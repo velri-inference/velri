@@ -1,19 +1,18 @@
 //! Scalar `f32` reference executor (`RefExecutor`) used as the numerical oracle for differential
 //! tests across all operators and `PlacementPlan` configurations (`docs/RU/architecture.md` Sections 2 & 9).
 
-use lumen_backend::{Executor, GatedActivation, Op, WeightTable};
+mod dispatch;
+
+use lumen_backend::{ExecutionBindings, Executor, GatedActivation, Op, WeightTable};
 use lumen_core::{Device, LumenError, Result, f16};
 use lumen_ltq::{LtqFormat, decode_tile, rotate_input_256};
 use lumen_tensor::{MatWeight, TileLayout};
 
 /// Scalar `f32` reference backend implementing `trait Executor`.
 ///
-/// **Status:** the pure kernels below ([`ref_rmsnorm_f32`], [`ref_gated_mlp_act_f32`],
-/// [`ref_ltq_band16_gemv_f32`]) exist, but binding them to `Op`/`TensorRef` needs the buffer
-/// model of `lumen-exec`, which is not written yet. Until an operator is wired up the executor
-/// says so honestly: [`Executor::supports`] is `false` and [`Executor::execute_op`] fails.
-/// An oracle that answers "ok" without computing anything would make every differential test
-/// pass vacuously.
+/// Supports bounded dense-f32 execution of linear, lookup, norm, rotary, causal attention,
+/// append and residual operations. LTQ fast paths and other operators remain explicitly
+/// unsupported by dispatch; the independent LTQ reference kernels below are still available.
 pub struct RefExecutor {
     device: Device,
 }
@@ -31,6 +30,7 @@ impl RefExecutor {
             Op::RmsNorm { .. } => "RmsNorm",
             Op::RmsNormGated { .. } => "RmsNormGated",
             Op::Rope { .. } => "Rope",
+            Op::Append { .. } => "Append",
             Op::Attention { .. } => "Attention",
             Op::IndexerScore { .. } => "IndexerScore",
             Op::DeltaNet { .. } => "DeltaNet",
@@ -61,25 +61,7 @@ impl Executor for RefExecutor {
     /// Exhaustive match over `Op` without a wildcard `_` arm (Architecture Section 9 invariant):
     /// flip an arm to `true` in the same change that implements the operator.
     fn supports(&self, op: &Op) -> bool {
-        match op {
-            Op::RowLookup { .. }
-            | Op::Linear { .. }
-            | Op::RmsNorm { .. }
-            | Op::RmsNormGated { .. }
-            | Op::Rope { .. }
-            | Op::Attention { .. }
-            | Op::IndexerScore { .. }
-            | Op::DeltaNet { .. }
-            | Op::GatedMlpAct { .. }
-            | Op::Router { .. }
-            | Op::MoEGemm { .. }
-            | Op::HcMix { .. }
-            | Op::HcInject { .. }
-            | Op::ResidualAdd { .. }
-            | Op::Transfer { .. }
-            | Op::Fetch { .. }
-            | Op::Sample { .. } => false,
-        }
+        dispatch::supports(op, self.device)
     }
 
     /// The reference executor reads the canonical on-disk layout only, so there is nothing to
@@ -98,29 +80,13 @@ impl Executor for RefExecutor {
     }
 
     /// Exhaustive match over `Op` without a wildcard `_` arm (Architecture Section 9 invariant).
-    fn execute_op(&mut self, op: &Op, _weights: &WeightTable) -> Result<()> {
-        match op {
-            Op::RowLookup { .. }
-            | Op::Linear { .. }
-            | Op::RmsNorm { .. }
-            | Op::RmsNormGated { .. }
-            | Op::Rope { .. }
-            | Op::Attention { .. }
-            | Op::IndexerScore { .. }
-            | Op::DeltaNet { .. }
-            | Op::GatedMlpAct { .. }
-            | Op::Router { .. }
-            | Op::MoEGemm { .. }
-            | Op::HcMix { .. }
-            | Op::HcInject { .. }
-            | Op::ResidualAdd { .. }
-            | Op::Transfer { .. }
-            | Op::Fetch { .. }
-            | Op::Sample { .. } => Err(LumenError::UnsupportedOp {
-                device: self.device,
-                op: Self::op_name(op).to_string(),
-            }),
-        }
+    fn execute_op(
+        &mut self,
+        op: &Op,
+        weights: &WeightTable,
+        bindings: &mut ExecutionBindings,
+    ) -> Result<()> {
+        dispatch::execute(op, weights, bindings, self.device)
     }
 }
 
@@ -285,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_does_not_pretend_to_execute() {
+    fn test_executor_rejects_execution_without_bound_buffers() {
         let mut exec = RefExecutor::default();
         let weights = WeightTable::default();
         let ops = [
@@ -307,9 +273,20 @@ mod tests {
             },
         ];
         for op in &ops {
-            assert!(!exec.supports(op), "{op:?}");
-            let err = exec.execute_op(op, &weights).unwrap_err();
-            assert!(matches!(err, LumenError::UnsupportedOp { .. }), "{err}");
+            let err = exec
+                .execute_op(
+                    op,
+                    &weights,
+                    &mut ExecutionBindings::new(&[], 1, 1).unwrap(),
+                )
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    LumenError::Memory(_) | LumenError::UnsupportedOp { .. }
+                ),
+                "{err}"
+            );
         }
     }
 

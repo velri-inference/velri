@@ -1,6 +1,9 @@
 //! Closed operator set `enum Op`, backend interface `trait Executor`, and hardware bandwidth
 //! profile `HwProfile` (`docs/RU/architecture.md` Sections 1, 7, 9 and `docs/RU/performance.md`).
 
+mod bindings;
+pub use bindings::{BindingKind, BindingSpec, ExecutionBindings, RowExtent};
+
 use lumen_core::{Device, MemLoc, Result};
 use lumen_tensor::{ExpertBank, MatWeight, RowTable, TensorRef};
 
@@ -60,47 +63,7 @@ impl WeightTable {
     }
 }
 
-/// RoPE positional encoding variant (`docs/RU/kernels.md` Section 2).
-#[derive(Clone, Debug, PartialEq)]
-pub enum RopeSpec {
-    /// Standard full-head RoPE with base $\theta$.
-    Standard { theta: f32, head_dim: u32 },
-    /// Partial RoPE (rotates only the first `rotary_dim` dimensions of each head).
-    Partial {
-        theta: f32,
-        head_dim: u32,
-        rotary_dim: u32,
-    },
-    /// Proportional RoPE (`p-RoPE`): frequencies $\theta^{-2i/d}$ for the first $p \cdot d / 2$ angles
-    /// with full-head `rotate-half`.
-    Proportional {
-        theta: f32,
-        head_dim: u32,
-        routed_fraction: f32,
-    },
-    /// YaRN context-extended RoPE.
-    Yarn {
-        theta: f32,
-        head_dim: u32,
-        factor: f32,
-        original_max_pos: u32,
-    },
-    /// 3D Multimodal RoPE (`M-RoPE`) splitting angles into $(t, h, w)$ sections.
-    MRope {
-        theta: f32,
-        head_dim: u32,
-        sections: [u32; 3],
-    },
-}
-
-/// Elementwise activation function for gated MLP blocks.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum GatedActivation {
-    /// $\text{SiLU}(g) \cdot u$.
-    SwiGlu,
-    /// $\text{GELU}_{\tanh}(g) \cdot u$ (the tanh approximation used by `gelu_pytorch_tanh`).
-    GeGlu,
-}
+pub use lumen_tensor::GatedActivation;
 
 /// Closed set of primitive operators executed by `trait Executor`.
 ///
@@ -137,31 +100,21 @@ pub enum Op {
         out: TensorRef,
         eps: f32,
     },
-    /// Rotary positional embedding (`RoPE`) applied to $Q$ and $K$.
+    /// Explicit rotary transform of one logical operand.
     Rope {
-        q: TensorRef,
-        k: TensorRef,
-        /// Token positions: `[T]` for 1D variants, `[3, T]` for `MRope`.
-        positions: TensorRef,
-        spec: RopeSpec,
+        input: TensorRef,
+        out: TensorRef,
+        spec: lumen_tensor::Rotary,
     },
-    /// Paged full, sliding-window, or sparse (`QSA`) attention.
+    /// Append current rows to an explicitly bound sequence tensor.
+    Append { input: TensorRef, out: TensorRef },
+    /// Causal grouped-query attention over explicit operands; owns no state.
     Attention {
-        layer: usize,
         q: TensorRef,
         k: TensorRef,
         v: TensorRef,
         out: TensorRef,
-        /// Softmax scale applied to $q \cdot k$ (e.g. $1/\sqrt{d}$, or `1.0` with QK-norm).
-        scale: f32,
-        sliding_window: Option<u32>,
-        k_eq_v: bool,
-        softcap: Option<f32>,
-        has_output_gate: bool,
-        /// Learned per-head attention sink logits.
-        sinks: Option<TensorRef>,
-        /// Bidirectional intra-span mask for image tokens, unioned with the causal mask.
-        bidirectional_spans: Option<TensorRef>,
+        spec: lumen_tensor::Attention,
     },
     /// Sparse attention block indexer (`QSA`): computes $\text{ReLU}(q \cdot k)$ and selects top-$k$ blocks.
     IndexerScore {
@@ -315,7 +268,12 @@ pub trait Executor: Send {
     /// Executes a single primitive operator `op`; `weights` resolves the ids it carries.
     ///
     /// Must return an error (never `Ok(())`) for an operator it does not execute.
-    fn execute_op(&mut self, op: &Op, weights: &WeightTable) -> Result<()>;
+    fn execute_op(
+        &mut self,
+        op: &Op,
+        weights: &WeightTable,
+        bindings: &mut ExecutionBindings,
+    ) -> Result<()>;
 }
 
 #[cfg(test)]

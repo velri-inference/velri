@@ -6,6 +6,11 @@
 //! from that single description, so model families differ only in how they *fill in* a layout,
 //! never in how a tree is built.
 
+mod compute;
+pub use compute::{
+    AttentionBlock, Block, GatedMlp, Linear, PreNormResidual, ProjectedAttention, RmsNorm,
+};
+
 use lumen_core::{ComponentKind, ComponentTree, LayerMask};
 
 /// Self-attention module (full or sliding window: the config tree does not distinguish them).

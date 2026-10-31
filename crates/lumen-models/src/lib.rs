@@ -13,6 +13,7 @@
 
 pub mod blocks;
 mod families;
+pub mod graph;
 pub mod hf;
 
 use lumen_core::{ComponentTree, LumenError, Result};

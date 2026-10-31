@@ -2,7 +2,7 @@
 
 Build a small correct execution path first, then justify additional mechanisms with measurements. The phase numbers below retain existing code references; they are milestones, not a requirement to finish every optimization before proceeding. In particular, a hybrid synchronization experiment can run alongside the first GPU work.
 
-**Current position:** the configuration/inspect and format/decoder foundation exists. End-to-end inference does not. The Python golden fixtures required below are still missing; Rust differential decoder tests do not replace them. See [architecture.md](architecture.md) for implemented scope and [execution-design.md](execution-design.md) for proposed mechanisms.
+**Current position:** configuration/inspect, LTQ container validation and reference weight decoding work. A computation graph, reusable blocks and prepared dense-f32 CPU execution now run a synthetic decoder, with logits checked against an independent Python oracle. Real-model loading and text generation are not connected yet. External Python LTQ golden fixtures for phase 2 are still needed; the dense decoder fixture does not replace them. See [architecture.md](architecture.md) and [blocks.md](blocks.md) for implemented scope, and [execution-design.md](execution-design.md) for proposed mechanisms.
 
 ## Milestones and acceptance
 

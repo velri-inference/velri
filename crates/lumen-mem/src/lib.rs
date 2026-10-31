@@ -372,7 +372,7 @@ pub struct KvLayerSpec {
     pub head_dim: usize,
     pub mode: KvLayoutMode,
     /// Optional sliding window size $W$. When `Some(w)`, the ring holds $W + T_{\max} - 1$ tokens.
-    /// `u32`, like `sliding_window` in `lumen_backend::Op::Attention`.
+    /// Legacy cache-sizing window; execution attention uses `lumen_tensor::Attention::window`.
     pub sliding_window: Option<u32>,
 }
 

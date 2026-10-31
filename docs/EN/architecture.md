@@ -4,7 +4,7 @@
 
 A MoE block contains several subnetworks called experts, and a router selects which experts process a token. For example, the GPU might compute attention while the CPU computes the selected experts. The engine must transfer the experts' input from GPU to CPU, wait for the result, and return it to the GPU. It needs to know which data each computation requires, where that data lives, and how much memory the work will use. This separation between describing the model, preparing the work, and executing it is the basis of the architecture.
 
-**The project is currently building its foundation.** Configuration parsing, model component trees, and the `inspect` command work: they show the selected placement. There is also LTQ container reading and validation, a reference weight decoder, memory size calculations, and several reference kernels. Running a complete model and generating text is not possible yet: execution preparation and working CPU/CUDA backends are still to be implemented.
+**The project is currently building its foundation.** Configuration parsing, model component trees, and the `inspect` command work: they show the selected placement. There is also LTQ container reading and validation, a reference weight decoder, memory size calculations, and several reference kernels. A validated computation graph, reusable blocks, CPU execution preparation and dense-f32 reference dispatch now run a synthetic decoder. Loading a real model for text generation, optimized CPU/CUDA backends and offload are still to be implemented. See [blocks.md](blocks.md) for the implemented API and its limits.
 
 The sections below explain how these parts should work together. Where existing code has narrower capabilities, that limitation is stated separately. Development milestones are in [roadmap.md](roadmap.md); optimization ideas that still need validation are in [execution-design.md](execution-design.md).
 
@@ -47,12 +47,12 @@ The order is checked by architectural tests: a crate may depend only on crates a
 | `lumen-ltq` | Provides reference LTQ decoding and the associated input transform |
 | `lumen-format` | Reads and validates LTQ containers |
 | `lumen-backend` | Defines operations and their executor interface |
-| `lumen-ref` | Contains individual reference kernels; execution through the common operation interface is not wired up yet |
+| `lumen-ref` | Executes the supported dense-f32 operations through explicit buffer bindings; also contains reference LTQ kernels |
 | `lumen-cpu` | Future CPU backend; currently a placeholder |
 | `lumen-cuda-kernels` | Future CUDA kernel build; currently a placeholder |
 | `lumen-cuda` | Future CUDA backend; currently a placeholder |
-| `lumen-models` | Reads model configs and builds component trees; weight mapping and computation descriptions are still to come |
-| `lumen-exec` | Will prepare execution; currently a placeholder |
+| `lumen-models` | Reads model configs; provides a validated graph and reusable computation blocks. Family-to-graph adapters and checkpoint mapping remain to be implemented |
+| `lumen-exec` | Prepares a bounded single-sequence CPU schedule, validates placement and weights, and manages execution sessions |
 | `lumen-media` | Will prepare images, audio, and other media; currently a placeholder |
 | `lumen-chat` | Will turn conversational messages into tokens and parse responses; currently a placeholder |
 | `lumen-engine` | Will manage generation and request state; currently a placeholder |
@@ -126,7 +126,7 @@ Preparation must check that the backends support the selected operations and tha
 
 Later, adjacent operations can be combined into one kernel (fusion), regions of execution can be captured in CUDA Graphs, and placement can be chosen automatically. These are ways to accelerate an already correct execution path. They are added after checking numerical results, state changes, and measured benefit.
 
-**The current `Architecture` trait does not yet provide that complete description.** It returns a structural `Layout` and a component tree for configuration. `Layout` does not yet retain all the information needed for computation. Implementing execution requires expressing that information explicitly; the `ComponentTree` of paths alone describes neither computation nor memory ownership.
+**The current `Architecture` trait does not yet provide that complete description.** It returns a structural `Layout` and a component tree for configuration. `Layout` does not yet retain all the information needed for computation. The new `GraphBuilder` expresses computation and storage ownership explicitly; the `ComponentTree` is derived from it for placement. Family adapters still need to populate that graph from their configs and checkpoints.
 
 ## 8. Generation Runtime (`Engine`), Speculative Decoding, and Multimodality
 

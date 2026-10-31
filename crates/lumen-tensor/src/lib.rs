@@ -1,6 +1,9 @@
 //! Tensor descriptors (`TensorRef`, `WeightRef`) and canonical weight descriptors (`LtqLinear`,
 //! `RowTable`, `DenseLinear`, `ExpertBank`) defined in `docs/RU/architecture.md` Section 6.
 
+mod operations;
+pub use operations::{Attention, GatedActivation, Rotary};
+
 use lumen_core::{DType, Shape};
 use lumen_mem::BufferId;
 use serde::{Deserialize, Serialize};
