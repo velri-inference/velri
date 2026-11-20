@@ -2,7 +2,7 @@
 
 [English](../../EN/models/qwen3_next.md)
 
-Это справочные требования к реализации семейства, а не список готовых к запуску моделей. В движке на C23 семейство задаёт порядок и параметры [общих блоков](../blocks.md). Подготовка проверяет операции через [реестр бэкендов](../backends.md), начиная с CPU и Vulkan; определения терминов — в [словаре](../glossary.md).
+Это справочные требования к реализации семейства, а не список готовых к запуску моделей. В движке на C23 семейство задаёт порядок и параметры [общих блоков](../blocks-and-config.md). Подготовка проверяет операции через [реестр бэкендов](../../../velri-lib/docs/RU/architecture.md#5-реестр-бэкендов-и-общий-контракт), начиная с CPU и Vulkan; определения терминов — в [словаре](../glossary.md).
 
 Модели этого семейства построены по **гибридной схеме 3 : 1**, определяемой массивом `layer_types` в конфигурации модели:
 - Три слоя подряд используют линейное рекуррентное внимание **`GatedDeltaNet` (GDN)** (`linear_attention`), не требующее растущего KV-кэша.
@@ -39,7 +39,7 @@
 
 | Узел слоя | `qwen3_next` | `qwen3_5_dense` (`qwen3_5`) | `qwen3_5_moe` |
 | :--- | :--- | :--- | :--- |
-| **Вход `GatedDeltaNet`** | 2 слитые проекции: `in_proj_qkvz` и `in_proj_ba`, упакованные по группам `num_k_heads` (`fix_query_key_value_ordering`) | 4 раздельные проекции: `in_proj_qkv`, `in_proj_z` (квантуются в LTQ) и узкие плотные `in_proj_b`, `in_proj_a` на `num_v_heads` | Как у `qwen3_5_dense` (4 раздельные проекции) |
+| **Вход `GatedDeltaNet`** | 2 слитые проекции: `in_proj_qkvz` и `in_proj_ba`, упакованные по группам `num_k_heads` (`fix_query_key_value_ordering`) | 4 раздельные проекции: `in_proj_qkv`, `in_proj_z` (подлежат квантованию) и узкие плотные `in_proj_b`, `in_proj_a` на `num_v_heads` | Как у `qwen3_5_dense` (4 раздельные проекции) |
 | **Ядро `GatedDeltaNet`** | `causal conv1d` (окно 4, SiLU) $\to$ дельта-правило с $L_2$-нормой $Q, K$, $\beta = \sigma(b)$, $g = -\exp(A_{\text{log}}) \cdot \text{softplus}(a + \text{dt\_bias})$ $\to$ `RMSNormGated(head_v_dim)` с гейтом $\text{SiLU}(z)$ $\to$ `out_proj` | То же | То же |
 | **`full_attention`** | **Gated Attention**: `q_proj` ширины $2 \cdot H \cdot D$ делится на $(q, \text{gate})$; `q_norm` и `k_norm` по `head_dim`; выход умножается на $\sigma(\text{gate})$ перед `o_proj` | То же | То же |
 | **Позиционное кодирование (`RoPE`)** | Частичный 1D RoPE (`partial_rotary_factor: 0.25`) | Чередующийся 3D **M-RoPE** `mrope_section: [11, 11, 10]`, `partial 0.25` | Как у `qwen3_5_dense` |

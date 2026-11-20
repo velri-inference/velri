@@ -1,112 +1,59 @@
-# How we evaluate performance
+# Performance Measurement Methodology
 
 [Русский](../RU/performance.md)
 
-This document defines measurement rules for the move to C and Vulkan. Terms are explained in the [glossary](glossary.md).
+This document sets uniform benchmarking rules across `Velri` and `Velri-lib` so kernel comparisons (including native C23/SIMD vs. **Slang CPU** and **Vulkan** kernels) remain honest and reproducible.
 
-**Status:** the first C CPU linear module and its measurements are described in [cpu-linear.md](cpu-linear.md). The C runtime and Vulkan backend are not implemented. Historical Rust measurements remain in [cpu-performance.md](cpu-performance.md) and the experiment archive (`../benchmarks/`); they do not establish performance of the C module or the future engine. CLI commands `probe` and `bench` are still being designed.
+**What works today:** `velri-lib/` ships `bench_slang_cpu` (Slang AOT CPU over `velri_pool`) and `bench_vulkan` (SPIR-V 1.6 when `-DVELRI_ENABLE_VULKAN=ON`, see [kernels.md](../../velri-lib/docs/EN/kernels.md)). The earlier handwritten C23/SIMD suite is preserved for historical comparisons on branch `archive/c23-cpu-legacy`. Raw reports and profiles stay locally in gitignored `docs/benchmarks/`.
 
-## What we measure
+---
 
-Every result identifies one of three levels:
+## 1. Three Measurement Levels
 
-1. **An individual compute kernel** on prepared data. For example, one GEMV without preparing a job for the worker pool.
-2. **A complete operation call**, including implementation selection, dispatch to the pool and waiting for completion.
-3. **A model step**, which executes several operations and changes model state.
+Every reported figure explicitly states its level:
+1. **Microkernel** on pre-prepared buffers (excluding thread-pool dispatch).
+2. **Full operation call**, including argument validation, dispatch selection, pool or GPU queue submission, and completion wait.
+3. **Model step**, covering all layer operations, cross-device transfers, and state updates (`decode` latency, `prefill` throughput, TTFT, peak memory).
 
-These measurements answer different questions. A faster GEMV may barely affect a model step if most time goes into other operations or waits. Model-level measures also include decode latency, prefill throughput, memory use and time to first token.
+Speeding up an isolated microkernel does not prove an end-to-end model speedup.
 
-### First launch and repeated work
+### Cold start, cache, and DRAM
+- Cold loading, weight packing, and `VkPipeline` creation are timed separately; steady-state measurements record their warmup scheme.
+- Re-reading one matrix from L2/L3 (cached GEMV) and streaming distinct matrices from DRAM (streaming GEMV, e.g., weight rings in `bench_slang_cpu` / `bench_vulkan`) are distinct regimes and are always labeled explicitly.
 
-Measure cold loading, weight packing and pipeline creation separately. For steady execution, state how the program was warmed up before measurement.
+---
 
-Also distinguish data that fits in cache from weights read from main memory. Repeating GEMV on one matrix differs from traversing successive weight matrices of a model. The report must identify which case was measured.
+## 2. Units and Ceiling References
 
-## Units
-
-For dense GEMM with input `[N,K]` and weights `[M,K]`, use:
+For dense `GEMM` / `GEMV` with input `[N, K]` and weights `[M, K]`:
 
 ```text
-TFLOPS = 2*N*M*K / seconds / 1e12
+TFLOPS (or TOPS for INT8) = 2 * N * M * K / seconds / 1e12
 ```
 
-Here `seconds` is the measured time in seconds. GEMV uses the same formula with `N=1`.
+- Only useful arithmetic operations enter the numerator (zero padding, packing, and transfers never inflate FLOP/OP counts, even though their time is included in full-call timing).
+- `GB/s` figures always state whether they count logical weight bytes (`weight_bytes / seconds / 1e9`, as in `bench_slang_cpu` / `bench_vulkan`) or measured hardware traffic at a specific memory level.
+- **Conditional references rather than "absolute ceilings":** peak compute estimates depend on active cores, ISA width, dtype, and **sustained clock under the measured workload** (not marketing boost). A GEMV memory reference is `bandwidth * 2 / weight_element_bytes` adjusted for padding. Ratios to such numbers are labeled as **fraction of a reference ceiling** (theoretical, conditional, or measured); unknown physical limits remain unknown.
 
-The numerator counts only useful arithmetic under this convention. Extra padding, packing and control operations do not increase its FLOP count. Their time counts if they are part of the measured call.
+---
 
-For GB/s, always specify which bytes are counted: logical data volume or measured traffic at a particular memory level. Cache reads and DRAM reads must not silently be treated as the same traffic.
+## 3. Profiling Before Optimizing
 
-## What we compare against
+- On CPU, separately inspect call setup, task publication, worker wake-up, arithmetic, and completion wait. Overlapping wait time across threads must never be summed as single-call latency.
+- On Vulkan, separately measure GPU execution (via timestamp queries only when supported by the queue), CPU waits, copies, and pipeline creation. CPU and GPU clocks cannot be subtracted directly without calibration.
+- Profilers, sanitizers, and Vulkan validation layers distort timings: always confirm wins with a clean release run without them.
+- State a falsifiable hypothesis before editing code (repeated packing, stray buffer, tile imbalance, register spilling). Changing compiler or language alone is not a root cause.
 
-The estimated maximum compute rate depends on:
+---
 
-- active core count;
-- instruction width and throughput;
-- data type;
-- processor frequency under the measured workload.
+## 4. Comparison Tables and Reproducibility
 
-Brief boost frequency and a rated maximum do not establish sustained GEMM speed. For GEMV, also estimate read volume and available DRAM or relevant-cache bandwidth. Measure memory bandwidth, inter-chiplet bandwidth and working thread counts on the current machine.
+Every comparison table (e.g., native C23/AVX-512 vs. Slang CPU vs. BLIS/OpenBLAS/Vulkan) records:
+- source revision/hash, compiler (`clang`/`gcc`/`slangc`), and flags;
+- CPU/GPU, driver, ISA, worker count, and `affinity` policy;
+- exact dimensions (`rows`, `M`, `K`), `dtype`, layout (row-major / prepared), cache mode (`ring_count`), warmup, and iteration count;
+- median and spread (`min`/`p50`/`p99`/`max`), including regressions;
+- **numerical contract and verification status** (tolerances against an independent C23 reference for float kernels; exact/bitwise checks for integer kernels);
+- interleaved execution (AB/BA) rather than cherry-picking best runs across separate sessions.
 
-Roofline and `max(compute time, transfer time)` help build an estimate if their assumptions are explicit. A different microbenchmark's speed does not set a strict physical bound for our model step.
-
-Label the result's ratio to that estimate as a **ratio to a conditional reference**. For example, reaching 80% of a reference does not itself prove 80% hardware utilization or that a further 20% speedup is available. Report all arithmetic-rate references in TFLOPS as well.
-
-## What we check before optimizing
-
-First identify where time is spent. On CPU, separate:
-
-1. call preparation;
-2. job publication to workers;
-3. each worker's start time;
-4. computation;
-5. call completion.
-
-Sampling locates CPU-time consumption. Available hardware counters help check causes of stalls and traffic volume. The timeline identifies the critical path.
-
-Worker waits may overlap. When several workers wait simultaneously, their waiting times cannot be added and presented as one call's latency.
-
-For Vulkan, separately measure GPU commands, CPU waits, copies and pipeline creation. Use timestamp queries only when supported by the relevant queue. GPU and CPU clock values cannot be subtracted directly without a valid correspondence.
-
-Profilers and validation affect execution. Confirm an apparent improvement in a separate run without them.
-
-Before changing code, state a testable cause: repeated packing, an unnecessary intermediate buffer, too little work per job, uneven matrix partitions or a slow kernel region. Changing the language, compiler or alignment does not by itself explain lost time.
-
-## Making measurements reproducible
-
-### Keep a kernel comparison table
-
-Each optimization report includes a table of the measured implementations, including
-the baseline, retained candidates, rejected candidates and external implementations
-that were tested. Identify a kernel by its source revision or hash and describe the
-change; the compiler name alone does not identify a different algorithm.
-
-For every row, show the workload and dimensions, hardware/ISA, compiler, worker count,
-median TFLOPS and variation, numerical contract and bitwise-check result. A shared
-heading may hold conditions that are identical for all rows. Include the relevant
-compute or memory reference in TFLOPS and state whether it is theoretical, conditional
-or measured. An unknown physical ceiling stays unknown.
-
-Keep a run identifier and a link to the raw measurements. Results from separate runs
-must remain distinguishable; do not choose the best sample from each and call it a
-paired comparison. Include regressions. An implementation awaiting code or measurement
-gets an explicit pending entry, with no invented speed or correctness result.
-
-Update the table as candidates are evaluated. Raw benchmark data remains local under
-`docs/benchmarks/`, excluded from commits; concise published summaries stay synchronized
-between English and Russian documentation.
-
-### Record the conditions
-
-Keep the following in the report:
-
-- source or binary version and compiler;
-- CPU, GPU, driver and ISA;
-- shapes, dtype and layout;
-- threading policy and affinity;
-- cache regime, warmup order and repetition count.
-
-Alternate the baseline and candidate when comparing them. Show variation, regressions and complete call cost. Measurements under competing load, such as a game, are not evidence of an optimization's benefit.
-
-Every optimization passes numerical comparisons and memory-bound checks. Choose implementations for different CPUs and GPUs using capabilities and measurements. Users must not need the developer's processor.
-
-Builds and checks under emulation can validate selected correctness scenarios. Measure real ARM performance on the actual device.
+QEMU emulation (ARM64, RISC-V, x86 dispatch) establishes compilation and correctness only, never physical hardware performance.

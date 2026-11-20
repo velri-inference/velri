@@ -1,18 +1,21 @@
 {
   "model": {
-    "path": "models/qwen3.8-27b/model.vtq",
-    "compute": "cuda:0",
-    "store": "vram:0",
+    "path": "models/qwen3.8-27b",
+    "compute": "vulkan:0",
+    "store": "vulkan:0",
     "input-layer": {
       "store": "ram:0"
     },
     "hidden-layers": {
       "dense-mlp": {
-        "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0"
+        "compute": "cpu:0",
+        "store": "ram:0",
+        "prefill-compute": "vulkan:0"
       },
       "36-63": {
         "dense-mlp": {
-          "compute": "cuda:0", "store": "vram:0"
+          "compute": "vulkan:0",
+          "store": "vulkan:0"
         }
       }
     },
@@ -39,13 +42,15 @@
     "v-bits": 5
   },
 
-  "cuda": {
-    "prefill-chunk-size": 512,
-    "cuda-graphs": false
-  },
-
-  "cpu": {
-    "threads": 16
+  "backends": {
+    "vulkan": {
+      "prefill-chunk-size": 512
+    },
+    "cpu": {
+      "threads": 16,
+      "reserve-cores": 1,
+      "affinity": "auto"
+    }
   },
 
   "server": {

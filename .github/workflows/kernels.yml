@@ -1,0 +1,131 @@
+name: Slang CPU & cross-platform contract
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+env:
+  SLANG_VERSION: "2026.22.1"
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - compiler: clang-18
+            sanitize: "OFF"
+            multiversion: "ON"
+          - compiler: gcc-14
+            sanitize: "OFF"
+            multiversion: "ON"
+          - compiler: gcc-14
+            sanitize: "ON"
+            multiversion: "ON"
+          - compiler: clang-18
+            sanitize: "OFF"
+            multiversion: "OFF"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install C23 compiler
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.compiler }}
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
+      - name: Configure
+        run: >-
+          cmake -S velri-lib -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_C_FLAGS=-Werror
+          -DVELRI_SANITIZE=${{ matrix.sanitize }}
+          -DVELRI_CPU_MULTIVERSION=${{ matrix.multiversion }}
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+
+  linux-x64-dispatch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-14 qemu-user
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
+      - run: >-
+          cmake -S velri-lib -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_C_FLAGS=-Werror -DVELRI_CPU_MULTIVERSION=ON
+      - run: cmake --build build --parallel 2
+      # QEMU TCG does not implement AVX-512. Verify runtime CPUID dispatch on baseline and AVX2 CPUs.
+      - name: Run the same binary on baseline and AVX2-only CPUs
+        run: |
+          qemu-x86_64 -cpu Nehalem ./build/bench_slang_cpu --verify-only
+          qemu-x86_64 -cpu Haswell,-hle,-rtm ./build/bench_slang_cpu --verify-only
+
+  linux-aarch64-cross:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: >-
+          sudo apt-get update && sudo apt-get install -y
+          gcc-14-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
+      - run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE=velri-lib/cmake/toolchains/aarch64-linux-gnu.cmake
+          -DCMAKE_C_FLAGS=-Werror
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+
+  android-cross:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v${SLANG_VERSION}/slang-${SLANG_VERSION}-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
+      - name: Configure & build Android (${{ matrix.abi }}, CPU + Vulkan)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_C_FLAGS=-Werror \
+            -DVELRI_ENABLE_VULKAN=ON
+          cmake --build build --parallel 2
+
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Khronos Slang (slangc AOT)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/shader-slang/slang/releases/download/v$env:SLANG_VERSION/slang-$env:SLANG_VERSION-windows-x86_64.zip"
+          $zip = "$env:RUNNER_TEMP\slang.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\slang" -Force
+          "$env:RUNNER_TEMP\slang\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Configure, build & test Windows x64 (Clang)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_C_FLAGS=-Werror
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure

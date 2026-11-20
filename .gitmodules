@@ -1,3 +1,0 @@
-[submodule "external/velri-lib"]
-	path = external/velri-lib
-	url = https://github.com/velri-inference/velri-lib.git

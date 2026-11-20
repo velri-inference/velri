@@ -2,7 +2,7 @@
 
 [Русский](../../RU/models/gemma4.md)
 
-This is a reference for the architecture and its implementation requirements, not a report of working Velri execution. The C23 engine composes the model from [common blocks](../blocks.md); support for concrete operations and representations is checked through the [backend registry](../backends.md), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
+This is a reference for the architecture and its implementation requirements, not a report of working Velri execution. The C23 engine composes the model from [common blocks](../blocks-and-config.md); support for concrete operations and representations is checked through the [backend registry](../../../velri-lib/docs/EN/architecture.md#5-backend-registry-and-shared-contract), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
 
 The **Gemma 4** family comprises five models (`E2B`, `E4B`, `12B`, `26B-A4B`, `31B`) that alternate **sliding-window attention layers (`sliding`)** with **global full-attention layers (`full`)**.
 
@@ -54,13 +54,13 @@ The final `num_kv_shared_layers` layers (20 of 35 in `E2B` and 18 of 42 in `E4B`
 
 The plan represents these reads as references to one state resource with explicit dependencies on the reference layer's writes. The shared resource's lifetime and size are accounted for once; additional representations or transfers between devices are accounted for separately.
 
-During prompt processing (prefill), these final layers write nothing to the KV cache. This permits considering evaluation only for rows that require output logits, after checking all dependencies and side effects. The optimization is not implemented; it belongs in [execution preparation](../architecture.md#what-is-done-ahead-of-time-and-at-each-step).
+During prompt processing (prefill), these final layers write nothing to the KV cache. This permits considering evaluation only for rows that require output logits, after checking all dependencies and side effects. The optimization is not implemented; it belongs in [execution preparation](../../../velri-lib/docs/EN/execution.md#1-preparation-prepare-vs-execution-step).
 
 ---
 
 ## 4. Per-Layer Embeddings (`PLE` in E2B and E4B)
 
-- **Lookup table component:** the `embed_tokens_per_layer` tensor of shape $[262\,144, \text{layers} \times 256] \times \sqrt{256}$, indexed by token ID. In `E4B`, this table occupies ~5.6 GB in `bf16` (roughly one-third of all model weights). Once compressed with `LtqRing` rings, RAM or NVMe storage can be considered: preparation must provide row fetching, supported decoding, and delivery to the consumer. This does not promise direct GPU reads of RAM or hidden I/O latency.
+- **Lookup table component:** the `embed_tokens_per_layer` tensor of shape $[262\,144, \text{layers} \times 256] \times \sqrt{256}$, indexed by token ID. In `E4B`, this table occupies ~5.6 GB in `bf16` (roughly one-third of all model weights). With low-bit row quantization, RAM or NVMe storage can be considered: preparation must provide row fetching, supported decoding, and delivery to the consumer. This does not promise direct GPU reads of RAM or hidden I/O latency.
 - **Contextual component:** a linear projection of the main token embedding $\times \text{hidden}^{-1/2} \to \text{RMSNorm}$, combined with the table lookup scaled by $1/\sqrt{2}$.
 - **Per-layer injection:** after the MLP on each layer, the model computes $\text{GELU}(W_{\text{gate}} h) \odot \text{ple}_\ell \to W_{\text{proj}} \to \text{RMSNorm} \to + \text{residual}$.
 

@@ -9,11 +9,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          submodules: recursive
       - name: Install C23 compiler
         run: sudo apt-get update && sudo apt-get install -y clang-18
-      - name: Configure pinned library and engine consumer
+      - name: Install Khronos Slang (slangc AOT)
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -fL "https://github.com/shader-slang/slang/releases/download/v2026.22.1/slang-2026.22.1-linux-x86_64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/slang"
+          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
+      - name: Configure library and engine consumer
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_C_COMPILER=clang-18 -DCMAKE_C_FLAGS=-Werror
