@@ -1,0 +1,77 @@
+# Generate the register update shared by the FMA GEMM microkernels. The C
+# wrappers still own panel loading, K unrolling and their output epilogues.
+set(VELRI_GEMM_HEADER "/* Generated from cmake/gemm.cmake; edit the generator. */\n")
+
+function(velri_fma_step name vector_bytes rows scalar load_weights)
+    if(vector_bytes EQUAL 32)
+        set(reg ymm)
+        set(registers 16)
+    elseif(vector_bytes EQUAL 64)
+        set(reg zmm)
+        set(registers 32)
+    else()
+        message(FATAL_ERROR "Unsupported x86 vector size: ${vector_bytes}")
+    endif()
+    if(scalar STREQUAL "float")
+        set(element_bytes 4)
+        set(packed ps)
+        set(broadcast ss)
+    elseif(scalar STREQUAL "double")
+        set(element_bytes 8)
+        set(packed pd)
+        set(broadcast sd)
+    else()
+        message(FATAL_ERROR "Unsupported FMA scalar: ${scalar}")
+    endif()
+    math(EXPR b0 "2 * ${rows}")
+    math(EXPR b1 "${b0} + 1")
+    math(EXPR a0 "${b0} + 2")
+    math(EXPR a1 "${b0} + 3")
+    math(EXPR odd_rows "${rows} % 2")
+    if(a1 GREATER_EQUAL registers OR odd_rows)
+        message(FATAL_ERROR "FMA tile does not fit the register schedule")
+    endif()
+    set(body "#define ${name}(AOFF")
+    if(load_weights)
+        string(APPEND body ", BOFF")
+    endif()
+    string(APPEND body ") \\\n")
+    if(load_weights)
+        string(APPEND body
+            "    \"vmovu${packed} \" #BOFF \"(%[b]), %%${reg}${b0}\\n\\t\" \\\n"
+            "    \"vmovu${packed} \" #BOFF \"+${vector_bytes}(%[b]), %%${reg}${b1}\\n\\t\" \\\n")
+    endif()
+    math(EXPR last_pair "${rows} - 2")
+    foreach(row RANGE 0 ${last_pair} 2)
+        math(EXPR offset0 "${row} * ${element_bytes}")
+        math(EXPR offset1 "${offset0} + ${element_bytes}")
+        string(APPEND body
+            "    \"vbroadcast${broadcast} \" #AOFF \"+${offset0}(%[a]), %%${reg}${a0}\\n\\t\" \\\n"
+            "    \"vbroadcast${broadcast} \" #AOFF \"+${offset1}(%[a]), %%${reg}${a1}\\n\\t\" \\\n")
+        foreach(delta RANGE 0 1)
+            math(EXPR input "${a0} + ${delta}")
+            foreach(column RANGE 0 1)
+                math(EXPR weight "${b0} + ${column}")
+                math(EXPR accumulator "2 * (${row} + ${delta}) + ${column}")
+                string(APPEND body
+                    "    \"vfmadd231${packed} %%${reg}${weight}, %%${reg}${input}, %%${reg}${accumulator}\\n\\t\" \\\n")
+            endforeach()
+        endforeach()
+    endforeach()
+    string(APPEND body "    \"\"\n"
+        "#define ${name}_ROWS ${rows}\n"
+        "#define ${name}_VECTOR_BYTES ${vector_bytes}\n"
+        "#define ${name}_ELEMENT_BYTES ${element_bytes}\n\n")
+    set(VELRI_GEMM_HEADER "${VELRI_GEMM_HEADER}${body}" PARENT_SCOPE)
+endfunction()
+
+velri_fma_step(AVX2_F32_STEP 32 6 float TRUE)
+velri_fma_step(AVX2_F64_STEP 32 6 double TRUE)
+velri_fma_step(FMA_BODY_14X32_PS 64 14 float FALSE)
+velri_fma_step(STEP_14X16_F64 64 14 double TRUE)
+
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/generated/gemm_fma.tmp" "${VELRI_GEMM_HEADER}")
+configure_file("${CMAKE_CURRENT_BINARY_DIR}/generated/gemm_fma.tmp"
+               "${CMAKE_CURRENT_BINARY_DIR}/generated/gemm_fma.h" COPYONLY)
+file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/generated/gemm_fma.tmp")

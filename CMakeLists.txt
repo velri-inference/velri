@@ -4,14 +4,18 @@ project(velri VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 include(CTest)
 
-# Consume the separate computation library, never copies of its private kernels.
+# The computation library lives in this repository and also builds on its own.
 set(VELRI_LIB_DEFAULT_SOURCE "")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/velri-lib/CMakeLists.txt")
-    set(VELRI_LIB_DEFAULT_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/external/velri-lib")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/velri-lib/CMakeLists.txt")
+    set(VELRI_LIB_DEFAULT_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/velri-lib")
 endif()
-set(VELRI_LIB_SOURCE_DIR "${VELRI_LIB_DEFAULT_SOURCE}" CACHE PATH "Path to a separate Velri-lib source checkout")
+set(VELRI_LIB_SOURCE_DIR "${VELRI_LIB_DEFAULT_SOURCE}" CACHE PATH "Velri-lib source directory; empty uses an installed package")
 if(VELRI_LIB_SOURCE_DIR)
     get_filename_component(VELRI_LIB_SOURCE_DIR "${VELRI_LIB_SOURCE_DIR}" ABSOLUTE
         BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -27,6 +31,6 @@ endif()
 # Only an integration check exists; the engine runtime and graph are not ready.
 if(BUILD_TESTING)
     add_executable(test_velri_lib tests/integration/velri_lib.c)
-    target_link_libraries(test_velri_lib PRIVATE VelriLib::cpu_linear)
+    target_link_libraries(test_velri_lib PRIVATE VelriLib::cpu)
     add_test(NAME velri_lib_integration COMMAND test_velri_lib)
 endif()

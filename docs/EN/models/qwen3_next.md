@@ -2,7 +2,7 @@
 
 [Русский](../../RU/models/qwen3_next.md)
 
-These are family implementation requirements, not a list of runnable models. In the C23 engine, the family defines the order and parameters of [common blocks](../blocks.md). Preparation checks operations through the [backend registry](../backends.md), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
+These are family implementation requirements, not a list of runnable models. In the C23 engine, the family defines the order and parameters of [common blocks](../blocks-and-config.md). Preparation checks operations through the [backend registry](../../../velri-lib/docs/EN/architecture.md#5-backend-registry-and-shared-contract), starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
 
 Models in this family follow a **3 : 1 hybrid schedule** defined by the `layer_types` array in the model configuration:
 - Three consecutive layers use linear recurrent attention **`GatedDeltaNet` (GDN)** (`linear_attention`), which requires no growing KV cache.
@@ -39,7 +39,7 @@ Every 4th layer executes paged full attention with a sigmoid output gate:
 
 | Layer Component | `qwen3_next` | `qwen3_5_dense` (`qwen3_5`) | `qwen3_5_moe` |
 | :--- | :--- | :--- | :--- |
-| **`GatedDeltaNet` Input** | 2 fused projections: `in_proj_qkvz` and `in_proj_ba`, packed by `num_k_heads` groups (`fix_query_key_value_ordering`) | 4 split projections: `in_proj_qkv`, `in_proj_z` (LTQ quantized) and narrow dense `in_proj_b`, `in_proj_a` of width `num_v_heads` | Same as `qwen3_5_dense` (4 split projections) |
+| **`GatedDeltaNet` Input** | 2 fused projections: `in_proj_qkvz` and `in_proj_ba`, packed by `num_k_heads` groups (`fix_query_key_value_ordering`) | 4 split projections: `in_proj_qkv`, `in_proj_z` (quantizable) and narrow dense `in_proj_b`, `in_proj_a` of width `num_v_heads` | Same as `qwen3_5_dense` (4 split projections) |
 | **`GatedDeltaNet` Core** | `causal conv1d` (window 4, SiLU) $\to$ delta rule with $L_2$-normed $Q, K$, $\beta = \sigma(b)$, $g = -\exp(A_{\text{log}}) \cdot \text{softplus}(a + \text{dt\_bias})$ $\to$ `RMSNormGated(head_v_dim)` gated by $\text{SiLU}(z)$ $\to$ `out_proj` | Same | Same |
 | **`full_attention`** | **Gated Attention**: `q_proj` of width $2 \cdot H \cdot D$ split into $(q, \text{gate})$; `q_norm` & `k_norm` over `head_dim`; output multiplied by $\sigma(\text{gate})$ before `o_proj` | Same | Same |
 | **Positional Encoding (`RoPE`)** | Partial 1D RoPE (`partial_rotary_factor: 0.25`) | Interleaved 3D **M-RoPE** `mrope_section: [11, 11, 10]`, `partial 0.25` | Same as `qwen3_5_dense` |

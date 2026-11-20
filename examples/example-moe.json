@@ -1,8 +1,8 @@
 {
   "model": {
-    "path": "models/qwen3.8-flash-next/model.vtq",
-    "compute": "cuda:0",
-    "store": "vram:0",
+    "path": "models/qwen3.8-flash-next",
+    "compute": "vulkan:0",
+    "store": "vulkan:0",
     "input-layer": {
       "store": "ram:0"
     },
@@ -24,13 +24,16 @@
       },
       "moe": {
         "routed-experts": {
-          "compute": "cpu:0", "store": "ram:0", "prefill-compute": "cuda:0"
+          "compute": "cpu:0",
+          "store": "ram:0",
+          "prefill-compute": "vulkan:0"
         }
       },
       "32-47": {
         "moe": {
           "routed-experts": {
-            "compute": "cuda:0", "store": "vram:0"
+            "compute": "vulkan:0",
+            "store": "vulkan:0"
           }
         }
       }
@@ -53,8 +56,15 @@
     "size": 262144
   },
 
-  "cuda": {
-    "prefill-chunk-size": 4096
+  "backends": {
+    "vulkan": {
+      "prefill-chunk-size": 4096
+    },
+    "cpu": {
+      "threads": 0,
+      "reserve-cores": 1,
+      "affinity": "auto"
+    }
   },
 
   "disk": {

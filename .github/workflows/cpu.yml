@@ -9,11 +9,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          submodules: recursive
       - name: Install C23 compiler
         run: sudo apt-get update && sudo apt-get install -y clang-18
-      - name: Configure pinned library and engine consumer
+      - name: Configure library and engine consumer
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_C_COMPILER=clang-18 -DCMAKE_C_FLAGS=-Werror

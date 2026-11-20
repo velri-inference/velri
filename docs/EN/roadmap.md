@@ -1,89 +1,88 @@
-# Migration to C and Vulkan
+# Roadmap
 
 [Русский](../RU/roadmap.md)
 
-The goal is a working, verifiable engine that people can contribute to through understandable C code. Technical terms in this plan are explained in the [glossary](glossary.md).
+The goal is a verifiable, maintainable, fast native C23/C++23 engine (with zero Python or PyTorch at runtime) powered by a unified library of composable **Khronos Slang (`slangc` AOT)** kernels and **CPU + Vulkan** as the first backends. Every new or migrated piece is accepted only after checking correctness, memory cost, and full execution time.
 
-A language change does not itself establish acceleration. Verify correct results, memory use and complete execution time for every migrated part.
+Stages express dependencies; independent tracks (e.g., weight container formats and Slang PoC) may progress in parallel.
 
-**What exists now:** the CPU linear prototype, references and tests have been extracted into the separate Velri-lib project. Velri consumes its pinned revision and checks the CMake/header boundary. The generic graph, executor, target F64/FP16/BF16/INT8 paths, Vulkan and real-model inference are not implemented. Earlier Rust results remain historical evidence. See [project boundaries](velri-lib.md).
+---
 
-## Order of work
+### Stage 0 *(Completed)* — Baseline C23 CPU Library (`VelriLib::cpu`)
+Implemented in `velri-lib/` and verified in CI (`x86-64` baseline/AVX2/AVX-512, `AArch64` and `RISC-V 64` under QEMU):
+- typed `Linear` (11 modes: `F64`, `FP32`, `FP16`, `BF16`, `INT8`, `W8A8`, `W8A32`, row-major and prepared);
+- `RMSNorm`, `LayerNorm`, `RoPE`, activations, `gated MLP`, `softmax`, `FWHT`, format conversions, and per-row `INT8` quantization;
+- persistent `velri_pool` (pthreads), guard-page contract tests, and `bench_cpu`;
+- root `Velri` integration build (both subdirectory and installed `VelriLib` CMake package).
 
-These stages express dependencies. Some work can proceed in parallel: Vulkan experiments may start after buffer and basic-operation contracts, while format support can migrate alongside CPU computation. A real model can be connected before reaching maximum TFLOPS.
+This suite serves as the working baseline and correctness/speed bar for subsequent stages.
 
-### 1. Minimal C library
+---
 
-Prepare CMake, error statuses, opaque objects, size and overflow checks, CPU references and Unity/CTest tests. Introduce a small internal [backend interface](backends.md) and build-time module registration alongside them.
+### Stage 1 — Minimal `velri-lib` Core and Backend Contract
+Build the library core ([velri-lib/docs/EN/architecture.md](../../velri-lib/docs/EN/architecture.md)):
+- `TensorView` / `Storage`, operation registry, graph builder, and memory planner (with explicit K/V roles);
+- internal C backend contract (`query_operation`, `prepare`, `submit`, `poll`, `wait`), static registration, and RAM transfer bus;
+- thin CPU adapter wrapping `VelriLib::cpu` plus a small async mock backend (one op + controllable completion delay).
 
-The interface includes operation support queries, prepared implementations, acceptance and completion. A backend can initially support one operation, but a whole model needs a complete prepared plan. A third production backend is unnecessary for this check.
+**Acceptance:** a standalone client builds a graph, prepares a plan, and runs two independent execution slots with zero engine code; shared contract tests verify pre-accept rejection, post-accept failure, cancellation, RAM transfers, and slot isolation.
 
-This stage is complete when the library builds for Windows, Linux and Android arm64 and the first test runs without a Rust runtime. Argument errors, ownership and correct resource release are verified.
+---
 
-A test backend with one operation and controllable delayed completion must connect without changes to models or the planner. Shared checks cover rejection before launch, failure after acceptance, cancellation, RAM transfers and session independence. CPU builds do not depend on disabled-backend SDKs. This tests module boundaries, not another production backend.
+### Stage 2 — Slang AOT PoC (Vulkan + CPU) and Slang CPU Assessment
+Integrate `slangc` into CMake for pure build-time AOT ([velri-lib/docs/EN/kernels.md](../../velri-lib/docs/EN/kernels.md)):
+- author reusable Slang components (`numeric`, `activations`, `epilogue`, `reductions`) and initial real operations (`RMSNorm`, `RoPE`, `GatedMLP`, `Softmax`, `GEMV` / `GEMM`);
+- compile the same `.slang` source AOT to **SPIR-V** (validated with `spirv-val`) and **CPU `.o`** (via LLVM IR with target ISA flags, with zero AVX2 vs. AVX-512 source duplication);
+- dispatch CPU `.o` directly from `velri_pool` with `0 B` heap allocation;
+- benchmark Slang CPU head-to-head against native `VelriLib::cpu`, and Slang Vulkan against measured and physical GPU ceilings; record concrete Slang CPU backend improvements needed.
 
-### 2. End-to-end CPU execution
+**Acceptance:** shared `.slang` modules compile AOT with zero runtime compiler, pass numerical verification against C23 references, and produce reproducible CPU and Vulkan benchmarks.
 
-Connect small weights, model blocks, `Program` and `Session` into a working synthetic decoder.
+---
 
-This stage is complete when prefill and decode work and logits and state agree with independent fixtures. Shared storage owners and derived K/V must work without extra allocations. The CPU module uses the common interface; session slots are independent and cancellation is safe.
+### Stage 3 — End-to-End Synthetic CPU Decoder
+Assemble initial reusable blocks, `Model`, `Program`, and `Session` in `Velri` ([blocks-and-config.md](blocks-and-config.md), [api.md](api.md)).
 
-### 3. Optimized CPU computation
+**Acceptance:** synthetic `prefill` and `decode` match independent fixtures across arbitrary step splits; shared storage and derived K/V allocate no redundant buffers; session isolation and cancellation are verified.
 
-Port common C/LLVM kernels, weight preparation and the worker pool.
+---
 
-This stage is complete after reference comparisons and guard-page checks. Test tails and concurrent calls. The hot path has no allocations. Execution profiles and complete GEMM/GEMV call measurements are available.
+### Stage 4 — Migrate CPU Kernels to Slang AOT and Remove Legacy Target
+Deliver the Slang CPU backend improvements identified in Stage 2 and progressively migrate optimized CPU ops (including `Linear` GEMM/GEMV) to Slang AOT, keeping thin runtime, `velri_pool`, and independent references in C23.
 
-### 4. Loading a real model
+**Acceptance:** every migrated kernel passes contract tests (guard pages, ASan/UBSan, AArch64/RISC-V QEMU) and matches or beats native `VelriLib::cpu` full-call throughput; remove deprecated `VelriLib::cpu_linear` once regressions are retired. Verify Windows (Clang + native worker pool) and Android NDK builds.
 
-Add configuration, LTQ and weight loading, a supported tokenizer and chat template, and `inspect` and `run` commands.
+---
 
-This stage is complete when token IDs and logits agree with an independent implementation and memory reports truthfully describe usage.
+### Stage 5 — Real Model Loading
+Implement JSON configuration (`yyjson`), weight-format loading, initial dense family adapters (`Llama` / `Qwen3`), tokenizer, chat templates, and CLI `inspect` / `run`.
 
-### 5. First Vulkan execution
+**Acceptance:** full-model `token IDs` and logits match an independent reference; `inspect` accurately reports devices, resolved placement, and memory budgets.
 
-Add device discovery and capabilities, GPU memory, SPIR-V, operations for the selected model formats and a small decoder. Vulkan uses the same interface as CPU and the test module. The common planner needs no new device-name branches.
+---
 
-This stage is complete after numerical comparison with CPU and validation checks. Measurements are needed across GPU families and on Android. Missing device capabilities must be reported correctly.
+### Stage 6 — First Vulkan Backend
+Integrate `Vulkan-Headers`, `volk`, `VMA`, and Slang SPIR-V kernels (Vulkan 1.1 baseline + capability-gated `CoopMat`/subgroups/FP16/BF16/INT8).
 
-### 6. CPU and GPU working together
+**Acceptance:** end-to-end Vulkan decoder matches CPU within tolerances, passes Vulkan API and synchronization validation layers, and is measured across multiple GPU vendors and Android.
 
-Add CPU/GPU data and compute placement, the common RAM route, explicit conversions and operation dependencies. Then connect disk-table loading.
+---
 
-This stage is complete when changing placement preserves results within numerical tolerances. Check rejection for insufficient support, permitted alternative selection during preparation, cancellation, peak memory and crossing latency at p50 and p99.
+### Stage 7 — Hybrid CPU + Vulkan Execution
+Implement mixed CPU + GPU plans over RAM staging, explicit layout conversions, cross-queue/pool dependencies ([velri-lib/docs/EN/execution.md](../../velri-lib/docs/EN/execution.md)), followed by disk-backed tables (PLE).
 
-### 7. Broader computation support
+**Acceptance:** changing placement (`vulkan:0` / `cpu:0` / `ram:0` / `disk`) preserves accuracy within tolerances; peak memory (including UMA), cancellation, errors, and transfer p50/p99 latencies are verified.
 
-Add further attention and recurrent mechanisms, MoE, LTQ fast paths and fusion with measured benefits.
+---
 
-This stage is complete when each mechanism and the whole model are tested. Common blocks have no model-family branches.
+### Stage 8 — Advanced Architectures and Quantized Paths
+Add `GatedDeltaNet`, `QSA`, `MoE`, `Hyper-Connections`, `PLE`, fused Slang paths such as bufferless `K = RoPE(V * w_k)` (`Gemma 4`), plus the active low-bit quantization format and `velri-quantize`.
 
-### 8. Applications and multiple requests
+**Acceptance:** each mechanism and full model match independent reference implementations; shared blocks remain free of family-name branches.
 
-Develop CLI and chat, HTTP, batching, prefix reuse, speculation and media support.
+---
 
-This stage is complete when sessions are isolated, queues are bounded and capacity is controlled. Partial acceptance and rollback are tested.
+### Stage 9 — Applications and Multi-Request Serving
+Build out CLI/chat, optional HTTP/SSE server (`serve`), multi-request batching, `prefix reuse`, speculative decoding (`MTP` / `Gemma4Assistant`), and multimodal encoders (`ViT`, `Conformer`, direct patch projection).
 
-## What survives code replacement
-
-The current Rust code may be removed during the transition. What matters long term is the knowledge and verifiable results it helped establish:
-
-- LTQ v1 and external fixtures;
-- common mathematical block contracts;
-- storage-owner accounting rules;
-- verified numerical tests and independent reference data;
-- measurements identifying the implementation they describe.
-
-Old sources may be archived for reference if useful. The plan does not require continuously maintaining a runnable Rust version until its replacement exists. Before deletion, preserve knowledge, test scenarios and data for checking the new implementation. Archived Rust measurements must not be renamed as C/Vulkan results.
-
-Do not automatically port twenty build units, unused settings, CUDA protocols and additional barriers. Check a concrete use case before fixing each C contract.
-
-Pin exact library versions with a working build. Proposals and open decisions are listed in [dependencies.md](dependencies.md).
-
-The C++ dependency policy and conditional VMA choice remain open. Dynamic backend loading and a stable binary ABI are separate future decisions.
-
-## Separate quantizer work
-
-Calibration and native quantization develop separately from applications. They need model loading and execution, but must not depend on HTTP or the serving scheduler.
-
-Until a native backward path exists, verified research profiles can be imported. Modular forward execution does not mean backward is implemented. Format and quantization details are in the [LTQ design](ltq-design.md).
+**Acceptance:** strict session isolation, bounded queues with backpressure, clean cancellation on client disconnect, and verified speculative commit/rollback.

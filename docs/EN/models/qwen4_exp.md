@@ -2,7 +2,7 @@
 
 [Русский](../../RU/models/qwen4_exp.md)
 
-These are family implementation requirements, not a description of a working execution path. The C23 engine composes it from [common blocks](../blocks.md); the [backend registry](../backends.md) determines support for concrete operations and representations, starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
+These are family implementation requirements, not a description of a working execution path. The C23 engine composes it from [common blocks](../blocks-and-config.md); the [backend registry](../../../velri-lib/docs/EN/architecture.md#5-backend-registry-and-shared-contract) determines support for concrete operations and representations, starting with CPU and Vulkan. Terms are defined in the [glossary](../glossary.md).
 
 The **`qwen4_exp`** architecture (`Qwen3.8-Flash-Next`) extends the hybrid [`qwen3_next` / `qwen3_5_moe`](qwen3_next.md) foundation with three additional modules: Query-Sparse Attention (`QSA`), four-stream residual connections (`Hyper-Connections`), and n-gram Per-Layer Embeddings (`PLE`).
 
@@ -12,7 +12,7 @@ The **`qwen4_exp`** architecture (`Qwen3.8-Flash-Next`) extends the hybrid [`qwe
 
 | Component | `config.json` Parameters | Engine Requirements |
 | :--- | :--- | :--- |
-| **3 : 1 Hybrid Backbone** | 48 layers: 36 `GatedDeltaNet` layers and 12 `full_attention` layers (`full_attention_interval: 4`) | `DeltaNet` kernel and session-owned recurrent state ([storage ownership](../architecture.md#how-memory-is-organized)) |
+| **3 : 1 Hybrid Backbone** | 48 layers: 36 `GatedDeltaNet` layers and 12 `full_attention` layers (`full_attention_interval: 4`) | `DeltaNet` kernel and session-owned recurrent state ([storage ownership](../../../velri-lib/docs/EN/architecture.md#3-memory-views-and-kv-roles)) |
 | **Query-Sparse Attention (`QSA`) in full layers** | `indexer_*`: 4 heads of dim 128, 2048-token budget, 4-token blocks | The indexer selects $\le 512$ blocks plus the incomplete tail per query, intersected with the causal mask. Keeping the main cache in RAM requires supported block gathering and transfer into a representation accepted by attention; direct GPU access to RAM is optional |
 | **Multi-Stream `Hyper-Connections`** | `hc_count: 4`, `hc_lowrank: 320` | The `residual` state consists of 4 parallel streams; streams are mixed into a single input vector before each sub-block (`HcMix`), the sub-block output is injected back via `block_inject_weight` (`HcInject`), and all streams are reduced before the final norm (`hyper_connection_mixer`) |
 | **N-Gram `PLE` Module** | `ple_*`, `ngram_*` | A row table that permits NVMe storage (`store: "disk"`) with explicit fetching, decoding, and transfer of rows; within each layer — per-stream key projection, shared value projection, gate, and dilated causal convolution (kernel 4, dilation 3) |
@@ -32,9 +32,9 @@ At each token position, the model computes $(\text{ngram\_size} - 1) \times \tex
 The full table comprises 16 partitions of ~20 million rows each (exact partition sizes are derived from `ngram_vocab_size_base`):
 - in `bf16`, the table occupies **102 GB**;
 - in `int8` (162 bytes per row with scale) — **~52 GB**;
-- in `TCQ4X` LTQ rings (86 bytes per row) — **~28 GB**.
+- in 4-bit row quantization (~86 bytes per row) — **~28 GB**.
 
-The row payload per generated token is $16 \times 86 = 1376\text{ bytes}$ ($\le 1.4\text{ KB}$), and all 16 row indices depend solely on token IDs known immediately after sampling. This makes NVMe storage and background row prefetching options to consider. Actual I/O volume depends on read granularity and caching; keeping I/O off the critical path is not guaranteed. The plan must account for fetch buffers, row decoding, delivery to the consumer, and waiting for readiness. Disk is a data source, not a compute backend.
+The row payload per generated token is roughly $1.4\text{ KB}$ at 4-bit quantization, and all 16 row indices depend solely on token IDs known immediately after sampling. This makes NVMe storage and background row prefetching options to consider. Actual I/O volume depends on read granularity and caching; keeping I/O off the critical path is not guaranteed. The plan must account for fetch buffers, row decoding, delivery to the consumer, and waiting for readiness. Disk is a data source, not a compute backend.
 
 ---
 

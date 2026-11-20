@@ -1,163 +1,104 @@
-# How Velri works
+# Velri Engine Architecture and Stack
 
 [Русский](../RU/architecture.md)
 
-**Velri-lib** provides mathematical operations and tools for building, preparing and executing kernel launch graphs. Velri assembles these operations into reusable blocks and model architectures, loads files and manages inference requests. [Project boundary and build](velri-lib.md).
+**Velri** owns the model and inference layer: loading model files and weights, composing architectures from reusable blocks, resolving placement rules, and managing sessions and generation. All computation, kernel launch graphs, and device backends live inside **`velri-lib/`** ([velri-lib/docs/EN/architecture.md](../../velri-lib/docs/EN/architecture.md)).
 
-Velri is an engine for running neural network models. It should load a model, perform its computations on the available hardware, and return a result to the application. For a language model, this usually means scores for the next token, from which a continuation can be selected.
+**Status:** today `VelriLib::cpu` and Velri's consumer integration test are implemented. Remaining engine modules (`src/model/`, `src/format/`, `src/runtime/`, apps) are tracked in [roadmap.md](roadmap.md).
 
-We are designing the engine in **C23, with CPU and Vulkan as the first two backends**, for Windows, Linux, and Android ARM64. Other backends will connect through a common internal C interface. C is the engine language; Vulkan is the GPU API, with kernels written in GLSL and compiled to SPIR-V.
+---
 
-This is the target architecture. The earlier Rust prototype provided configuration loading, `inspect`, LTQ validation, a computation graph, a test dense-f32 decoder with synthetic weights, and CPU kernels. The C CPU linear prototype has been extracted into Velri-lib; the C graph, common executor, Vulkan and real-model generation are not ready yet. Historical Rust package names retain the `lumen-*` prefix. Project references and paths in the documentation use `velri`.
-
-This document explains the overall structure. Definitions are collected in the [glossary](glossary.md); the [documentation index](README.md) suggests a reading order.
-
-The first concrete C component is the [CPU linear module](cpu-linear.md), with build instructions and exact reference checks. It does not yet implement the runtime or common backend interface.
-
-## What happens when a model runs
-
-Suppose an application sends a request to the engine and asks it to continue some text.
-
-1. **Load the model description and weights.** The description tells us which layers are needed, how they connect, and where their weights are stored.
-2. **Assemble the computation from reusable blocks.** A layer might contain attention, an MLP, and residual connections. This stage describes the model's mathematics.
-3. **Prepare execution.** Account for user settings and hardware capabilities: choose kernels, place data, reserve memory, and construct jobs.
-4. **Create a session.** Each request has its own token history and mutable state. Several sessions can use the same model weights.
-5. **Execute steps.** Process the input text first, then generate a continuation. Preserve the data needed again between steps.
+## 1. Request Path from Model to Output
 
 ```mermaid
 flowchart TD
-    A[Model description and weights] --> B[Computation assembled from blocks]
-    B --> C[Preparation]
-    D[User settings and hardware] --> C
-    C --> E[Program: execution plan]
-    E --> F[Execute a step]
-    S[Session: tokens and request state] --> F
-    F --> G[CPU]
-    F --> H[Vulkan / GPU]
-    F --> I[Another registered backend]
-    G --> R[Result and updated state]
-    H --> R
-    I --> R
+    Files["Model files + JSON config"] --> Model["Model: weights and topology"]
+    Model --> Blocks["Model blocks (MLP, Attention, MoE, GDN)"]
+    Blocks -->|"velri-lib C23 API"| Graph["velri-lib operation graph"]
+    Graph --> Prepare["Preparation: AOT kernels, memory plan, weight packing"]
+    Devices["Device config and limits"] --> Prepare
+    Prepare --> Program["Program: immutable execution plan"]
+    Program --> Step["Session::step (tokens + sequence state)"]
+    Step --> Backends["velri-lib backends: CPU / Vulkan / future"]
+    Backends --> Out["Logits / tokens + updated state"]
 ```
 
-This separation lets us describe a model once and choose how to execute it on a particular device. Adding a model should not require writing thread management or GPU data transfers again.
+1. **Loading (`Model`):** parse model metadata, validate weight storage, and map tensor names.
+2. **Computation description:** a family adapter composes the model from reusable blocks ([blocks-and-config.md](blocks-and-config.md)), emitting operations and explicit state accesses into a `velri-lib` graph.
+3. **Preparation (`Program`):** given JSON placement, workload limits (context, batch, memory), and available devices, `velri-lib` validates operation support, selects AOT kernels, packs constant weights, and computes the memory and transfer plan.
+4. **Execution (`Session`):** each request owns its token history, mutable state, and execution slots; one `Model` and one `Program` are shared across multiple sessions.
 
-## Who is responsible for what
+### Responsibility Split and Directory Layout
 
-| Engine part | Responsibility |
-| :--- | :--- |
-| Model description | Layer order, connections, parameters, and weight mappings |
-| Common blocks | Repeated computations: attention, MLP, MoE, normalization, and other mechanisms |
-| Preparation | Computation validation, implementation selection, data placement, and memory planning |
-| Runtime | Step execution, session state, completion, and cancellation |
-| Backends | Operation support queries, prepared kernels, memory, and execution on their devices |
-| Platform code | OS threads, processor information, files, clocks, and library loading |
+| Project / Directory | Status | Responsibility |
+| :--- | :--- | :--- |
+| Velri: `include/velri/` | Planned | Public C23 engine API (`Context`, `Model`, `Program`, `Session`) |
+| Velri: `src/model/`, `src/format/` | Planned | Family adapters, reusable blocks, JSON config, weight format readers |
+| Velri: `src/runtime/`, `apps/` | Planned | Sessions, batching, sampling, tokenization, CLI, and HTTP/SSE server |
+| Velri: `tests/integration/` | Implemented | Public C API consumer check and installed `VelriLib` package test |
+| `velri-lib/` | Partially implemented | Tensors, graph, Slang AOT kernels, CPU/Vulkan backends, `velri_pool` ([details](../../velri-lib/docs/EN/architecture.md)) |
 
-For example, an attention block states which data it needs and what it computes. Preparation chooses a suitable kernel. The CPU backend runs it on the processor, while the Vulkan backend runs it on the GPU. Backends do not need to read a model family's configuration: preparation has already supplied the necessary parameters.
+Shared blocks never branch on model-family names and contain zero device-specific code (no AVX intrinsics, Vulkan calls, or thread pools). The engine and library never create competing CPU thread pools: one shared pool belongs to the `velri-lib` context.
 
-A small model can run entirely on one device. For a large model, we plan to distribute work: attention on the GPU, selected MoE experts on the CPU, and some data on disk. This placement requires explicit transfers and an account of their cost. It should not complicate ordinary execution entirely on the CPU or GPU.
+---
 
-## How another backend connects
+## 2. Building and Integrating `velri-lib`
 
-Each backend has a registration, its own devices, and a table of C functions. Preparation asks whether a device can execute a particular operation with the specified sizes, types, and layouts. It then obtains a prepared implementation and its memory requirements. The runtime starts the work and waits for its result through a common completion interface.
+The engine and `velri-lib/` live in one Git repository and build together without submodules or network downloads. `velri-lib/` also remains a standalone CMake project that builds, tests, and installs independently.
 
-To add a backend, create its module, include its registration in the build, and run the common checks. Model descriptions and the planner do not gain conditions based on the new backend's name. A backend can start with a few operations; missing operations are placed on other devices only in a permitted mixed plan with explicit data transfers.
+```sh
+# Integrated build of Velri + velri-lib and full test suite
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
+cmake --build build
+ctest --test-dir build --output-on-failure
 
-The basic transfer route between two devices passes through RAM in an agreed data representation. An incompatible private layout requires an explicit supported conversion. A new module therefore implements transfers to and from CPU memory, rather than a separate protocol for every existing backend. Direct device-to-device copies can be added later as an optimization.
+# Standalone library build
+cmake -S velri-lib -B build-lib -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang
+cmake --build build-lib
+ctest --test-dir build-lib --output-on-failure
+```
 
-Memory, preparation, error, and registration requirements are collected in the [backend interface](backends.md). It remains an internal source interface; the first working version does not need a stable ABI for external binary plugins.
+To verify the consumer boundary against an installed `VelriLib 0.1.0 EXACT` package:
 
-## How a new architecture is added
+```sh
+cmake --install build/velri-lib --prefix /tmp/velri-lib-install
+cmake -S . -B build-pkg -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DVELRI_LIB_SOURCE_DIR= -DCMAKE_PREFIX_PATH=/tmp/velri-lib-install
+cmake --build build-pkg && ctest --test-dir build-pkg --output-on-failure
+```
 
-An architecture defines layers and their connections. Layers are assembled from blocks, and blocks from operations. The same MLP block can be used on its own and inside a MoE expert. Reusing code does not automatically give those blocks shared weights.
+---
 
-For a new model, read its settings, map weight names, assemble the required blocks, and describe persistent state. If the necessary operations already exist, kernels need no changes. If a model introduces new mathematics, add a common mechanism with explicit parameters and checks. A common block must not contain conditions such as “if this is family X, behave differently.”
+## 3. Languages, Tooling, and Dependencies
 
-Attention also has separate parts: constructing inputs, accounting for position, selecting available history, and computing the result. Full attention, sliding-window attention, QSA, and DSA can share parts, but their differences must be explicit. A single `sparse` flag is not enough. GDN separately describes its recurrent update.
+### Languages and standards
+- **C23** (`C_STANDARD=23`, `C_STANDARD_REQUIRED=ON`, `C_EXTENSIONS=OFF`) — public headers (`include/velri/`, `include/velri_lib/`), internal backend contract, and core runtime code.
+- **C++23** (`CXX_STANDARD=23`, `CXX_STANDARD_REQUIRED=ON`, `CXX_EXTENSIONS=OFF`) — allowed inside implementations (e.g., VMA integration or build tools) behind an `extern "C"` boundary. C++ types and exceptions never cross public headers.
+- **Khronos Slang** — unified language for optimized GPU and CPU compute kernels ([velri-lib/docs/EN/kernels.md](../../velri-lib/docs/EN/kernels.md)).
+- **Build tools:** CMake 3.21+, Ninja, **Clang 18+** or **GCC 14+**. Target OSes are Linux, Windows, and Android ARM64 (CI currently covers Linux x86-64, AArch64, and RISC-V 64; Windows Clang and Android NDK Clang builds are verified separately in later milestones).
 
-The graph records connections, sizes, data types, and state access. It need not turn every addition of two numbers into a separate node: an operation can be large enough for a fast kernel and have a simple decomposition for reference computation.
+### Build-time tools vs. runtime dependencies
 
-Preparation can fuse several operations, including across layer boundaries. This is allowed only when the result, state update order, and data lifetimes are preserved. Different layers can read the same resource. The [blocks document](blocks.md) gives a detailed architecture composition example.
+**The shipped engine requires no Slang (`slangc`/`libslang`), LLVM, `shaderc`, Python, PyTorch, or Rust at runtime.** All `.slang` compilation to `.spv` and CPU `.o` runs AOT on the build host.
 
-<a id="storage-is-separate-from-a-value"></a>
+| Task | Tool / Library | Status | Where Used |
+| :--- | :--- | :--- | :--- |
+| Kernel compilation (GPU & CPU) | [Khronos Slang](https://github.com/shader-slang/slang) (`slangc`, Apache-2.0 WITH LLVM-exception) | Active (Stage 2) | **Build time only (AOT):** `.slang` → SPIR-V and CPU `.o` + reflection |
+| SPIR-V validation | [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) (`spirv-val`, Apache-2.0) | Active | **Build / CI only:** validate `.spv` against target Vulkan environment |
+| Vulkan declarations | [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) (Apache-2.0/MIT) | Active | Only when Vulkan backend is enabled in `velri-lib` |
+| Vulkan loader | [volk](https://github.com/zeux/volk) (MIT, C) | Planned | Internal Vulkan layer in `velri-lib`; per-device dispatch tables |
+| GPU memory allocator | [VMA](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT, C++/C API) | Planned | Internal to Vulkan backend (`velri-lib` planner owns lifetimes) |
+| JSON parsing (config & metadata) | [yyjson](https://github.com/ibireme/yyjson) (MIT, C) | Planned | Load time only; zero JSON parsing on hot paths |
+| C unit tests & fixtures | [Unity](https://github.com/ThrowTheSwitch/Unity) (MIT) + CTest + Python | Planned / CTest active | Automated tests and independent numerical fixture generation |
 
-## How memory is organized
+CPU-only builds never require the Vulkan SDK; disabled backends add zero headers or libraries.
 
-Data descriptions and memory allocation are separate concerns. A memory region has an owner responsible for its size, capacity, placement, and release. Several views with different shapes, offsets, and strides can refer to the same region. Creating such a view does not itself copy data.
+### Optional candidates for later stages
+- **Tokenization:** [utf8proc](https://github.com/JuliaStrings/utf8proc) (Unicode normalization/categories) and [PCRE2](https://github.com/PCRE2Project/pcre2) (pre-tokenization regex) are candidates; neither replaces a full tokenizer or Jinja chat-template engine, which will be validated against exact `token IDs` on real models.
+- **HTTP/SSE server:** [CivetWeb](https://github.com/civetweb/civetweb) is a candidate for the optional `serve` app (pending streaming, backpressure, and cancellation checks).
+- **Reference BLAS for benchmarks:** BLIS / OpenBLAS as external comparison baselines only, never engine dependencies.
 
-This is especially important for attention state. **K and V describe input roles; their names do not imply two separate buffers.** A model can store them separately, use a shared region, reconstruct one input from the other, or obtain both from common compressed state. The transformations must be recorded in the graph.
-
-The allocator therefore allocates only explicitly declared regions. It knows no family names and has no special “V-only” or “K-only” mode. If both roles use the same stored data, count that data once. If a transformation needs a temporary result, account for its memory separately. A kernel can avoid materializing that result by combining the transformation with the following computation, if it supports this work.
-
-| Data | Lifetime responsibility |
-| :--- | :--- |
-| Weights and prepared storage representations | Model; release is possible after all sessions and work using them have finished |
-| Immutable job schedule and descriptions of selected kernels | `Program`, tied to the model and device context |
-| Attention history and recurrent state | `Session`; data persists between steps of one session |
-| Intermediate results, scratch, and transfer buffers | Session or individual execution slot; reuse is possible after the last consumer |
-
-Prepared weights are immutable. Their identity is determined by their source owner and version, device, implementation, and packing format: equal dimensions are not enough to permit sharing. Mutable parameters and commands belong to a session or a preallocated execution slot.
-
-Memory budgets include all simultaneously live data: source and repacked weights, physical reservation overhead, padding, state, intermediate results, and outstanding transfers. Driver memory whose size cannot be reported is marked as unknown. If the CPU and GPU share physical RAM, it cannot be counted twice as two independent memory supplies: the names host-visible and device-local do not establish independent capacities.
-
-Before execution, set limits for context length, tokens per step, and active sequences. Within these limits, use preallocated memory. Calling a general-purpose allocator for every operation during generation should not be necessary. Exceeding a limit produces a clear capacity error or requires a separate explicit growth operation once no work remains outstanding.
-
-<a id="prepare-repeated-work-once"></a>
-
-## What is done ahead of time and at each step
-
-Weight dimensions and many model connections do not change with every generated token. Preparation validates these once and looks up weights by name. It then queries support on every permitted device, accounting for shapes, types, strides, permitted aliasing, state access, and bounds on changing values. It selects placement, kernels, and weight layouts; before allocation, it makes required transfers and conversions explicit.
-
-Preparation computes repeated parts of jobs: tile sizes, worker ranges, addressing, and temporary memory requirements. Workers do not parse JSON, look up weights by name, or recompute constant geometry on every call.
-
-Tokens, positions, the current history length, MoE routes, and selected state pages change at each step. Prepared templates with bounded sizes handle these values. Changing the number of tokens or selected experts should not rebuild the entire model. Dynamic bounds still need checks: prior validation of weights does not protect against an invalid index at runtime. Already validated constants are not rescanned without a reason.
-
-The CPU thread pool belongs to the execution context. Users set the thread count; available cores, SMT, and shared caches are discovered on the actual device. Sometimes it is useful to execute several operations as one job to reduce worker coordination. Check this decision using the time for the whole step and individual phases: fewer jobs must not impede useful parallelism.
-
-Autotuning can compare execution strategies, but it must have a bounded budget and a clear, reproducible report of its choice. Its result depends on the task shape, implementation, and available resources. Winning at repeated reads of one cached matrix does not establish a speedup for a whole model. Measurement rules are in the [performance document](performance.md).
-
-## What the Vulkan backend requires
-
-The proposed API baseline is **Vulkan 1.1 compute**. Target data formats are F64, FP16, BF16 and INT8; support for storage, arithmetic and accumulation is checked separately. FP32 may be an internal accumulator or conversion format, not the universal model format. The backend checks whether the device supports each required operation, data format, and task size. Faster variants may use FP16, BF16, integer dot instructions, or cooperative matrices when the necessary capabilities are available. No fixed subgroup size is assumed. Capability checks matter more than the vendor name. [Vulkan guide](https://docs.vulkan.org/guide/latest/querying_extensions_features.html).
-
-The backend manages GPU memory, compute pipelines, descriptions of resources available to shaders, command buffers, and queues. Shaders ship as SPIR-V. All of this stays inside the backend: users of the public C API do not manage Vulkan objects. Pipeline creation and descriptor preparation happen during loading or preparation, rather than again for every token.
-
-CPU/GPU communication starts with explicit copies and Vulkan synchronization rules. If the GPU writes a result, the CPU must wait for the write to finish and gain access to current data. Shared physical memory alone does not provide this; an ordinary C atomic does not replace Vulkan synchronization either. See the [execution design](execution-design.md) for details.
-
-Windows, Linux, and Android are target platforms, not an already verified device list. CPU execution must build independently. If the user explicitly requests a GPU on which the required path is unavailable, preparation returns the reason. Preparation may choose another permitted device or a declared equivalent decomposition of an operation; the choice must appear in the report. Automatic substitution with the CPU is allowed only in a mode selected for that purpose. A backend cannot silently switch to the CPU during an executing step.
-
-## How correctness is checked
-
-Every operation must describe its inputs, outputs, state access, and temporary memory. A backend either supports these requirements or explicitly rejects the operation. It must not skip an unfamiliar operation and continue.
-
-When adding an operation in C, update its common validation, diagnostic name, and reference implementation. A backend chooses a handler from the operation description or explicitly rejects it; the common backend interface does not need a new field for every kernel. Registry checks and tests must catch missing handlers. This replaces part of the protection currently provided by exhaustive Rust `match` expressions. A backend may support only some operations, but a whole model needs a fully supported prepared plan.
-
-New mathematics gets a simple reference implementation. Compare an optimized kernel against it, then measure speed. Also compare a complete model with an independent executor: correct matrix multiplication does not establish correct layer order, masks, or state. Correctness, speed, and portability are verified separately.
-
-The public library reports errors to the calling application and does not terminate its process. Long-lived objects use opaque C handles. They have matching creation and release operations; borrowed data has a documented lifetime. Concurrency and cancellation rules are described in the [API](api.md).
-
-## How the projects are organized
-
-Velri and Velri-lib have separate Git repositories, CMake builds and tests. Velri
-links the library's exported target; it does not include private source headers
-or retain a second kernel implementation. [Build instructions](velri-lib.md).
-
-| Project / directory | Responsibility |
-| :--- | :--- |
-| Velri: `include/velri/` | Planned application API for models and requests |
-| Velri: `src/model/`, `src/format/` | Model adapters, topology, configuration and weight files |
-| Velri: `src/runtime/`, `apps/` | Requests, batching policy, generation and applications |
-| Velri-lib: `include/velri_lib/` | Computation-library C interface |
-| Velri-lib: `src/core/`, `src/ops/`, `src/graph/` | Values, storage, mathematical operations and the graph builder |
-| Velri-lib: `src/plan/`, `src/runtime/` | Memory and kernel selection, jobs, execution slots and completion |
-| Velri-lib: `src/backend/`, `src/platform/` | Device execution, CPU workers, GPU queues and OS facilities |
-
-Only the CPU linear module and engine integration test exist today; the other
-modules remain planned. Generic blocks receive mathematical parameters, never
-model-family conditionals. The engine schedules requests; the library schedules
-compute jobs, using one context-owned CPU pool. Optional backends stay within
-Velri-lib and do not become mandatory engine dependencies when disabled.
-
-First establish a verifiable path: small weights → graph → preparation → CPU execution → checked result. Preserve independent Python fixtures and reference results for comparison. Keeping the Rust implementation runnable until the new path is ready is not required. First check the common interface with a small backend that has limited operation support and controllable completion delay. Then add real models, Vulkan, and cooperation between devices. Old crates should not become C libraries one for one. Before removing old code, preserve the necessary reference data, measurements, and algorithm descriptions; CPU kernels already have a [separate document](kernel-reference.md).
-
-Tokenization and chat templates are checked separately; the library also accepts token IDs. LTQ v1's specification survives the language change. The quantizer can reuse common loading and execution, but develops separately from the server. Builds and libraries are described in the [dependency stack](dependencies.md), and acceptance criteria in the [roadmap](roadmap.md).
+### Dependency rules
+- Each integration pins an exact release/commit, checksum, and license notices; fetching is an explicit step so subsequent builds work **offline**.
+- Third-party types never appear in public `include/velri/` or `include/velri_lib/` headers.
+- Before adopting any library, verify whether it spawns internal threads or relies on mutable global state.
