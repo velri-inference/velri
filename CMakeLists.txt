@@ -31,6 +31,7 @@ add_library(velri_engine STATIC
     src/config/placement.c
     src/model/layers.c
     src/model/arch/gpt2.c
+    src/model/arch/llama.c
 )
 target_include_directories(velri_engine PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src"

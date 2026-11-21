@@ -473,6 +473,26 @@ static velri_status parse_leaf_placement(velri_json_reader *r, velri_engine_conf
     return st;
 }
 
+static void join_label4(char *dst, size_t cap, const char *a, const char *b, const char *c,
+                        const char *d) {
+    if (!dst || cap == 0U) {
+        return;
+    }
+    size_t pos = 0U;
+    const char *parts[4] = {a, b, c, d};
+    for (size_t i = 0U; i < 4U; ++i) {
+        if (!parts[i]) continue;
+        size_t n = strlen(parts[i]);
+        size_t avail = (cap - 1U) - pos;
+        if (n > avail) n = avail;
+        if (n > 0U) {
+            memcpy(dst + pos, parts[i], n);
+            pos += n;
+        }
+    }
+    dst[pos] = '\0';
+}
+
 static velri_status parse_indexer_object(velri_json_reader *r, velri_engine_config *cfg,
                                          const char *scope_prefix, const char *display_prefix,
                                          int32_t selector_idx, char *err_msg, size_t err_cap) {
@@ -507,8 +527,8 @@ static velri_status parse_indexer_object(velri_json_reader *r, velri_engine_conf
             }
             seen_keys = true;
             char sub_scope[VELRI_CFG_SCOPE_MAX], sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_scope, sizeof(sub_scope), "%s/keys", scope_prefix);
-            snprintf(sub_disp, sizeof(sub_disp), "%s.keys", display_prefix);
+            join_label4(sub_scope, sizeof(sub_scope), scope_prefix, "/keys", nullptr, nullptr);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".keys", nullptr, nullptr);
             st = parse_leaf_placement(r, cfg, sub_scope, sub_disp, selector_idx, err_msg, err_cap);
         } else {
             char kbuf[64] = {0};
@@ -556,8 +576,8 @@ static velri_status parse_attention_object(velri_json_reader *r, velri_engine_co
             }
             seen_children |= 1U;
             char sub_scope[VELRI_CFG_SCOPE_MAX], sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_scope, sizeof(sub_scope), "%s/kv-cache", scope_prefix);
-            snprintf(sub_disp, sizeof(sub_disp), "%s.kv-cache", display_prefix);
+            join_label4(sub_scope, sizeof(sub_scope), scope_prefix, "/kv-cache", nullptr, nullptr);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".kv-cache", nullptr, nullptr);
             st = parse_leaf_placement(r, cfg, sub_scope, sub_disp, selector_idx, err_msg, err_cap);
         } else if (velri_json_str_eq(key, "indexer")) {
             if (seen_children & 2U) {
@@ -566,8 +586,8 @@ static velri_status parse_attention_object(velri_json_reader *r, velri_engine_co
             }
             seen_children |= 2U;
             char sub_scope[VELRI_CFG_SCOPE_MAX], sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_scope, sizeof(sub_scope), "%s/indexer", scope_prefix);
-            snprintf(sub_disp, sizeof(sub_disp), "%s.indexer", display_prefix);
+            join_label4(sub_scope, sizeof(sub_scope), scope_prefix, "/indexer", nullptr, nullptr);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".indexer", nullptr, nullptr);
             st = parse_indexer_object(r, cfg, sub_scope, sub_disp, selector_idx, err_msg, err_cap);
         } else {
             char kbuf[64] = {0};
@@ -632,8 +652,8 @@ static velri_status parse_moe_object(velri_json_reader *r, velri_engine_config *
             }
             seen_children |= bit;
             char sub_scope[VELRI_CFG_SCOPE_MAX], sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_scope, sizeof(sub_scope), "%s/%s", scope_prefix, child);
-            snprintf(sub_disp, sizeof(sub_disp), "%s.%s", display_prefix, child);
+            join_label4(sub_scope, sizeof(sub_scope), scope_prefix, "/", child, nullptr);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".", child, nullptr);
             st = parse_leaf_placement(r, cfg, sub_scope, sub_disp, selector_idx, err_msg, err_cap);
         }
         if (st != VELRI_OK) return st;
@@ -721,7 +741,7 @@ static velri_status parse_hidden_layers_body(velri_json_reader *r, velri_engine_
             }
             seen_children |= 1U;
             char sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_disp, sizeof(sub_disp), "%s.attention", display_prefix);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".attention", nullptr, nullptr);
             st = parse_attention_object(r, cfg, "hidden-layers/attention", sub_disp, selector_idx,
                                         err_msg, err_cap);
         } else if (velri_json_str_eq(key, "dense-mlp")) {
@@ -731,7 +751,7 @@ static velri_status parse_hidden_layers_body(velri_json_reader *r, velri_engine_
             }
             seen_children |= 2U;
             char sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_disp, sizeof(sub_disp), "%s.dense-mlp", display_prefix);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".dense-mlp", nullptr, nullptr);
             st = parse_leaf_placement(r, cfg, "hidden-layers/dense-mlp", sub_disp, selector_idx,
                                       err_msg, err_cap);
         } else if (velri_json_str_eq(key, "moe")) {
@@ -741,7 +761,7 @@ static velri_status parse_hidden_layers_body(velri_json_reader *r, velri_engine_
             }
             seen_children |= 4U;
             char sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_disp, sizeof(sub_disp), "%s.moe", display_prefix);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".moe", nullptr, nullptr);
             st = parse_moe_object(r, cfg, "hidden-layers/moe", sub_disp, selector_idx, err_msg,
                                   err_cap);
         } else if (velri_json_str_eq(key, "gdn")) {
@@ -751,7 +771,7 @@ static velri_status parse_hidden_layers_body(velri_json_reader *r, velri_engine_
             }
             seen_children |= 8U;
             char sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_disp, sizeof(sub_disp), "%s.gdn", display_prefix);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".gdn", nullptr, nullptr);
             st = parse_leaf_placement(r, cfg, "hidden-layers/gdn", sub_disp, selector_idx, err_msg,
                                       err_cap);
         } else if (velri_json_str_eq(key, "conv")) {
@@ -761,7 +781,7 @@ static velri_status parse_hidden_layers_body(velri_json_reader *r, velri_engine_
             }
             seen_children |= 16U;
             char sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-            snprintf(sub_disp, sizeof(sub_disp), "%s.conv", display_prefix);
+            join_label4(sub_disp, sizeof(sub_disp), display_prefix, ".conv", nullptr, nullptr);
             st = parse_leaf_placement(r, cfg, "hidden-layers/conv", sub_disp, selector_idx, err_msg,
                                       err_cap);
         } else {
@@ -773,7 +793,7 @@ static velri_status parse_hidden_layers_body(velri_json_reader *r, velri_engine_
                 st = parse_layer_selector(kbuf, cfg, &sub_sel, err_msg, err_cap);
                 if (st != VELRI_OK) return st;
                 char sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-                snprintf(sub_disp, sizeof(sub_disp), "%s[%s]", display_prefix, kbuf);
+                join_label4(sub_disp, sizeof(sub_disp), display_prefix, "[", kbuf, "]");
                 st = parse_hidden_layers_body(r, cfg, sub_disp, sub_sel, false, err_msg, err_cap);
             } else {
                 /* Also support escaped digit-leading selector keys like "\u0030-3". */
@@ -785,7 +805,7 @@ static velri_status parse_hidden_layers_body(velri_json_reader *r, velri_engine_
                     st = parse_layer_selector(kbuf, cfg, &sub_sel, err_msg, err_cap);
                     if (st != VELRI_OK) return st;
                     char sub_disp[VELRI_CFG_RULE_LABEL_MAX];
-                    snprintf(sub_disp, sizeof(sub_disp), "%s[%s]", display_prefix, kbuf);
+                    join_label4(sub_disp, sizeof(sub_disp), display_prefix, "[", kbuf, "]");
                     st = parse_hidden_layers_body(r, cfg, sub_disp, sub_sel, false, err_msg,
                                                   err_cap);
                 } else {
@@ -1648,23 +1668,23 @@ static void apply_rule_cascade(const velri_placement_rule *rule, bool *has_store
     if (!*has_store && rule->store.kind != VELRI_LOC_UNSET) {
         *has_store = true;
         *store_spec = rule->store;
-        snprintf(store_src, src_cap, "%s.store", rule->display_rule);
+        join_label4(store_src, src_cap, rule->display_rule, ".store", nullptr, nullptr);
     }
     if (!*has_comp && rule->compute.kind != VELRI_LOC_UNSET) {
         *has_comp = true;
         *comp_spec = rule->compute;
-        snprintf(comp_src, src_cap, "%s.compute", rule->display_rule);
+        join_label4(comp_src, src_cap, rule->display_rule, ".compute", nullptr, nullptr);
     }
     if (!*has_pre) {
         if (rule->prefill_compute.kind != VELRI_LOC_UNSET) {
             *has_pre = true;
             *pre_spec = rule->prefill_compute;
-            snprintf(pre_src, src_cap, "%s.prefill-compute", rule->display_rule);
+            join_label4(pre_src, src_cap, rule->display_rule, ".prefill-compute", nullptr, nullptr);
         } else if (rule->compute.kind != VELRI_LOC_UNSET) {
             /* Optional `prefill-compute` inherits from `compute` at the winning specificity level. */
             *has_pre = true;
             *pre_spec = rule->compute;
-            snprintf(pre_src, src_cap, "%s.compute", rule->display_rule);
+            join_label4(pre_src, src_cap, rule->display_rule, ".compute", nullptr, nullptr);
         }
     }
 }

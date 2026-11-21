@@ -93,6 +93,152 @@ void velri_vk_free_buf_locked(velri_backend_device *dev, vk_buf *b) {
     free(b);
 }
 
+velri_status velri_vk_alloc_host_bda_locked(velri_backend_device *dev, size_t bytes,
+                                            VkBuffer *out_buf, VkDeviceMemory *out_mem,
+                                            VkDeviceAddress *out_bda, void **out_map) {
+    *out_buf = VK_NULL_HANDLE;
+    *out_mem = VK_NULL_HANDLE;
+    *out_bda = 0U;
+    *out_map = nullptr;
+    if (bytes == 0U) {
+        return VELRI_ERR_INVALID;
+    }
+
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkBufferCreateInfo b_ci = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = (VkDeviceSize)bytes,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    if (dev->vkCreateBuffer(dev->device, &b_ci, nullptr, &buf) != VK_SUCCESS) {
+        return VELRI_ERR_NOMEM;
+    }
+
+    VkMemoryRequirements mr;
+    dev->vkGetBufferMemoryRequirements(dev->device, buf, &mr);
+    uint32_t mtype = find_mem_type(&dev->mem_props, mr.memoryTypeBits,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mtype == UINT32_MAX) {
+        dev->vkDestroyBuffer(dev->device, buf, nullptr);
+        return VELRI_ERR_UNSUPPORTED;
+    }
+
+    VkMemoryAllocateFlagsInfo flags_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    };
+    VkMemoryAllocateInfo ma = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &flags_info,
+        .allocationSize = mr.size,
+        .memoryTypeIndex = mtype,
+    };
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (dev->vkAllocateMemory(dev->device, &ma, nullptr, &mem) != VK_SUCCESS) {
+        dev->vkDestroyBuffer(dev->device, buf, nullptr);
+        return VELRI_ERR_NOMEM;
+    }
+    void *mapped = nullptr;
+    if (dev->vkBindBufferMemory(dev->device, buf, mem, 0) != VK_SUCCESS ||
+        dev->vkMapMemory(dev->device, mem, 0, mr.size, 0, &mapped) != VK_SUCCESS) {
+        dev->vkFreeMemory(dev->device, mem, nullptr);
+        dev->vkDestroyBuffer(dev->device, buf, nullptr);
+        return VELRI_ERR_NOMEM;
+    }
+
+    VkBufferDeviceAddressInfo bda_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = buf,
+    };
+    *out_buf = buf;
+    *out_mem = mem;
+    *out_bda = dev->vkGetBufferDeviceAddress(dev->device, &bda_info);
+    *out_map = mapped;
+    return VELRI_OK;
+}
+
+velri_status velri_vk_alloc_step_slot_locked(velri_backend_device *dev, vk_step_slab **out_slab,
+                                             uint32_t *out_slot, VkDeviceAddress *out_bda,
+                                             vk_gpu_step_params **out_map) {
+    *out_slab = nullptr;
+    *out_slot = 0U;
+    *out_bda = 0U;
+    *out_map = nullptr;
+
+    for (vk_step_slab *sl = dev->step_slabs; sl != nullptr; sl = sl->next) {
+        for (uint32_t w = 0U; w < VK_STEP_SLAB_SLOTS / 64U; ++w) {
+            if (sl->used_mask[w] != UINT64_MAX) {
+                uint64_t inv = ~sl->used_mask[w];
+                uint32_t bit = 0U;
+                while (((inv >> bit) & 1ULL) == 0ULL) {
+                    bit++;
+                }
+                sl->used_mask[w] |= (1ULL << bit);
+                uint32_t slot = w * 64U + bit;
+                *out_slab = sl;
+                *out_slot = slot;
+                *out_bda = sl->bda + (VkDeviceAddress)((size_t)slot * sizeof(vk_gpu_step_params));
+                *out_map = &sl->mapped[slot];
+                return VELRI_OK;
+            }
+        }
+    }
+
+    vk_step_slab *sl = (vk_step_slab *)calloc(1U, sizeof(*sl));
+    if (!sl) {
+        return VELRI_ERR_NOMEM;
+    }
+    void *mapped = nullptr;
+    velri_status st = velri_vk_alloc_host_bda_locked(
+        dev, (size_t)VK_STEP_SLAB_SLOTS * sizeof(vk_gpu_step_params), &sl->buffer, &sl->memory,
+        &sl->bda, &mapped);
+    if (st != VELRI_OK) {
+        free(sl);
+        return st;
+    }
+    sl->mapped = (vk_gpu_step_params *)mapped;
+    sl->used_mask[0] = 1ULL;
+    sl->next = dev->step_slabs;
+    dev->step_slabs = sl;
+
+    *out_slab = sl;
+    *out_slot = 0U;
+    *out_bda = sl->bda;
+    *out_map = &sl->mapped[0];
+    return VELRI_OK;
+}
+
+void velri_vk_free_step_slot_locked(vk_step_slab *slab, uint32_t slot) {
+    if (!slab || slot >= VK_STEP_SLAB_SLOTS) {
+        return;
+    }
+    slab->used_mask[slot / 64U] &= ~(1ULL << (slot % 64U));
+}
+
+void velri_vk_free_all_step_slabs_locked(velri_backend_device *dev) {
+    if (!dev) {
+        return;
+    }
+    vk_step_slab *sl = dev->step_slabs;
+    dev->step_slabs = nullptr;
+    while (sl) {
+        vk_step_slab *next = sl->next;
+        if (sl->mapped && sl->memory && dev->vkUnmapMemory) {
+            dev->vkUnmapMemory(dev->device, sl->memory);
+        }
+        if (sl->buffer && dev->vkDestroyBuffer) {
+            dev->vkDestroyBuffer(dev->device, sl->buffer, nullptr);
+        }
+        if (sl->memory && dev->vkFreeMemory) {
+            dev->vkFreeMemory(dev->device, sl->memory, nullptr);
+        }
+        free(sl);
+        sl = next;
+    }
+}
+
 velri_status velri_vk_init_staging_buffer(velri_backend_device *dev) {
     static const size_t k_sizes[] = {
         VK_STAGE_MAX_BYTES, 4U * 1024U * 1024U, 1U * 1024U * 1024U, 256U * 1024U
@@ -227,6 +373,16 @@ static velri_status vk_copy_ram_impl(velri_backend_device *dev,
         if (st != VELRI_OK) {
             break;
         }
+        if (!to_device) {
+            VkMemoryBarrier pre_bar = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            };
+            dev->vkCmdPipelineBarrier(dev->xfer_cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0U, 1U, &pre_bar, 0U,
+                                      nullptr, 0U, nullptr);
+        }
         VkBufferCopy region = {
             .srcOffset = to_device ? 0U : (VkDeviceSize)(dev_buf->byte_offset + done),
             .dstOffset = to_device ? (VkDeviceSize)(dev_buf->byte_offset + done) : 0U,
@@ -234,6 +390,16 @@ static velri_status vk_copy_ram_impl(velri_backend_device *dev,
         };
         dev->vkCmdCopyBuffer(dev->xfer_cmd, to_device ? dev->stage_buf : vb->buffer,
                              to_device ? vb->buffer : dev->stage_buf, 1U, &region);
+        if (to_device) {
+            VkMemoryBarrier post_bar = {
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            };
+            dev->vkCmdPipelineBarrier(dev->xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0U, 1U, &post_bar, 0U,
+                                      nullptr, 0U, nullptr);
+        }
         st = xfer_end_submit_locked(dev);
         if (st != VELRI_OK) {
             break;
@@ -281,6 +447,14 @@ velri_status velri_vk_zero_mem(velri_backend_device *dev, void *mem_handle, size
     velri_status st = xfer_begin_locked(dev);
     if (st == VELRI_OK) {
         dev->vkCmdFillBuffer(dev->xfer_cmd, vb->buffer, 0U, (VkDeviceSize)fill_sz, 0U);
+        VkMemoryBarrier post_bar = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        };
+        dev->vkCmdPipelineBarrier(dev->xfer_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0U, 1U, &post_bar, 0U,
+                                  nullptr, 0U, nullptr);
         st = xfer_end_submit_locked(dev);
     }
     velri_os_mutex_unlock(dev->mtx);

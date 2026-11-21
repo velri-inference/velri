@@ -785,6 +785,185 @@ static velri_status pack_scratch_arenas(velri_plan *plan) {
     return st;
 }
 
+typedef struct {
+    velri_device_id device_id;
+    velri_arena_kind arena_kind;
+    uint32_t owner_key; /* 0 for shared slot arenas; storage_idx for VELRI_ARENA_NONE */
+    size_t start;
+    size_t end;
+} phys_span;
+
+static bool phys_span_overlaps(const phys_span *a, const phys_span *b) {
+    return a->device_id == b->device_id && a->arena_kind == b->arena_kind &&
+           a->owner_key == b->owner_key && a->start < b->end && b->start < a->end;
+}
+
+static velri_status compute_operand_span(const velri_plan *plan, uint32_t storage_idx,
+                                         const velri_tensor_view *view, phys_span *out,
+                                         bool *out_valid) {
+    *out_valid = false;
+    const velri_plan_storage *ps = &plan->storages[storage_idx];
+    if (ps->kind == VELRI_STORAGE_WEIGHT) {
+        return VELRI_OK; /* Immutable weights never participate in RAW/WAR/WAW hazards. */
+    }
+    size_t vs = 0U, ve = ps->byte_size;
+    if (velri_tensor_view_byte_span(view, &vs, &ve) != VELRI_OK) {
+        vs = 0U;
+        ve = ps->byte_size;
+    }
+    size_t base = (ps->arena_kind != VELRI_ARENA_NONE) ? ps->arena_offset : 0U;
+    size_t s0 = 0U, s1 = 0U;
+    if (velri_add_overflow_size(base, vs, &s0) || velri_add_overflow_size(base, ve, &s1)) {
+        return VELRI_ERR_OVERFLOW;
+    }
+    out->device_id = ps->device_id;
+    out->arena_kind = ps->arena_kind;
+    out->owner_key = (ps->arena_kind == VELRI_ARENA_NONE) ? storage_idx : 0U;
+    out->start = s0;
+    out->end = s1;
+    *out_valid = (s0 < s1);
+    return VELRI_OK;
+}
+
+static bool span_conflicts_list(const phys_span *sp, const phys_span *list, uint32_t count) {
+    for (uint32_t i = 0U; i < count; ++i) {
+        if (phys_span_overlaps(sp, &list[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/*
+ * Post-packing DAG Hazard & Batch-Length Analyzer:
+ *   Runs AFTER `pack_scratch_arenas` so packed scratch reuse (WAR/WAW on shared arena bytes)
+ *   is accounted for exactly. Within each contiguous same-device OP batch, tracks physical
+ *   read/write spans since the last barrier and marks hazard-free ops with
+ *   `no_barrier_before = true` so GPU backends can overlap independent dispatches.
+ */
+static velri_status analyze_dag_barriers_and_batches(velri_plan *plan) {
+    plan->max_batch_len = 0U;
+    plan->dag_total_ops = 0U;
+    plan->dag_elided_barriers = 0U;
+    if (plan->num_steps == 0U) {
+        return VELRI_OK;
+    }
+
+    phys_span *reads = nullptr;
+    phys_span *writes = nullptr;
+    uint32_t r_cnt = 0U, r_cap = 0U;
+    uint32_t w_cnt = 0U, w_cap = 0U;
+    velri_status st = VELRI_OK;
+
+    uint32_t s = 0U;
+    while (s < plan->num_steps) {
+        if (plan->steps[s].kind != VELRI_STEP_OP) {
+            s++;
+            continue;
+        }
+        velri_device_id dev = plan->steps[s].u.op.device_id;
+        uint32_t run_end = s + 1U;
+        while (run_end < plan->num_steps && plan->steps[run_end].kind == VELRI_STEP_OP &&
+               plan->steps[run_end].u.op.device_id == dev) {
+            run_end++;
+        }
+        uint32_t batch_len =
+            (plan->ctx->devices[dev].vt->submit_batch != nullptr) ? (run_end - s) : 1U;
+        if (batch_len > plan->max_batch_len) {
+            plan->max_batch_len = batch_len;
+        }
+
+        r_cnt = 0U;
+        w_cnt = 0U;
+        for (uint32_t idx = s; idx < run_end; ++idx) {
+            velri_launch_step *step = &plan->steps[idx];
+            const velri_resolved_op *op = &step->u.op.resolved;
+            plan->dag_total_ops++;
+
+            phys_span op_r[VELRI_OP_MAX_INPUTS];
+            phys_span op_w[VELRI_OP_MAX_OUTPUTS];
+            uint32_t op_rc = 0U, op_wc = 0U;
+            for (uint32_t i = 0U; i < op->num_inputs; ++i) {
+                if (!op->input_present[i]) {
+                    continue;
+                }
+                bool valid_span = false;
+                st = compute_operand_span(plan, step->u.op.in_storage_idx[i], &op->inputs[i],
+                                          &op_r[op_rc], &valid_span);
+                if (st != VELRI_OK) {
+                    goto done;
+                }
+                if (valid_span) {
+                    op_rc++;
+                }
+            }
+            for (uint32_t o = 0U; o < op->num_outputs; ++o) {
+                bool valid_span = false;
+                st = compute_operand_span(plan, step->u.op.out_storage_idx[o], &op->outputs[o],
+                                          &op_w[op_wc], &valid_span);
+                if (st != VELRI_OK) {
+                    goto done;
+                }
+                if (valid_span) {
+                    op_wc++;
+                }
+            }
+
+            if (idx == s) {
+                step->u.op.no_barrier_before = true; /* First op in batch needs no leading barrier */
+            } else {
+                bool hazard = false;
+                for (uint32_t i = 0U; i < op_rc && !hazard; ++i) {
+                    if (span_conflicts_list(&op_r[i], writes, w_cnt)) {
+                        hazard = true; /* RAW */
+                    }
+                }
+                for (uint32_t o = 0U; o < op_wc && !hazard; ++o) {
+                    if (span_conflicts_list(&op_w[o], writes, w_cnt) ||
+                        span_conflicts_list(&op_w[o], reads, r_cnt)) {
+                        hazard = true; /* WAW or WAR */
+                    }
+                }
+                if (hazard) {
+                    step->u.op.no_barrier_before = false;
+                    r_cnt = 0U;
+                    w_cnt = 0U;
+                } else {
+                    step->u.op.no_barrier_before = true;
+                    plan->dag_elided_barriers++;
+                }
+            }
+
+            if (op_rc > 0U) {
+                void *nb = nullptr;
+                if (!velri_vec_ensure(reads, &nb, &r_cap, r_cnt, op_rc, sizeof(phys_span))) {
+                    st = VELRI_ERR_NOMEM;
+                    goto done;
+                }
+                reads = (phys_span *)nb;
+                memcpy(&reads[r_cnt], op_r, (size_t)op_rc * sizeof(phys_span));
+                r_cnt += op_rc;
+            }
+            if (op_wc > 0U) {
+                void *nb = nullptr;
+                if (!velri_vec_ensure(writes, &nb, &w_cap, w_cnt, op_wc, sizeof(phys_span))) {
+                    st = VELRI_ERR_NOMEM;
+                    goto done;
+                }
+                writes = (phys_span *)nb;
+                memcpy(&writes[w_cnt], op_w, (size_t)op_wc * sizeof(phys_span));
+                w_cnt += op_wc;
+            }
+        }
+        s = run_end;
+    }
+
+done:
+    free(reads);
+    free(writes);
+    return st;
+}
+
 static void compute_memory_report(velri_plan *plan) {
     velri_memory_report *rep = &plan->report;
     memset(rep, 0, sizeof(*rep));
@@ -982,6 +1161,9 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
     if (st == VELRI_OK) {
         st = pack_scratch_arenas(plan);
     }
+    if (st == VELRI_OK) {
+        st = analyze_dag_barriers_and_batches(plan);
+    }
     if (st != VELRI_OK) {
         velri_plan_release(plan);
         return st;
@@ -1042,4 +1224,18 @@ velri_status velri_plan_memory_report(const velri_plan *plan, velri_memory_repor
 
 uint32_t velri_plan_launch_step_count(const velri_plan *plan) {
     return plan ? plan->num_steps : 0U;
+}
+
+velri_status velri_plan_barrier_stats(const velri_plan *plan, uint32_t *out_total_ops,
+                                      uint32_t *out_elided_barriers) {
+    if (!plan) {
+        return VELRI_ERR_INVALID;
+    }
+    if (out_total_ops) {
+        *out_total_ops = plan->dag_total_ops;
+    }
+    if (out_elided_barriers) {
+        *out_elided_barriers = plan->dag_elided_barriers;
+    }
+    return VELRI_OK;
 }

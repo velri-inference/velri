@@ -1,4 +1,5 @@
 #include "model/arch/gpt2.h"
+#include "model/arch/llama.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -473,6 +474,15 @@ static void run_gpt2_suite_ex(velri_context *ctx, velri_device_id store_dev,
     CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare gpt2");
     bind_all_weights(plan, &manifest, meta, w);
 
+    uint32_t dag_ops = 0U, dag_elided = 0U;
+    CHECK_OK(velri_plan_barrier_stats(plan, &dag_ops, &dag_elided), "gpt2 barrier stats");
+    CHECK(dag_ops > 0U, "gpt2 has ops");
+
+    velri_device_caps comp_caps;
+    CHECK_OK(velri_context_device_caps(ctx, compute_dev, &comp_caps), "compute caps");
+    bool expect_vk_replay = (!comp_caps.is_host_memory && store_dev == compute_dev &&
+                             expected_state_dev == compute_dev);
+
     velri_memory_report rep;
     CHECK_OK(velri_plan_memory_report(plan, &rep), "memory report");
     const velri_device_memory_report *dr_store = &rep.devices[store_dev];
@@ -549,6 +559,7 @@ static void run_gpt2_suite_ex(velri_context *ctx, velri_device_id store_dev,
     CHECK(err_pre_dec6 < 1e-4, "prefill(4)+decode(2) logits match FP64 reference");
 
     /* Slot 1: pure token-by-token decode across all 6 tokens */
+    uint64_t total_vk_replays = 0U;
     for (size_t t = 0U; t < seq_len; ++t) {
         tok_buf1[0] = seq[t];
         velri_step_params sp_dec = {
@@ -558,6 +569,11 @@ static void run_gpt2_suite_ex(velri_context *ctx, velri_device_id store_dev,
         };
         CHECK_OK(velri_slot_run(slot_decode, &sp_dec, nullptr), "pure decode");
         CHECK(velri_slot_last_run_allocs(slot_decode) == 0U, "pure decode 0 allocs");
+        total_vk_replays += velri_slot_last_run_graph_replays(slot_decode);
+    }
+    if (expect_vk_replay) {
+        CHECK(total_vk_replays >= seq_len,
+              "pure Vulkan decode must replay persistent captured command buffer every step");
     }
     double err_pre_vs_dec = max_abs_diff(logits0, logits1, meta->vocab_size);
     CHECK(err_pre_vs_dec < 1e-4, "prefill+decode matches pure decode");
@@ -574,8 +590,10 @@ static void run_gpt2_suite_ex(velri_context *ctx, velri_device_id store_dev,
           "reset slot reproduces clean prefill");
 
     memcpy(out_final_logits, logits0, logits_bytes);
-    printf("  [PASS] %-18s | prefill(4) err=%.2e | pre+dec(6) err=%.2e | pre==dec diff=%.2e | 0 allocs\n",
-           tag, err_pre4, err_pre_dec6, err_pre_vs_dec);
+    printf("  [PASS] %-18s | pre(4) err=%.2e | pre+dec(6)=%.2e | pre==dec=%.2e | "
+           "dag_elided=%u/%u | vk_replays=%llu | 0 allocs\n",
+           tag, err_pre4, err_pre_dec6, err_pre_vs_dec, dag_elided, dag_ops,
+           (unsigned long long)total_vk_replays);
 
     free(tok_buf0);
     free(tok_buf1);
@@ -635,17 +653,19 @@ static void trace_placement_cb(const char *scope_path, int32_t layer_idx, void *
 
 static void test_builder_and_layer_contracts(velri_device_id cpu_dev,
                                              const velri_model_params *meta) {
-    /* 1. RoPE layer descriptor must fail cleanly with VELRI_ERR_UNSUPPORTED until wired. */
+    /* 1. RoPE + latent_kv combination must fail cleanly with VELRI_ERR_UNSUPPORTED. */
     {
+        velri_model_params bad_meta = *meta;
+        bad_meta.latent_kv = true;
         velri_graph *g = nullptr;
-        CHECK_OK(velri_graph_create(&g), "rope neg graph");
+        CHECK_OK(velri_graph_create(&g), "rope+latent neg graph");
         velri_manifest m;
         velri_manifest_init(&m);
         velri_builder b;
         velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
 
-        velri_tensor x = velri_layer_embedding(&b, meta, "tok.weight", nullptr);
-        CHECK(x.valid && velri_b_status(&b) == VELRI_OK, "embed before rope check");
+        velri_tensor x = velri_layer_embedding(&b, &bad_meta, "tok.weight", nullptr);
+        CHECK(x.valid && velri_b_status(&b) == VELRI_OK, "embed before rope+latent check");
 
         const velri_pre_norm_layer_desc rope_desc = {
             .norm_kind = VELRI_NORM_RMS,
@@ -663,10 +683,66 @@ static void test_builder_and_layer_contracts(velri_device_id cpu_dev,
             .up_proj = "mlp.up_proj",
             .down_proj = "mlp.down_proj",
         };
-        velri_tensor out = velri_layers_pre_norm_repeat(&b, x, meta, &rope_desc);
+        velri_tensor out = velri_layers_pre_norm_repeat(&b, x, &bad_meta, &rope_desc);
         CHECK(!out.valid && velri_b_status(&b) == VELRI_ERR_UNSUPPORTED,
-              "has_rope=true must fail cleanly with VELRI_ERR_UNSUPPORTED");
+              "has_rope=true && latent_kv=true must fail cleanly with VELRI_ERR_UNSUPPORTED");
 
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+    }
+
+    /* 1b. Shared weight constructor reuses identical manifest entry, rejects shape mismatch & null manifest. */
+    {
+        const size_t d1[2] = {16U, 8U};
+        const size_t d2[2] = {16U, 4U};
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "shared weight g");
+        velri_manifest m;
+        velri_manifest_init(&m);
+        velri_builder b;
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
+        velri_tensor a = velri_b_weight_shared(&b, "model.rope.cos", VELRI_DTYPE_F32, 2U, d1);
+        velri_tensor a2 = velri_b_weight_shared(&b, "model.rope.cos", VELRI_DTYPE_F32, 2U, d1);
+        CHECK(a.valid && a2.valid && a.storage_id == a2.storage_id && m.num_weights == 1U,
+              "velri_b_weight_shared reuses storage without duplicating manifest");
+        velri_tensor bad = velri_b_weight_shared(&b, "model.rope.cos", VELRI_DTYPE_F32, 2U, d2);
+        CHECK(!bad.valid && velri_b_status(&b) == VELRI_ERR_INVALID,
+              "velri_b_weight_shared rejects shape mismatch");
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+
+        CHECK_OK(velri_graph_create(&g), "shared null manifest g");
+        velri_b_init(&b, g, nullptr, cpu_dev, cpu_dev, nullptr, nullptr);
+        velri_tensor nm = velri_b_weight_shared(&b, "model.rope.cos", VELRI_DTYPE_F32, 2U, d1);
+        CHECK(!nm.valid && velri_b_status(&b) == VELRI_ERR_INVALID,
+              "velri_b_weight_shared requires manifest");
+        velri_graph_destroy(g);
+
+        /* H4: velri_fill_rope_tables must reject negative, NaN, and Inf theta. */
+        float c_tmp[8], s_tmp[8];
+        CHECK(velri_fill_rope_tables(c_tmp, s_tmp, 2U, 8U, -10000.0f) == VELRI_ERR_INVALID,
+              "negative theta rejected");
+        CHECK(velri_fill_rope_tables(c_tmp, s_tmp, 2U, 8U, NAN) == VELRI_ERR_INVALID,
+              "NaN theta rejected");
+        CHECK(velri_fill_rope_tables(c_tmp, s_tmp, 2U, 8U, INFINITY) == VELRI_ERR_INVALID,
+              "Inf theta rejected");
+        CHECK_OK(velri_fill_rope_tables(c_tmp, s_tmp, 2U, 8U, 0.0f), "theta=0 defaults cleanly");
+
+        /* H1: velri_block_dense_attention must reject rope.enabled without explicit table names. */
+        CHECK_OK(velri_graph_create(&g), "rope missing name g");
+        velri_manifest_init(&m);
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
+        const size_t xdims[2] = {4U, 32U};
+        velri_tensor x = velri_b_input(&b, VELRI_DTYPE_F32, 2U, xdims);
+        const velri_attention_spec bad_rope = {
+            .q_name = "q", .k_name = "k", .v_name = "v", .o_name = "o",
+            .n_heads = 2U, .n_kv_heads = 2U, .head_dim = 16U, .max_ctx = 8U,
+            .causal = true, .dtype = VELRI_DTYPE_F32,
+            .rope = {.enabled = true, .cos_name = nullptr, .sin_name = nullptr},
+        };
+        velri_tensor bad_a = velri_block_dense_attention(&b, x, "l0", &bad_rope);
+        CHECK(!bad_a.valid && velri_b_status(&b) == VELRI_ERR_INVALID,
+              "dense_attention must require explicit rope cos_name/sin_name");
         velri_manifest_destroy(&m);
         velri_graph_destroy(g);
     }
@@ -781,11 +857,470 @@ static void test_builder_and_layer_contracts(velri_device_id cpu_dev,
         velri_graph_destroy(g);
     }
 
-    printf("  [PASS] builder & layer contracts (RoPE guard, dup manifest, tie_to, scopes, unwind)\n");
+    printf("  [PASS] builder & layer contracts (RoPE+latent guard, shared weight, dup manifest, tie_to, scopes, unwind)\n");
+}
+
+/* ============================================================================
+ * Synthetic Llama / Qwen2 End-to-End Suite (Pre-RMSNorm + RoPE + GQA + SwiGLU)
+ * ============================================================================ */
+
+typedef struct {
+    float *in_norm_w;
+    float *q_w, *q_b;
+    float *k_w, *k_b;
+    float *v_w, *v_b;
+    float *o_w;
+    float *post_norm_w;
+    float *gate_w;
+    float *up_w;
+    float *down_w;
+} host_llama_layer;
+
+typedef struct {
+    float *embed;
+    float *norm_w;
+    float *lm_head;
+    float *rope_cos;
+    float *rope_sin;
+    host_llama_layer *layers;
+    uint32_t n_layer;
+} host_llama_weights;
+
+static void init_llama_weights(const velri_model_params *p, host_llama_weights *w) {
+    memset(w, 0, sizeof(*w));
+    size_t d = p->hidden_size;
+    size_t q_dim = (size_t)p->num_attention_heads * p->head_dim;
+    size_t kv_dim = (size_t)p->num_key_value_heads * p->head_dim;
+    size_t inner = p->intermediate_size;
+    uint32_t rdim = p->rotary_dim ? p->rotary_dim : p->head_dim;
+    uint64_t rng = 0x11A11A26ULL;
+    float s = 0.08f;
+
+    w->embed = alloc_rand((size_t)p->vocab_size * d, &rng, 0.25f);
+    w->norm_w = alloc_ones_jitter(d, &rng, 0.05f);
+    w->lm_head = p->tie_word_embeddings ? nullptr : alloc_rand((size_t)p->vocab_size * d, &rng, 0.1f);
+    w->rope_cos = (float *)calloc((size_t)p->max_ctx * (size_t)(rdim / 2U), sizeof(float));
+    w->rope_sin = (float *)calloc((size_t)p->max_ctx * (size_t)(rdim / 2U), sizeof(float));
+    CHECK(w->rope_cos && w->rope_sin, "llama rope oom");
+    CHECK_OK(velri_fill_rope_tables(w->rope_cos, w->rope_sin, p->max_ctx, rdim, p->rope_theta),
+             "fill rope tables");
+
+    w->n_layer = p->num_hidden_layers;
+    w->layers = (host_llama_layer *)calloc(p->num_hidden_layers, sizeof(*w->layers));
+    CHECK(w->layers != nullptr, "llama layers oom");
+    for (uint32_t i = 0U; i < p->num_hidden_layers; ++i) {
+        host_llama_layer *lw = &w->layers[i];
+        lw->in_norm_w = alloc_ones_jitter(d, &rng, 0.05f);
+        lw->q_w = alloc_rand(q_dim * d, &rng, s);
+        lw->k_w = alloc_rand(kv_dim * d, &rng, s);
+        lw->v_w = alloc_rand(kv_dim * d, &rng, s);
+        if (p->qkv_bias) {
+            lw->q_b = alloc_rand(q_dim, &rng, 0.05f);
+            lw->k_b = alloc_rand(kv_dim, &rng, 0.05f);
+            lw->v_b = alloc_rand(kv_dim, &rng, 0.05f);
+        }
+        lw->o_w = alloc_rand(d * q_dim, &rng, s);
+        lw->post_norm_w = alloc_ones_jitter(d, &rng, 0.05f);
+        lw->gate_w = alloc_rand(inner * d, &rng, s);
+        lw->up_w = alloc_rand(inner * d, &rng, s);
+        lw->down_w = alloc_rand(d * inner, &rng, s);
+    }
+}
+
+static void free_llama_weights(host_llama_weights *w) {
+    if (!w) return;
+    free(w->embed);
+    free(w->norm_w);
+    free(w->lm_head);
+    free(w->rope_cos);
+    free(w->rope_sin);
+    for (uint32_t i = 0U; i < w->n_layer; ++i) {
+        free(w->layers[i].in_norm_w);
+        free(w->layers[i].q_w);
+        free(w->layers[i].q_b);
+        free(w->layers[i].k_w);
+        free(w->layers[i].k_b);
+        free(w->layers[i].v_w);
+        free(w->layers[i].v_b);
+        free(w->layers[i].o_w);
+        free(w->layers[i].post_norm_w);
+        free(w->layers[i].gate_w);
+        free(w->layers[i].up_w);
+        free(w->layers[i].down_w);
+    }
+    free(w->layers);
+}
+
+static void ref_apply_rope_fp64(double *buf, size_t n_tok, size_t n_heads, size_t hd,
+                                size_t rdim, velri_rope_mode mode, const float *cos_t,
+                                const float *sin_t) {
+    size_t half = rdim / 2U;
+    for (size_t t = 0U; t < n_tok; ++t) {
+        const float *c = cos_t + t * half;
+        const float *s = sin_t + t * half;
+        for (size_t h = 0U; h < n_heads; ++h) {
+            double *row = buf + (t * n_heads + h) * hd;
+            for (size_t i = 0U; i < half; ++i) {
+                size_t i0 = (mode == VELRI_ROPE_HALF) ? i : (i * 2U);
+                size_t i1 = (mode == VELRI_ROPE_HALF) ? (i + half) : (i * 2U + 1U);
+                double x0 = row[i0];
+                double x1 = row[i1];
+                row[i0] = x0 * (double)c[i] - x1 * (double)s[i];
+                row[i1] = x1 * (double)c[i] + x0 * (double)s[i];
+            }
+        }
+    }
+}
+
+static void ref_llama_fp64(const velri_model_params *p, const host_llama_weights *w,
+                           const int32_t *tokens, size_t n_tok, float *out_logits) {
+    size_t d = p->hidden_size;
+    size_t nh = p->num_attention_heads;
+    size_t nkvh = p->num_key_value_heads;
+    size_t hd = p->head_dim;
+    size_t q_dim = nh * hd;
+    size_t kv_dim = nkvh * hd;
+    size_t inner = p->intermediate_size;
+    size_t rdim = p->rotary_dim ? p->rotary_dim : hd;
+    double eps = (double)p->norm_eps;
+
+    double *x = (double *)calloc(n_tok * d, sizeof(double));
+    double *h = (double *)calloc(n_tok * d, sizeof(double));
+    double *q = (double *)calloc(n_tok * q_dim, sizeof(double));
+    double *k = (double *)calloc(n_tok * kv_dim, sizeof(double));
+    double *v = (double *)calloc(n_tok * kv_dim, sizeof(double));
+    double *attn = (double *)calloc(n_tok * q_dim, sizeof(double));
+    double *mlp = (double *)calloc(n_tok * inner, sizeof(double));
+    double *scores = (double *)calloc(n_tok, sizeof(double));
+    CHECK(x && h && q && k && v && attn && mlp && scores, "ref llama oom");
+
+    for (size_t t = 0U; t < n_tok; ++t) {
+        size_t tid = (size_t)tokens[t];
+        for (size_t c = 0U; c < d; ++c) {
+            x[t * d + c] = (double)w->embed[tid * d + c];
+        }
+    }
+
+    for (uint32_t l = 0U; l < p->num_hidden_layers; ++l) {
+        const host_llama_layer *lw = &w->layers[l];
+
+        /* Pre-RMSNorm 1 */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            double ss = 0.0;
+            for (size_t c = 0U; c < d; ++c) ss += x[t * d + c] * x[t * d + c];
+            double inv = 1.0 / sqrt(ss / (double)d + eps);
+            for (size_t c = 0U; c < d; ++c) h[t * d + c] = x[t * d + c] * inv * (double)lw->in_norm_w[c];
+        }
+
+        /* Split Q, K, V */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t m = 0U; m < q_dim; ++m) {
+                double acc = lw->q_b ? (double)lw->q_b[m] : 0.0;
+                for (size_t c = 0U; c < d; ++c) acc += h[t * d + c] * (double)lw->q_w[m * d + c];
+                q[t * q_dim + m] = acc;
+            }
+            for (size_t m = 0U; m < kv_dim; ++m) {
+                double ak = lw->k_b ? (double)lw->k_b[m] : 0.0;
+                double av = lw->v_b ? (double)lw->v_b[m] : 0.0;
+                for (size_t c = 0U; c < d; ++c) {
+                    ak += h[t * d + c] * (double)lw->k_w[m * d + c];
+                    av += h[t * d + c] * (double)lw->v_w[m * d + c];
+                }
+                k[t * kv_dim + m] = ak;
+                v[t * kv_dim + m] = av;
+            }
+        }
+
+        /* RoPE on Q and K */
+        ref_apply_rope_fp64(q, n_tok, nh, hd, rdim, p->rope_mode, w->rope_cos, w->rope_sin);
+        ref_apply_rope_fp64(k, n_tok, nkvh, hd, rdim, p->rope_mode, w->rope_cos, w->rope_sin);
+
+        /* Causal GQA Attention */
+        double scale = 1.0 / sqrt((double)hd);
+        size_t gsize = nh / nkvh;
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t head = 0U; head < nh; ++head) {
+                size_t kvh = head / gsize;
+                const double *qh = q + t * q_dim + head * hd;
+                double smax = -1e300;
+                for (size_t j = 0U; j <= t; ++j) {
+                    const double *kh = k + j * kv_dim + kvh * hd;
+                    double dot = 0.0;
+                    for (size_t c = 0U; c < hd; ++c) dot += qh[c] * kh[c];
+                    scores[j] = dot * scale;
+                    if (scores[j] > smax) smax = scores[j];
+                }
+                double ssum = 0.0;
+                for (size_t j = 0U; j <= t; ++j) {
+                    scores[j] = exp(scores[j] - smax);
+                    ssum += scores[j];
+                }
+                for (size_t c = 0U; c < hd; ++c) {
+                    double acc = 0.0;
+                    for (size_t j = 0U; j <= t; ++j) {
+                        const double *vh = v + j * kv_dim + kvh * hd;
+                        acc += (scores[j] / ssum) * vh[c];
+                    }
+                    attn[t * q_dim + head * hd + c] = acc;
+                }
+            }
+        }
+
+        /* o_proj + residual */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t m = 0U; m < d; ++m) {
+                double acc = 0.0;
+                for (size_t c = 0U; c < q_dim; ++c) acc += attn[t * q_dim + c] * (double)lw->o_w[m * q_dim + c];
+                x[t * d + m] += acc;
+            }
+        }
+
+        /* Pre-RMSNorm 2 */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            double ss = 0.0;
+            for (size_t c = 0U; c < d; ++c) ss += x[t * d + c] * x[t * d + c];
+            double inv = 1.0 / sqrt(ss / (double)d + eps);
+            for (size_t c = 0U; c < d; ++c) h[t * d + c] = x[t * d + c] * inv * (double)lw->post_norm_w[c];
+        }
+
+        /* SwiGLU MLP + residual */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t m = 0U; m < inner; ++m) {
+                double ag = 0.0, au = 0.0;
+                for (size_t c = 0U; c < d; ++c) {
+                    ag += h[t * d + c] * (double)lw->gate_w[m * d + c];
+                    au += h[t * d + c] * (double)lw->up_w[m * d + c];
+                }
+                double silu = ag / (1.0 + exp(-ag));
+                mlp[t * inner + m] = silu * au;
+            }
+            for (size_t m = 0U; m < d; ++m) {
+                double acc = 0.0;
+                for (size_t c = 0U; c < inner; ++c) acc += mlp[t * inner + c] * (double)lw->down_w[m * inner + c];
+                x[t * d + m] += acc;
+            }
+        }
+    }
+
+    /* Final RMSNorm on last row + LM head */
+    const double *last = x + (n_tok - 1U) * d;
+    double ss = 0.0;
+    for (size_t c = 0U; c < d; ++c) ss += last[c] * last[c];
+    double inv = 1.0 / sqrt(ss / (double)d + eps);
+    for (size_t c = 0U; c < d; ++c) h[c] = last[c] * inv * (double)w->norm_w[c];
+
+    const float *lm_w = p->tie_word_embeddings ? w->embed : w->lm_head;
+    for (uint32_t vo = 0U; vo < p->vocab_size; ++vo) {
+        double acc = 0.0;
+        for (size_t c = 0U; c < d; ++c) acc += h[c] * (double)lm_w[(size_t)vo * d + c];
+        out_logits[vo] = (float)acc;
+    }
+
+    free(x); free(h); free(q); free(k); free(v); free(attn); free(mlp); free(scores);
+}
+
+static const void *resolve_llama_weight(const velri_model_params *p, const host_llama_weights *w,
+                                        const char *name, size_t *out_bytes) {
+    size_t d = p->hidden_size;
+    size_t q_dim = (size_t)p->num_attention_heads * p->head_dim;
+    size_t kv_dim = (size_t)p->num_key_value_heads * p->head_dim;
+    size_t inner = p->intermediate_size;
+    uint32_t rdim = p->rotary_dim ? p->rotary_dim : p->head_dim;
+
+    if (strcmp(name, "model.embed_tokens.weight") == 0) {
+        *out_bytes = (size_t)p->vocab_size * d * sizeof(float);
+        return w->embed;
+    }
+    if (strcmp(name, "model.norm.weight") == 0) {
+        *out_bytes = d * sizeof(float);
+        return w->norm_w;
+    }
+    if (strcmp(name, "lm_head.weight") == 0) {
+        *out_bytes = (size_t)p->vocab_size * d * sizeof(float);
+        return w->lm_head;
+    }
+    if (strcmp(name, "model.rope.cos") == 0) {
+        *out_bytes = (size_t)p->max_ctx * (size_t)(rdim / 2U) * sizeof(float);
+        return w->rope_cos;
+    }
+    if (strcmp(name, "model.rope.sin") == 0) {
+        *out_bytes = (size_t)p->max_ctx * (size_t)(rdim / 2U) * sizeof(float);
+        return w->rope_sin;
+    }
+
+    const char *pfx = "model.layers.";
+    size_t plen = strlen(pfx);
+    if (strncmp(name, pfx, plen) == 0) {
+        const char *num = name + plen;
+        if (*num >= '0' && *num <= '9') {
+            char *end = nullptr;
+            unsigned long layer = strtoul(num, &end, 10);
+            if (end && *end == '.' && layer < p->num_hidden_layers) {
+                const host_llama_layer *lw = &w->layers[layer];
+                const char *sub = end + 1;
+                if (strcmp(sub, "input_layernorm.weight") == 0) { *out_bytes = d * sizeof(float); return lw->in_norm_w; }
+                if (strcmp(sub, "post_attention_layernorm.weight") == 0) { *out_bytes = d * sizeof(float); return lw->post_norm_w; }
+                if (strcmp(sub, "self_attn.q_proj.weight") == 0) { *out_bytes = q_dim * d * sizeof(float); return lw->q_w; }
+                if (strcmp(sub, "self_attn.q_proj.bias") == 0) { *out_bytes = q_dim * sizeof(float); return lw->q_b; }
+                if (strcmp(sub, "self_attn.k_proj.weight") == 0) { *out_bytes = kv_dim * d * sizeof(float); return lw->k_w; }
+                if (strcmp(sub, "self_attn.k_proj.bias") == 0) { *out_bytes = kv_dim * sizeof(float); return lw->k_b; }
+                if (strcmp(sub, "self_attn.v_proj.weight") == 0) { *out_bytes = kv_dim * d * sizeof(float); return lw->v_w; }
+                if (strcmp(sub, "self_attn.v_proj.bias") == 0) { *out_bytes = kv_dim * sizeof(float); return lw->v_b; }
+                if (strcmp(sub, "self_attn.o_proj.weight") == 0) { *out_bytes = d * q_dim * sizeof(float); return lw->o_w; }
+                if (strcmp(sub, "mlp.gate_proj.weight") == 0) { *out_bytes = inner * d * sizeof(float); return lw->gate_w; }
+                if (strcmp(sub, "mlp.up_proj.weight") == 0) { *out_bytes = inner * d * sizeof(float); return lw->up_w; }
+                if (strcmp(sub, "mlp.down_proj.weight") == 0) { *out_bytes = d * inner * sizeof(float); return lw->down_w; }
+            }
+        }
+    }
+    return nullptr;
+}
+
+typedef struct {
+    velri_device_id cpu_dev;
+    velri_device_id vk_dev;
+} hybrid_llama_cfg;
+
+static void hybrid_llama_placement_cb(const char *scope_path, int32_t layer_idx, void *user,
+                                      velri_device_id *out_store, velri_device_id *out_compute) {
+    (void)scope_path;
+    const hybrid_llama_cfg *hc = (const hybrid_llama_cfg *)user;
+    if (layer_idx == 0) {
+        *out_store = hc->cpu_dev;
+        *out_compute = hc->cpu_dev;
+    } else if (layer_idx >= 1) {
+        *out_store = hc->vk_dev;
+        *out_compute = hc->vk_dev;
+    }
+}
+
+static void run_llama_suite_ex(velri_context *ctx, velri_device_id default_dev,
+                               velri_placement_resolve_fn resolve_fn, void *resolve_user,
+                               uint32_t expected_rope_replicas, const char *tag,
+                               const velri_model_params *p, const host_llama_weights *w,
+                               const int32_t *seq, size_t seq_len, const float *ref_4,
+                               const float *ref_6, float *out_logits) {
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "llama g");
+    velri_manifest manifest;
+    velri_manifest_init(&manifest);
+    velri_builder b;
+    velri_b_init(&b, g, &manifest, default_dev, default_dev, resolve_fn, resolve_user);
+    CHECK_OK(velri_arch_llama_build(&b, p), "build llama");
+
+    CHECK(velri_manifest_find_weight(&manifest, "model.rope.cos") != nullptr &&
+              velri_manifest_find_weight(&manifest, "model.rope.sin") != nullptr,
+          "Llama manifest has shared RoPE tables");
+    uint32_t per_layer_w = p->qkv_bias ? 12U : 9U;
+    uint32_t base_w = (p->tie_word_embeddings ? 2U : 3U) + 2U * expected_rope_replicas;
+    uint32_t expected_w = base_w + per_layer_w * p->num_hidden_layers;
+    CHECK(manifest.num_weights == expected_w, "shared RoPE tables registered once per device");
+    CHECK(manifest.num_states == 2U * p->num_hidden_layers, "exact Llama GQA KV state count");
+
+    velri_plan *plan = nullptr;
+    CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep llama");
+    for (uint32_t i = 0U; i < manifest.num_weights; ++i) {
+        const velri_manifest_entry *e = &manifest.weights[i];
+        const char *key = e->source_name[0] ? e->source_name : e->name;
+        size_t bytes = 0U;
+        const void *ptr = resolve_llama_weight(p, w, key, &bytes);
+        CHECK(ptr != nullptr && bytes == manifest_entry_bytes(e), e->name);
+        CHECK_OK(velri_plan_bind_weight_host(plan, e->storage_id, ptr, bytes), e->name);
+    }
+
+    uint32_t dag_ops = 0U, dag_elided = 0U;
+    CHECK_OK(velri_plan_barrier_stats(plan, &dag_ops, &dag_elided), "llama barrier stats");
+    /* Every layer has parallel Q/K/V (2), parallel RoPE Q/K (1), and parallel Gate/Up (1) => >= 4/layer! */
+    CHECK(dag_elided >= 4U * p->num_hidden_layers,
+          "Llama DAG analyzer must elide barriers across parallel Q/K/V, RoPE Q/K, and Gate/Up");
+
+    velri_device_caps caps;
+    CHECK_OK(velri_context_device_caps(ctx, default_dev, &caps), "llama dev caps");
+
+    velri_slot *slot0 = nullptr;
+    velri_slot *slot1 = nullptr;
+    CHECK_OK(velri_slot_create(plan, &slot0), "llama slot0");
+    CHECK_OK(velri_slot_create(plan, &slot1), "llama slot1");
+
+    int32_t *tok0 = (int32_t *)calloc(p->max_seq_len, sizeof(int32_t));
+    int32_t *tok1 = (int32_t *)calloc(p->max_seq_len, sizeof(int32_t));
+    float *log0 = (float *)calloc(p->vocab_size, sizeof(float));
+    float *log1 = (float *)calloc(p->vocab_size, sizeof(float));
+    CHECK(tok0 && tok1 && log0 && log1, "llama io oom");
+
+    CHECK_OK(velri_slot_bind_host(slot0, manifest.token_ids_in, tok0, p->max_seq_len * sizeof(int32_t)), "t0");
+    CHECK_OK(velri_slot_bind_host(slot0, manifest.logits_out, log0, p->vocab_size * sizeof(float)), "l0");
+    CHECK_OK(velri_slot_bind_host(slot1, manifest.token_ids_in, tok1, p->max_seq_len * sizeof(int32_t)), "t1");
+    CHECK_OK(velri_slot_bind_host(slot1, manifest.logits_out, log1, p->vocab_size * sizeof(float)), "l1");
+
+    /* Prefill(4) + Decode(2) */
+    memcpy(tok0, seq, 4U * sizeof(int32_t));
+    velri_step_params sp_pre = {
+        .has_pos_offset = true, .pos_offset_override = 0U,
+        .has_seq_len = true, .seq_len_override = 4U,
+        .has_kv_len = true, .kv_len_override = 0U,
+    };
+    CHECK_OK(velri_slot_run(slot0, &sp_pre, nullptr), "llama prefill 4");
+    CHECK(velri_slot_last_run_allocs(slot0) == 0U, "llama prefill 0 allocs");
+    double err_pre4 = max_abs_diff(log0, ref_4, p->vocab_size);
+    CHECK(err_pre4 < 1e-4, "llama prefill(4) matches FP64 reference");
+
+    for (size_t t = 4U; t < seq_len; ++t) {
+        tok0[0] = seq[t];
+        velri_step_params sp_dec = {
+            .has_pos_offset = true, .pos_offset_override = t,
+            .has_seq_len = true, .seq_len_override = 1U,
+            .has_kv_len = true, .kv_len_override = t,
+        };
+        CHECK_OK(velri_slot_run(slot0, &sp_dec, nullptr), "llama dec after prefill");
+        CHECK(velri_slot_last_run_allocs(slot0) == 0U, "llama dec 0 allocs");
+    }
+    double err_pre_dec6 = max_abs_diff(log0, ref_6, p->vocab_size);
+    CHECK(err_pre_dec6 < 1e-4, "llama prefill(4)+decode(2) matches FP64 reference");
+
+    /* Pure token-by-token decode(6) */
+    uint64_t replays = 0U;
+    for (size_t t = 0U; t < seq_len; ++t) {
+        tok1[0] = seq[t];
+        velri_step_params sp_dec = {
+            .has_pos_offset = true, .pos_offset_override = t,
+            .has_seq_len = true, .seq_len_override = 1U,
+            .has_kv_len = true, .kv_len_override = t,
+        };
+        CHECK_OK(velri_slot_run(slot1, &sp_dec, nullptr), "llama pure dec");
+        CHECK(velri_slot_last_run_allocs(slot1) == 0U, "llama pure dec 0 allocs");
+        replays += velri_slot_last_run_graph_replays(slot1);
+    }
+    if (!caps.is_host_memory && !resolve_fn) {
+        CHECK(replays == seq_len, "Llama Vulkan decode must replay persistent graph every step");
+    }
+    double err_pvd = max_abs_diff(log0, log1, p->vocab_size);
+    CHECK(err_pvd < 1e-4, "llama prefill+decode == pure decode");
+
+    memcpy(out_logits, log0, p->vocab_size * sizeof(float));
+    printf("  [PASS] %-18s | pre(4) err=%.2e | pre+dec(6)=%.2e | pre==dec=%.2e | "
+           "dag_elided=%u/%u | vk_replays=%llu | 0 allocs\n",
+           tag, err_pre4, err_pre_dec6, err_pvd, dag_elided, dag_ops,
+           (unsigned long long)replays);
+
+    free(tok0); free(tok1); free(log0); free(log1);
+    velri_slot_destroy(slot1);
+    velri_slot_destroy(slot0);
+    velri_plan_destroy(plan);
+    velri_manifest_destroy(&manifest);
+    velri_graph_destroy(g);
+}
+
+static void run_llama_suite_on_device(velri_context *ctx, velri_device_id dev, const char *tag,
+                                      const velri_model_params *p, const host_llama_weights *w,
+                                      const int32_t *seq, size_t seq_len, const float *ref_4,
+                                      const float *ref_6, float *out_logits) {
+    run_llama_suite_ex(ctx, dev, nullptr, nullptr, 1U, tag, p, w, seq, seq_len, ref_4, ref_6,
+                       out_logits);
 }
 
 int main(void) {
-    printf("=== Velri End-to-End GPT-2 Architecture Suite ===\n");
+    printf("=== Velri End-to-End GPT-2 & Llama/Qwen Architecture Suite ===\n");
 
     const velri_model_params meta_std = {
         .vocab_size = 257U,
@@ -873,6 +1408,85 @@ int main(void) {
         printf("  [SKIP] vulkan:0 (not enabled or no GPU available)\n");
     }
 
+    /* Synthetic Llama / Qwen2 (Pre-RMSNorm + RoPE + GQA + SwiGLU) E2E Suite */
+    {
+        const velri_model_params llama_p = {
+            .vocab_size = 257U,
+            .max_position_embeddings = 64U,
+            .hidden_size = 128U,
+            .num_hidden_layers = 3U,
+            .num_attention_heads = 4U,
+            .num_key_value_heads = 2U,
+            .head_dim = 32U,
+            .intermediate_size = 256U,
+            .sliding_window = 0U,
+            .norm_eps = 1e-5f,
+            .hidden_act = VELRI_ACT_SILU,
+            .tie_word_embeddings = false,
+            .dtype = VELRI_DTYPE_F32,
+            .rope_theta = 500000.0f,
+            .rotary_dim = 32U,
+            .rope_mode = VELRI_ROPE_HALF,
+            .qkv_bias = true, /* exercises Qwen2 Q/K/V biases + Llama SwiGLU/GQA/RoPE */
+            .max_seq_len = 16U,
+            .max_ctx = 64U,
+            .latent_kv = false,
+        };
+        host_llama_weights lw;
+        init_llama_weights(&llama_p, &lw);
+        float *lref_4 = (float *)calloc(llama_p.vocab_size, sizeof(float));
+        float *lref_6 = (float *)calloc(llama_p.vocab_size, sizeof(float));
+        float *lcpu = (float *)calloc(llama_p.vocab_size, sizeof(float));
+        float *lvk = (float *)calloc(llama_p.vocab_size, sizeof(float));
+        CHECK(lref_4 && lref_6 && lcpu && lvk, "llama ref oom");
+        ref_llama_fp64(&llama_p, &lw, seq, 4U, lref_4);
+        ref_llama_fp64(&llama_p, &lw, seq, 6U, lref_6);
+
+        run_llama_suite_on_device(ctx, cpu_dev, "cpu:0 [llama/qwen]", &llama_p, &lw, seq, 6U,
+                                  lref_4, lref_6, lcpu);
+        if (velri_context_find_device(ctx, "vulkan", 0U, &vk_dev) == VELRI_OK) {
+            run_llama_suite_on_device(ctx, vk_dev, "vk:0  [llama/qwen]", &llama_p, &lw, seq, 6U,
+                                      lref_4, lref_6, lvk);
+            double ldiff = max_abs_diff(lcpu, lvk, llama_p.vocab_size);
+            CHECK(ldiff < 1e-4, "CPU and Vulkan Llama/Qwen logits match");
+
+            /* H2 regression: hybrid Llama (layer 0 on cpu:0, layers 1..2 on vulkan:0) replicates RoPE once/dev. */
+            float *lhyb = (float *)calloc(llama_p.vocab_size, sizeof(float));
+            CHECK(lhyb != nullptr, "hybrid llama oom");
+            hybrid_llama_cfg hcfg = {.cpu_dev = cpu_dev, .vk_dev = vk_dev};
+            run_llama_suite_ex(ctx, vk_dev, hybrid_llama_placement_cb, &hcfg, 2U,
+                               "hyb   [llama/qwen]", &llama_p, &lw, seq, 6U, lref_4, lref_6, lhyb);
+            double hdiff = max_abs_diff(lvk, lhyb, llama_p.vocab_size);
+            CHECK(hdiff < 1e-4, "Hybrid CPU+Vulkan Llama logits match pure Vulkan");
+            printf("  [PASS] llama/qwen cpu==vk=%.2e | hybrid==vk=%.2e\n", ldiff, hdiff);
+            free(lhyb);
+        }
+
+        /* Partial rotary_dim (16 < 32) + VELRI_ROPE_INTERLEAVED verification */
+        velri_model_params part_p = llama_p;
+        part_p.num_hidden_layers = 2U;
+        part_p.rotary_dim = 16U;
+        part_p.rope_mode = VELRI_ROPE_INTERLEAVED;
+        part_p.qkv_bias = false;
+        part_p.tie_word_embeddings = true;
+        host_llama_weights pw;
+        init_llama_weights(&part_p, &pw);
+        ref_llama_fp64(&part_p, &pw, seq, 4U, lref_4);
+        ref_llama_fp64(&part_p, &pw, seq, 6U, lref_6);
+        run_llama_suite_on_device(ctx, cpu_dev, "cpu:0 [part-rope]", &part_p, &pw, seq, 6U,
+                                  lref_4, lref_6, lcpu);
+        if (velri_context_find_device(ctx, "vulkan", 0U, &vk_dev) == VELRI_OK) {
+            run_llama_suite_on_device(ctx, vk_dev, "vk:0  [part-rope]", &part_p, &pw, seq, 6U,
+                                      lref_4, lref_6, lvk);
+            CHECK(max_abs_diff(lcpu, lvk, part_p.vocab_size) < 1e-4,
+                  "Partial interleaved RoPE CPU==Vulkan");
+        }
+        free_llama_weights(&pw);
+
+        free(lref_4); free(lref_6); free(lcpu); free(lvk);
+        free_llama_weights(&lw);
+    }
+
     velri_context_destroy(ctx);
     free(ref_4);
     free(ref_6);
@@ -883,6 +1497,6 @@ int main(void) {
     free(offload_lat_logits);
     free(kv_offload_logits);
     free_host_weights(&w);
-    printf("=== GPT-2 End-to-End Suite PASSED ===\n");
+    printf("=== GPT-2 & Llama/Qwen End-to-End Suite PASSED ===\n");
     return 0;
 }

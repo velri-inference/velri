@@ -50,6 +50,8 @@ static const vk_pipe_spec k_pipes[PIPE_COUNT] = {
     [PIPE_ATTENTION_DECODE_F32]  = {spv_vk_attention_decode_f32, spv_vk_attention_decode_f32_bytes, VK_CAP_NONE},
     [PIPE_ATTENTION_PREFILL_F32] = {spv_vk_attention_prefill_f32, spv_vk_attention_prefill_f32_bytes, VK_CAP_NONE},
     [PIPE_ATTENTION_WIDE_F32]    = {spv_vk_attention_wide_f32, spv_vk_attention_wide_f32_bytes, VK_CAP_NONE},
+    [PIPE_ATTENTION_SPLITKV_F32] = {spv_vk_attention_splitkv_f32, spv_vk_attention_splitkv_f32_bytes, VK_CAP_NONE},
+    [PIPE_ATTENTION_SPLITKV_REDUCE_F32] = {spv_vk_attention_splitkv_reduce_f32, spv_vk_attention_splitkv_reduce_f32_bytes, VK_CAP_NONE},
     [PIPE_BATCHED_LINEAR_NT_F32] = {spv_vk_batched_linear_nt_f32, spv_vk_batched_linear_nt_f32_bytes, VK_CAP_NONE},
     [PIPE_BATCHED_LINEAR_NN_F32] = {spv_vk_batched_linear_nn_f32, spv_vk_batched_linear_nn_f32_bytes, VK_CAP_NONE},
 };
@@ -140,6 +142,61 @@ uint32_t velri_vk_choose_split_k(uint32_t rows, uint32_t m, uint32_t k, uint32_t
     return sk;
 }
 
+bool velri_vk_splitkv_layout(uint32_t n_splits, uint32_t n_heads, uint32_t d_v,
+                             uint32_t *out_part_stride, size_t *out_bytes) {
+    if (n_splits == 0U || n_heads == 0U || d_v == 0U || d_v > UINT32_MAX - 5U) {
+        return false;
+    }
+    uint32_t part_stride = ((d_v + 2U) + 3U) & ~3U;
+    size_t tmp = 0U, elems = 0U, bytes = 0U;
+    if (velri_mul_overflow_size((size_t)n_heads, (size_t)n_splits, &tmp) ||
+        velri_mul_overflow_size(tmp, (size_t)part_stride, &elems) ||
+        velri_mul_overflow_size(elems, sizeof(float), &bytes)) {
+        return false;
+    }
+    if (out_part_stride) {
+        *out_part_stride = part_stride;
+    }
+    if (out_bytes) {
+        *out_bytes = bytes;
+    }
+    return true;
+}
+
+uint32_t velri_vk_choose_split_kv(uint32_t n_heads, uint32_t d_v, uint32_t kv_len) {
+    if (n_heads == 0U || d_v == 0U || kv_len < VK_SPLITKV_MIN_KV_LEN) {
+        return 1U;
+    }
+    /* Target ~2x SM count at >=1024 keys to hide DRAM latency on 4-warp Split-KV WGs. */
+    uint32_t target_wgs = (kv_len >= 1024U) ? (VK_TARGET_WGS * 2U) : VK_TARGET_WGS;
+    uint32_t sp = velri_div_ceil_u32(target_wgs, n_heads);
+    if (sp < 2U) {
+        return 1U;
+    }
+    uint32_t by_len = kv_len / 64U;
+    if (sp > by_len) {
+        sp = by_len;
+    }
+    if (sp > VK_SPLITKV_MAX_SPLITS) {
+        sp = VK_SPLITKV_MAX_SPLITS;
+    }
+    /* Quantize to power-of-2 buckets {2, 4, 8, 16} for O(1) persistent graph capture reuse. */
+    uint32_t p2 = VK_SPLITKV_MAX_SPLITS;
+    while (p2 > sp && p2 > 1U) {
+        p2 >>= 1U;
+    }
+    sp = p2;
+    while (sp >= 2U) {
+        size_t bytes = 0U;
+        if (velri_vk_splitkv_layout(sp, n_heads, d_v, nullptr, &bytes) &&
+            (uint64_t)bytes <= VK_SPLITK_MAX_BYTES) {
+            return sp;
+        }
+        sp >>= 1U;
+    }
+    return 1U;
+}
+
 static void select_coopmat_plan(const velri_backend_device *dev, uint32_t rows, uint32_t m,
                                 int gemv_id, int cm64_id, int cm128_id,
                                 struct velri_prepared_op *out_plan) {
@@ -162,6 +219,8 @@ velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const ve
     out_plan->reduce_pipe_id = -1;
     out_plan->stage2_decode_pipe_id = -1;
     out_plan->stage2_prefill_pipe_id = -1;
+    out_plan->stage2_splitkv_pipe_id = -1;
+    out_plan->stage3_splitkv_reduce_pipe_id = -1;
     out_plan->split_k = 1U;
     out_plan->splitk_bytes = 0U;
 
@@ -258,6 +317,19 @@ velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const ve
         if (!velri_op_attn_is_wide(dk, dv)) {
             out_plan->stage2_decode_pipe_id = PIPE_ATTENTION_DECODE_F32;
             out_plan->stage2_prefill_pipe_id = PIPE_ATTENTION_PREFILL_F32;
+            out_plan->stage2_splitkv_pipe_id = PIPE_ATTENTION_SPLITKV_F32;
+            out_plan->stage3_splitkv_reduce_pipe_id = PIPE_ATTENTION_SPLITKV_REDUCE_F32;
+            uint32_t max_ctx = (uint32_t)op->outputs[1].dims[1];
+            uint32_t sw = op->raw.attr.attention.sliding_window;
+            uint32_t eff_max_kv = (sw > 0U && sw < max_ctx) ? sw : max_ctx;
+            uint32_t max_splits =
+                velri_vk_choose_split_kv(op->raw.attr.attention.n_heads, dv, eff_max_kv);
+            size_t skv_bytes = 0U;
+            if (max_splits > 1U &&
+                velri_vk_splitkv_layout(max_splits, op->raw.attr.attention.n_heads, dv, nullptr,
+                                        &skv_bytes)) {
+                out_plan->splitk_bytes = skv_bytes;
+            }
         } else {
             out_plan->stage2_decode_pipe_id = PIPE_ATTENTION_WIDE_F32;
             out_plan->stage2_prefill_pipe_id = PIPE_ATTENTION_WIDE_F32;
@@ -279,11 +351,13 @@ velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const ve
     if (!has_pipe_caps(dev, out_plan->pipe_id)) {
         return VELRI_ERR_UNSUPPORTED;
     }
-    const int opt_pipes[4] = {
+    const int opt_pipes[6] = {
         out_plan->alt_pipe_id,
         out_plan->reduce_pipe_id,
         out_plan->stage2_decode_pipe_id,
         out_plan->stage2_prefill_pipe_id,
+        out_plan->stage2_splitkv_pipe_id,
+        out_plan->stage3_splitkv_reduce_pipe_id,
     };
     for (size_t i = 0U; i < sizeof(opt_pipes) / sizeof(opt_pipes[0]); ++i) {
         if (opt_pipes[i] >= 0 && !has_pipe_caps(dev, opt_pipes[i])) {
@@ -324,12 +398,14 @@ velri_status velri_vk_prepare_op(velri_backend_device *dev, const velri_resolved
         return st;
     }
 
-    const int req_pipes[5] = {
+    const int req_pipes[7] = {
         plan.pipe_id,
         plan.alt_pipe_id,
         plan.reduce_pipe_id,
         plan.stage2_decode_pipe_id,
         plan.stage2_prefill_pipe_id,
+        plan.stage2_splitkv_pipe_id,
+        plan.stage3_splitkv_reduce_pipe_id,
     };
 
     velri_os_mutex_lock(dev->mtx);
@@ -354,6 +430,7 @@ velri_status velri_vk_prepare_op(velri_backend_device *dev, const velri_resolved
             }
             velri_vk_free_buf_locked(dev, dev->splitk_buf);
             dev->splitk_buf = nb;
+            dev->splitk_buf_gen++;
             velri_os_cond_broadcast(dev->slot_cv);
         }
     }

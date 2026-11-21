@@ -377,6 +377,8 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/attention.slang|vk_attention_decode_f32"
         "${_vk}/attention.slang|vk_attention_prefill_f32"
         "${_vk}/attention.slang|vk_attention_wide_f32"
+        "${_vk}/attention.slang|vk_attention_splitkv_f32"
+        "${_vk}/attention.slang|vk_attention_splitkv_reduce_f32"
         "${_vk}/batched_linear.slang|vk_batched_linear_nt_f32"
         "${_vk}/batched_linear.slang|vk_batched_linear_nn_f32"
     )

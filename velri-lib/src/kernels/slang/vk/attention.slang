@@ -14,6 +14,7 @@ struct KvAppendArgs {
     Ptr<float, Access.Read> v_in;
     Ptr<float> k_cache;
     Ptr<float> v_cache;
+    Ptr<uint, Access.Read> step_params; // optional [seq_len, pos_offset, kv_pos] for captured graphs
     uint rows;
     uint n_kv_heads;
     uint d_k;
@@ -36,7 +37,8 @@ void vk_kv_append_f32(uniform KvAppendArgs a, uint3 gtid : SV_GroupThreadID, uin
     uint t = gid.y;
     if (t >= a.rows) return;
 
-    uint64_t pos64 = uint64_t(a.kv_pos) + uint64_t(t);
+    uint eff_kv_pos = (a.step_params != nullptr) ? a.step_params[2] : a.kv_pos;
+    uint64_t pos64 = uint64_t(eff_kv_pos) + uint64_t(t);
     if (pos64 >= uint64_t(a.max_ctx)) return;
 
     uint k_dim = a.n_kv_heads * a.d_k;
@@ -68,6 +70,7 @@ struct AttentionArgs {
     Ptr<float, Access.Read> k_cache;
     Ptr<float, Access.Read> v_cache;
     Ptr<float> y;
+    Ptr<uint, Access.Read> step_params; // optional [seq_len, pos_offset, kv_pos] for captured graphs
     uint rows;
     uint n_heads;
     uint n_kv_heads;
@@ -342,18 +345,252 @@ void attention_wide_impl<TIter : IKeyIter>(
 
 [shader("compute")] [numthreads(256, 1, 1)]
 void vk_attention_decode_f32(uniform AttentionArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    DenseRangeIter iter = make_dense_range_iter(a.kv_pos, 0u, a.rows, a.max_ctx, a.sliding_window, a.causal);
+    uint eff_kv_pos = (a.step_params != nullptr) ? a.step_params[2] : a.kv_pos;
+    DenseRangeIter iter = make_dense_range_iter(eff_kv_pos, 0u, a.rows, a.max_ctx, a.sliding_window, a.causal);
     attention_online_impl<8u, DenseRangeIter>(a, 0u, gid.x, gtid.x, iter);
 }
 
 [shader("compute")] [numthreads(128, 1, 1)]
 void vk_attention_prefill_f32(uniform AttentionArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    DenseRangeIter iter = make_dense_range_iter(a.kv_pos, gid.x, a.rows, a.max_ctx, a.sliding_window, a.causal);
+    uint eff_kv_pos = (a.step_params != nullptr) ? a.step_params[2] : a.kv_pos;
+    DenseRangeIter iter = make_dense_range_iter(eff_kv_pos, gid.x, a.rows, a.max_ctx, a.sliding_window, a.causal);
     attention_online_impl<4u, DenseRangeIter>(a, gid.x, gid.y, gtid.x, iter);
 }
 
 [shader("compute")] [numthreads(256, 1, 1)]
 void vk_attention_wide_f32(uniform AttentionArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
-    DenseRangeIter iter = make_dense_range_iter(a.kv_pos, gid.x, a.rows, a.max_ctx, a.sliding_window, a.causal);
+    uint eff_kv_pos = (a.step_params != nullptr) ? a.step_params[2] : a.kv_pos;
+    DenseRangeIter iter = make_dense_range_iter(eff_kv_pos, gid.x, a.rows, a.max_ctx, a.sliding_window, a.causal);
     attention_wide_impl<DenseRangeIter>(a, gid.x, gid.y, gtid.x, iter);
+}
+
+// ============================================================================
+// 5. FlashDecoding Split-KV Decode (saturates high-SM GPUs on long contexts)
+// ============================================================================
+struct SplitKvArgs {
+    Ptr<float, Access.Read> q;
+    Ptr<float, Access.Read> k_cache;
+    Ptr<float, Access.Read> v_cache;
+    Ptr<float> partials; // per (h, sp): [m, l, unnormalized_acc[0..d_v-1]], stride = part_stride
+    Ptr<uint, Access.Read> step_params; // optional [seq_len, pos_offset, kv_pos] for captured graphs
+    uint n_heads;
+    uint n_kv_heads;
+    uint d_k;
+    uint d_v;
+    uint max_ctx;
+    uint kv_pos;
+    uint part_stride;
+    uint k_head_stride;
+    uint k_row_stride;
+    uint v_head_stride;
+    uint v_row_stride;
+    uint sliding_window;
+    uint causal;
+    uint n_splits;
+    uint pad;
+    float scale;
+};
+
+[shader("compute")] [numthreads(128, 1, 1)]
+void vk_attention_splitkv_f32(uniform SplitKvArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    uint h = gid.x;
+    uint sp = gid.y;
+    uint tid = gtid.x;
+    if (h >= a.n_heads || sp >= a.n_splits) return;
+
+    static const uint kP = 4u;
+    static const uint kWgSize = kP << 5u;
+
+    uint eff_kv_pos = (a.step_params != nullptr) ? a.step_params[2] : a.kv_pos;
+    DenseRangeIter full = make_dense_range_iter(eff_kv_pos, 0u, 1u, a.max_ctx, a.sliding_window, a.causal);
+    uint total_kv = full.count();
+    uint per_split = (total_kv > 0u) ? (((total_kv - 1u) / a.n_splits) + 1u) : 0u;
+    uint sp_start = sp * per_split;
+    uint sp_end = min(sp_start + per_split, total_kv);
+    uint sp_len = (sp_start < sp_end) ? (sp_end - sp_start) : 0u;
+
+    Ptr<float> slot_ptr =
+        a.partials + (uint64_t(h) * uint64_t(a.n_splits) + uint64_t(sp)) * uint64_t(a.part_stride);
+    if (sp_len == 0u) {
+        if (tid == 0u) {
+            slot_ptr[0] = kNegInfSentinel;
+            slot_ptr[1] = 0.0f;
+        }
+        return;
+    }
+
+    DenseRangeIter iter;
+    iter.start = full.start + sp_start;
+    iter.len = sp_len;
+
+    Ptr<float, Access.Read> q_ptr = a.q + uint64_t(h) * uint64_t(a.d_k);
+    for (uint d = tid; d < a.d_k; d += kWgSize) {
+        s_q[d] = q_ptr[d];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint part = tid >> 5u;
+    uint lane = tid & 31u;
+
+    float q_reg[8];
+    float acc[8];
+    [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
+        uint d = lane + (j << 5u);
+        q_reg[j] = (d < a.d_k) ? s_q[d] : 0.0f;
+        acc[j] = 0.0f;
+    }
+
+    uint group_size = a.n_heads / a.n_kv_heads;
+    uint kvh = h / group_size;
+    Ptr<float, Access.Read> k_head = a.k_cache + uint64_t(kvh) * uint64_t(a.k_head_stride);
+    Ptr<float, Access.Read> v_head = a.v_cache + uint64_t(kvh) * uint64_t(a.v_head_stride);
+    uint64_t krs64 = uint64_t(a.k_row_stride);
+    uint64_t vrs64 = uint64_t(a.v_row_stride);
+
+    float m_p = kNegInfSentinel;
+    float l_p = 0.0f;
+    uint n_iters = (sp_len - 1u) / kP + 1u;
+
+    for (uint it = 0u; it < n_iters; ++it) {
+        uint64_t k_rel = uint64_t(it) * uint64_t(kP) + uint64_t(part);
+        bool valid = (k_rel < uint64_t(sp_len));
+        uint k_idx = valid ? iter.key_index(uint(k_rel)) : 0u;
+
+        float partial_dot = 0.0f;
+        if (valid) {
+            Ptr<float, Access.Read> k_row = k_head + uint64_t(k_idx) * krs64;
+            [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
+                if ((j << 5u) < a.d_k) {
+                    uint d = lane + (j << 5u);
+                    if (d < a.d_k) {
+                        partial_dot = fma(q_reg[j], k_row[d], partial_dot);
+                    }
+                }
+            }
+        }
+
+        float score = part32_reduce_sum(partial_dot, tid, part, lane) * a.scale;
+
+        if (valid) {
+            float alpha = 1.0f;
+            float p_w = 1.0f;
+            if (l_p == 0.0f) {
+                alpha = 0.0f;
+                m_p = score;
+                l_p = 1.0f;
+            } else if (score > m_p) {
+                alpha = exp(m_p - score);
+                l_p = l_p * alpha + 1.0f;
+                m_p = score;
+            } else {
+                p_w = exp(score - m_p);
+                l_p += p_w;
+            }
+
+            Ptr<float, Access.Read> v_row = v_head + uint64_t(k_idx) * vrs64;
+            [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
+                if ((j << 5u) < a.d_v) {
+                    uint d = lane + (j << 5u);
+                    if (d < a.d_v) {
+                        acc[j] = fma(acc[j], alpha, p_w * v_row[d]);
+                    }
+                }
+            }
+        }
+    }
+
+    if (lane == 0u) {
+        s_m[part] = m_p;
+        s_l[part] = l_p;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    float m_all = s_m[0];
+    [ForceUnroll] for (uint p = 1u; p < kP; ++p) {
+        if (s_l[p] > 0.0f) {
+            m_all = max(m_all, s_m[p]);
+        }
+    }
+
+    float l_all = 0.0f;
+    [ForceUnroll] for (uint p = 0u; p < kP; ++p) {
+        if (s_l[p] > 0.0f) {
+            l_all += s_l[p] * exp(s_m[p] - m_all);
+        }
+    }
+
+    if (tid == 0u) {
+        slot_ptr[0] = m_all;
+        slot_ptr[1] = l_all;
+    }
+
+    float w_p = (l_p > 0.0f) ? exp(m_p - m_all) : 0.0f;
+    [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
+        if ((j << 5u) < a.d_v) {
+            uint d = lane + (j << 5u);
+            float sum = part32_cross_sum<kP>((d < a.d_v) ? (acc[j] * w_p) : 0.0f, tid, part, lane);
+            if (part == 0u && d < a.d_v) {
+                slot_ptr[2u + d] = sum;
+            }
+        }
+    }
+}
+
+struct SplitKvReduceArgs {
+    Ptr<float, Access.Read> partials;
+    Ptr<float> out;
+    uint n_heads;
+    uint d_v;
+    uint part_stride;
+    uint n_splits;
+};
+
+static const uint kMaxKvSplits = 32u;
+groupshared float s_skv_m[kMaxKvSplits];
+groupshared float s_skv_l[kMaxKvSplits];
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void vk_attention_splitkv_reduce_f32(uniform SplitKvReduceArgs a, uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
+    uint h = gid.x;
+    uint tid = gtid.x;
+    if (h >= a.n_heads) return;
+
+    uint eff_splits = min(a.n_splits, kMaxKvSplits);
+    uint64_t head_base = uint64_t(h) * uint64_t(a.n_splits) * uint64_t(a.part_stride);
+    uint64_t stride64 = uint64_t(a.part_stride);
+    if (tid < eff_splits) {
+        Ptr<float, Access.Read> sp_ptr = a.partials + head_base + uint64_t(tid) * stride64;
+        s_skv_m[tid] = sp_ptr[0];
+        s_skv_l[tid] = sp_ptr[1];
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid >= a.d_v) return;
+
+    float m_all = kNegInfSentinel;
+    bool any_valid = false;
+    for (uint sp = 0u; sp < eff_splits; ++sp) {
+        if (s_skv_l[sp] > 0.0f) {
+            m_all = any_valid ? max(m_all, s_skv_m[sp]) : s_skv_m[sp];
+            any_valid = true;
+        }
+    }
+
+    Ptr<float> o_ptr = a.out + uint64_t(h) * uint64_t(a.d_v);
+    if (!any_valid) {
+        o_ptr[tid] = 0.0f;
+        return;
+    }
+
+    float l_all = 0.0f;
+    float acc = 0.0f;
+    for (uint sp = 0u; sp < eff_splits; ++sp) {
+        float l_sp = s_skv_l[sp];
+        if (l_sp > 0.0f) {
+            float w = exp(s_skv_m[sp] - m_all);
+            l_all += l_sp * w;
+            acc = fma(a.partials[head_base + uint64_t(sp) * stride64 + 2u + uint64_t(tid)], w, acc);
+        }
+    }
+    o_ptr[tid] = (l_all > 0.0f) ? (acc / l_all) : 0.0f;
 }

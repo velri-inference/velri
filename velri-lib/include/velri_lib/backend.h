@@ -23,7 +23,6 @@ enum {
     VELRI_INVALID_ID = 0xFFFFFFFFU,
     VELRI_OP_MAX_INPUTS = 6,
     VELRI_OP_MAX_OUTPUTS = 3,
-    VELRI_MAX_SUBMIT_BATCH = 32,
     VELRI_ATTN_MAX_HEAD_DIM = 2048
 };
 
@@ -209,6 +208,7 @@ typedef struct {
 typedef struct velri_backend_device velri_backend_device;
 typedef struct velri_prepared_op velri_prepared_op;
 typedef struct velri_completion velri_completion;
+typedef struct velri_captured_graph velri_captured_graph;
 
 typedef struct {
     const velri_resolved_op *op;
@@ -218,6 +218,9 @@ typedef struct {
     const velri_buffer_binding *outputs;
     uint32_t num_outputs;
     const velri_step_params *params;
+    /* DAG barrier hint (default false => conservative barrier before item; true => planner proved
+     * zero RAW/WAR/WAW hazard against preceding un-barriered items in this batch). */
+    bool no_barrier_before;
 } velri_submit_item;
 
 /*
@@ -267,6 +270,15 @@ typedef struct velri_backend_vtable {
     /* 6. Completion (optional pair for asynchronous backends) */
     velri_status (*wait)(velri_backend_device *dev, velri_completion *comp);
     void (*destroy_completion)(velri_backend_device *dev, velri_completion *comp);
+
+    /* 7. Optional Persistent Launch-Graph Capture (all 3 provided together or all nullptr) */
+    velri_status (*capture_graph)(velri_backend_device *dev, const velri_submit_item *items,
+                                  uint32_t count, velri_captured_graph **out_graph); /* opt */
+    void (*destroy_captured_graph)(velri_backend_device *dev,
+                                   velri_captured_graph *graph); /* opt */
+    velri_status (*replay_graph)(velri_backend_device *dev, velri_captured_graph *graph,
+                                 const velri_step_params *params,
+                                 velri_completion **out_completion); /* opt */
 } velri_backend_vtable;
 
 /* Runtime context owning statically registered backends and open devices. */

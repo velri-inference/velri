@@ -20,12 +20,17 @@ enum {
     VK_CMD_RING_SIZE          = 8U,
     VK_STAGE_MAX_BYTES        = 16U * 1024U * 1024U,
     VK_MAX_PC_BYTES           = 128U,
-    VK_MAX_DISPATCH_STAGES    = 2U,
+    VK_MAX_DISPATCH_STAGES    = 3U,
     VK_MIN_BUF_ALIGN_BYTES    = 16U,
     VK_GEMM_F32_SMEM_BYTES    = 2U * 2U * 8U * 33U * 16U, /* 16896 B */
     VK_COOPMAT_128_SMEM_BYTES = 2U * 128U * 5U * 16U,     /* 20480 B */
     VK_TARGET_WGS             = 140U,
-    VK_GEMV_WG_SIZE           = 128U
+    VK_GEMV_WG_SIZE           = 128U,
+    VK_SPLITKV_MIN_KV_LEN     = 256U,
+    VK_SPLITKV_MAX_SPLITS     = 16U,
+    VK_SPLITKV_BUCKETS        = 4U,    /* Power-of-2 buckets: {2, 4, 8, 16} */
+    VK_STEP_SLAB_SLOTS        = 1024U, /* 64 KiB shared host-BDA slab = 1024 captured batches */
+    VK_ENC_SCRATCH_INIT_CAP   = 2048U
 };
 
 #define VK_SPLITK_MAX_BYTES (32ULL * 1024ULL * 1024ULL)
@@ -56,11 +61,11 @@ typedef struct {
 static_assert(sizeof(vk_layernorm_args) == 64, "LayerNormArgs size mismatch");
 
 typedef struct {
-    uint64_t x, cos_tbl, sin_tbl, y;
+    uint64_t x, cos_tbl, sin_tbl, y, step_params;
     uint32_t n_tokens, n_heads, head_dim, rotary_dim, pos_offset;
     uint32_t tok_sx, head_sx, tok_sy, head_sy, mode;
 } vk_rope_args;
-static_assert(sizeof(vk_rope_args) == 72, "RopeArgs size mismatch");
+static_assert(sizeof(vk_rope_args) == 80, "RopeArgs size mismatch");
 
 typedef struct {
     uint64_t x, y;
@@ -122,10 +127,10 @@ typedef struct {
 static_assert(sizeof(vk_splitk_reduce_args) == 64, "SplitKReduceArgs size mismatch");
 
 typedef struct {
-    uint64_t table, ids, out;
+    uint64_t table, ids, out, step_params;
     uint32_t rows, dim, vocab, table_stride, out_stride, pos_offset, has_ids, pad;
 } vk_embedding_args;
-static_assert(sizeof(vk_embedding_args) == 56, "EmbeddingArgs size mismatch");
+static_assert(sizeof(vk_embedding_args) == 64, "EmbeddingArgs size mismatch");
 
 typedef struct {
     uint64_t x, y;
@@ -134,17 +139,17 @@ typedef struct {
 static_assert(sizeof(vk_copy_last_row_args) == 32, "CopyLastRowArgs size mismatch");
 
 typedef struct {
-    uint64_t k_in, v_in, k_cache, v_cache;
+    uint64_t k_in, v_in, k_cache, v_cache, step_params;
     uint32_t rows, n_kv_heads, d_k, d_v, max_ctx, kv_pos;
     uint32_t k_stride, v_stride;
     uint32_t k_head_stride, k_row_stride;
     uint32_t v_head_stride, v_row_stride;
     uint32_t same_kv_cache, pad;
 } vk_kv_append_args;
-static_assert(sizeof(vk_kv_append_args) == 88, "KvAppendArgs size mismatch");
+static_assert(sizeof(vk_kv_append_args) == 96, "KvAppendArgs size mismatch");
 
 typedef struct {
-    uint64_t q, k_cache, v_cache, out;
+    uint64_t q, k_cache, v_cache, out, step_params;
     uint32_t rows, n_heads, n_kv_heads, d_k, d_v, max_ctx, kv_pos;
     uint32_t q_stride, o_stride;
     uint32_t k_head_stride, k_row_stride;
@@ -152,7 +157,32 @@ typedef struct {
     uint32_t sliding_window, causal;
     float scale;
 } vk_attention_args;
-static_assert(sizeof(vk_attention_args) == 96, "AttentionArgs size mismatch");
+static_assert(sizeof(vk_attention_args) == 104, "AttentionArgs size mismatch");
+
+typedef struct {
+    uint64_t q, k_cache, v_cache, partials, step_params;
+    uint32_t n_heads, n_kv_heads, d_k, d_v, max_ctx, kv_pos;
+    uint32_t part_stride, k_head_stride, k_row_stride;
+    uint32_t v_head_stride, v_row_stride;
+    uint32_t sliding_window, causal, n_splits, pad;
+    float scale;
+} vk_splitkv_args;
+static_assert(sizeof(vk_splitkv_args) == 104, "SplitKvArgs size mismatch");
+
+typedef struct {
+    uint64_t partials, out;
+    uint32_t n_heads, d_v, part_stride, n_splits;
+} vk_splitkv_reduce_args;
+static_assert(sizeof(vk_splitkv_reduce_args) == 32, "SplitKvReduceArgs size mismatch");
+
+/* Dynamic step-parameter uniform buffer read by persistent captured T=1 decode graphs. */
+typedef struct {
+    uint32_t seq_len;
+    uint32_t pos_offset;
+    uint32_t kv_pos;
+    uint32_t pad[13];
+} vk_gpu_step_params;
+static_assert(sizeof(vk_gpu_step_params) == 64, "vk_gpu_step_params size mismatch");
 
 typedef struct {
     uint64_t x, w, bias, y;
@@ -211,6 +241,8 @@ enum {
     PIPE_ATTENTION_DECODE_F32,
     PIPE_ATTENTION_PREFILL_F32,
     PIPE_ATTENTION_WIDE_F32,
+    PIPE_ATTENTION_SPLITKV_F32,
+    PIPE_ATTENTION_SPLITKV_REDUCE_F32,
     PIPE_BATCHED_LINEAR_NT_F32,
     PIPE_BATCHED_LINEAR_NN_F32,
     PIPE_COUNT
@@ -285,23 +317,68 @@ typedef struct {
     size_t size;
 } vk_buf;
 
+typedef struct vk_step_slab {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkDeviceAddress bda;
+    vk_gpu_step_params *mapped;
+    uint64_t used_mask[VK_STEP_SLAB_SLOTS / 64U];
+    struct vk_step_slab *next;
+} vk_step_slab;
+
 struct velri_completion {
     VkCommandPool pool;
     VkCommandBuffer cmd;
     VkFence fence;
     bool in_use;
     bool uses_splitk;
+    bool is_captured_graph;
+};
+
+struct velri_captured_graph {
+    VkCommandPool pool;
+    VkCommandBuffer cmd;
+    VkCommandBuffer splitkv_cmds[VK_SPLITKV_BUCKETS]; /* Pre-recorded buckets for n_splits={2,4,8,16} */
+    VkFence fence;
+    struct velri_completion comp;
+    vk_step_slab *step_slab;
+    uint32_t step_slot;
+    VkDeviceAddress step_bda;
+    vk_gpu_step_params *step_map;
+    bool splitkv_possible;
+    bool splitkv_uniform;
+    uint32_t splitkv_min_kv_pos;
+    uint32_t splitkv_nh;
+    uint32_t splitkv_dv;
+    uint32_t splitkv_max_ctx;
+    uint32_t splitkv_sw;
+    uint32_t splitkv_max_splits;
+    uint64_t splitkv_buf_gen;
+    bool require_explicit_pos_offset;
+    uint32_t default_pos_offset;
+    bool has_pos_bound;
+    uint32_t max_pos_offset;
+    bool has_kv_bound;
+    uint32_t max_kv_pos;
 };
 
 struct velri_prepared_op {
     int pipe_id;
-    int alt_pipe_id;            /* LINEAR: GEMV pipeline for dynamic active_rows <= 2 */
-    int reduce_pipe_id;         /* LINEAR Split-K: PIPE_SPLITK_REDUCE */
-    int stage2_decode_pipe_id;  /* ATTENTION: stage 2 decode/wide pipeline */
-    int stage2_prefill_pipe_id; /* ATTENTION: PIPE_ATTENTION_PREFILL_F32 */
+    int alt_pipe_id;                /* LINEAR: GEMV pipeline for dynamic active_rows <= 2 */
+    int reduce_pipe_id;             /* LINEAR Split-K: PIPE_SPLITK_REDUCE */
+    int stage2_decode_pipe_id;      /* ATTENTION: stage 2 decode/wide pipeline */
+    int stage2_prefill_pipe_id;     /* ATTENTION: PIPE_ATTENTION_PREFILL_F32 */
+    int stage2_splitkv_pipe_id;     /* ATTENTION: PIPE_ATTENTION_SPLITKV_F32 */
+    int stage3_splitkv_reduce_pipe_id; /* ATTENTION: PIPE_ATTENTION_SPLITKV_REDUCE_F32 */
     uint32_t split_k;
     size_t splitk_bytes;
 };
+
+typedef enum {
+    VK_SPLITK_NONE = 0,
+    VK_SPLITK_GEMM = 1,
+    VK_SPLITK_ATTN = 2
+} vk_splitk_kind;
 
 typedef struct {
     VkPipeline pipe;
@@ -313,7 +390,7 @@ typedef struct {
 typedef struct {
     vk_dispatch_stage stages[VK_MAX_DISPATCH_STAGES];
     uint32_t num_stages;
-    bool uses_splitk;
+    vk_splitk_kind splitk_kind;
     size_t splitk_bytes;
 } vk_encoded_dispatch;
 
@@ -353,8 +430,16 @@ struct velri_backend_device {
     /* Async compute submission ring (0-alloc hot path). */
     struct velri_completion ring[VK_CMD_RING_SIZE];
 
-    /* Shared Split-K partial buffer (pre-allocated in `velri_vk_prepare_op`). */
+    /* Shared Split-K / Split-KV partial buffer (pre-allocated in `velri_vk_prepare_op`). */
     vk_buf *splitk_buf;
+    uint64_t splitk_buf_gen;
+
+    /* Shared host-BDA slab pool for captured-graph `vk_gpu_step_params` (avoids per-batch VkDeviceMemory). */
+    vk_step_slab *step_slabs;
+
+    /* Pre-allocated batch-encoding scratch under `mtx` (eliminates stack cap & hot-path allocs). */
+    vk_encoded_dispatch *enc_scratch;
+    uint32_t enc_scratch_cap;
 };
 
 /* ---- Cross-TU Vulkan Backend Functions ---- */
@@ -365,11 +450,21 @@ velri_status velri_vk_open_device(uint32_t local_index, const void *cfg,
                                   velri_backend_device **out_dev);
 velri_status velri_vk_query_caps(const velri_backend_device *dev, velri_device_caps *out_caps);
 void velri_vk_close_device(velri_backend_device *dev);
+velri_status velri_vk_init_cmd_slot(velri_backend_device *dev, VkCommandPool *out_pool,
+                                    VkCommandBuffer *out_cmd, VkFence *out_fence);
 
 /* vk_memory.c */
 velri_status velri_vk_alloc_buf_locked(velri_backend_device *dev, size_t bytes, size_t align,
                                        vk_buf **out_buf);
 void velri_vk_free_buf_locked(velri_backend_device *dev, vk_buf *b);
+velri_status velri_vk_alloc_host_bda_locked(velri_backend_device *dev, size_t bytes,
+                                            VkBuffer *out_buf, VkDeviceMemory *out_mem,
+                                            VkDeviceAddress *out_bda, void **out_map);
+velri_status velri_vk_alloc_step_slot_locked(velri_backend_device *dev, vk_step_slab **out_slab,
+                                             uint32_t *out_slot, VkDeviceAddress *out_bda,
+                                             vk_gpu_step_params **out_map);
+void velri_vk_free_step_slot_locked(vk_step_slab *slab, uint32_t slot);
+void velri_vk_free_all_step_slabs_locked(velri_backend_device *dev);
 velri_status velri_vk_init_staging_buffer(velri_backend_device *dev);
 velri_status velri_vk_alloc(velri_backend_device *dev, size_t bytes, size_t align,
                             void **out_mem_handle);
@@ -386,6 +481,9 @@ bool velri_vk_splitk_layout(uint32_t sk, uint32_t rows, uint32_t m, uint32_t *ou
                             size_t *out_bytes);
 uint32_t velri_vk_choose_split_k(uint32_t rows, uint32_t m, uint32_t k, uint32_t tile_m,
                                  uint32_t tile_n, uint32_t target_wgs, uint32_t bk_elems);
+bool velri_vk_splitkv_layout(uint32_t n_splits, uint32_t n_heads, uint32_t d_v,
+                             uint32_t *out_part_stride, size_t *out_bytes);
+uint32_t velri_vk_choose_split_kv(uint32_t n_heads, uint32_t d_v, uint32_t kv_len);
 velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const velri_resolved_op *op,
                                        struct velri_prepared_op *out_plan);
 velri_status velri_vk_query_operation(const velri_backend_device *dev, const velri_resolved_op *op);

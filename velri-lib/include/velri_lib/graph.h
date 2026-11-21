@@ -78,6 +78,8 @@ velri_status velri_plan_bind_weight_host(velri_plan *plan, velri_storage_id stor
 
 velri_status velri_plan_memory_report(const velri_plan *plan, velri_memory_report *out_report);
 uint32_t velri_plan_launch_step_count(const velri_plan *plan);
+velri_status velri_plan_barrier_stats(const velri_plan *plan, uint32_t *out_total_ops,
+                                      uint32_t *out_elided_barriers);
 
 /* ---- Execution Slots (Independent, Reusable, 0 B Hot-Path Allocation) ---- */
 
@@ -101,5 +103,8 @@ velri_status velri_slot_reset(velri_slot *slot);
 
 /* Real count of backend device allocations performed during the last `velri_slot_run`. */
 uint64_t velri_slot_last_run_allocs(const velri_slot *slot);
+
+/* Count of persistent captured launch-graph replays executed during the last `velri_slot_run`. */
+uint64_t velri_slot_last_run_graph_replays(const velri_slot *slot);
 
 #endif /* VELRI_LIB_GRAPH_H */

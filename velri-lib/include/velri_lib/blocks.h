@@ -116,6 +116,8 @@ void velri_b_devices(const velri_builder *b, velri_device_id *out_store,
 
 velri_tensor velri_b_weight(velri_builder *b, const char *name, velri_dtype dtype, uint32_t rank,
                             const size_t *dims);
+velri_tensor velri_b_weight_shared(velri_builder *b, const char *name, velri_dtype dtype,
+                                   uint32_t rank, const size_t *dims);
 velri_tensor velri_b_weight_tied(velri_builder *b, const char *name, const char *tie_to,
                                  velri_dtype dtype, uint32_t rank, const size_t *dims);
 velri_tensor velri_b_input(velri_builder *b, velri_dtype dtype, uint32_t rank, const size_t *dims);
@@ -130,6 +132,8 @@ velri_tensor velri_b_subview_2d_cols(velri_builder *b, velri_tensor base, size_t
 velri_tensor velri_b_subview_2d_rows(velri_builder *b, velri_tensor base, size_t row_offset,
                                      size_t num_rows);
 velri_tensor velri_b_subview_1d(velri_builder *b, velri_tensor base, size_t offset, size_t len);
+velri_tensor velri_b_reshape_2d_to_3d(velri_builder *b, velri_tensor base, size_t d1, size_t d2);
+velri_tensor velri_b_reshape_3d_to_2d(velri_builder *b, velri_tensor base);
 
 /* ---- Primitive Operation Builders ---- */
 
@@ -146,6 +150,12 @@ velri_tensor velri_b_layernorm(velri_builder *b, velri_tensor x, velri_tensor w,
                                velri_tensor b_opt, float eps);
 velri_tensor velri_b_rmsnorm(velri_builder *b, velri_tensor x, velri_tensor w, float eps,
                              bool unit_offset);
+velri_tensor velri_b_rope(velri_builder *b, velri_tensor x, velri_tensor cos_tbl,
+                          velri_tensor sin_tbl, size_t rotary_dim, size_t pos_offset,
+                          velri_rope_mode mode);
+velri_tensor velri_b_rope_inplace(velri_builder *b, velri_tensor x, velri_tensor cos_tbl,
+                                  velri_tensor sin_tbl, size_t rotary_dim, size_t pos_offset,
+                                  velri_rope_mode mode);
 velri_tensor velri_b_activation(velri_builder *b, velri_tensor x, velri_act_kind act_kind);
 velri_tensor velri_b_activation_inplace(velri_builder *b, velri_tensor x, velri_act_kind act_kind);
 velri_tensor velri_b_gated_mlp_act(velri_builder *b, velri_tensor gate, velri_tensor up,
@@ -196,6 +206,14 @@ typedef struct {
 } velri_embedding_spec;
 
 typedef struct {
+    bool enabled;
+    uint32_t rotary_dim;  /* 0 => head_dim */
+    velri_rope_mode mode; /* VELRI_ROPE_HALF (0) or VELRI_ROPE_INTERLEAVED (1) */
+    const char *cos_name; /* Required when enabled: shared cos table manifest name */
+    const char *sin_name; /* Required when enabled: shared sin table manifest name */
+} velri_rope_spec;
+
+typedef struct {
     const char *scope;          /* Optional sub-scope pushed around the attention block */
     const char *kv_cache_scope; /* Optional sub-scope pushed around KV/latent cache state creation */
     const char *state_prefix;   /* Optional state name prefix inside layer (nullptr => "attn") */
@@ -213,8 +231,9 @@ typedef struct {
     bool causal;
     bool fused_qkv;
     bool qkv_bias;              /* Bias on Q/K/V projection (or fused QKV) */
-    bool o_bias;                /* Bias on output projection (decoupled from qkv_bias for Qwen2) */
+    bool o_bias;                /* Bias on output projection (decoupled from qkv_bias) */
     bool latent_kv;             /* True => cache single input `h_cache` + exact weight absorption */
+    velri_rope_spec rope;       /* Optional Rotary Position Embeddings applied to Q and K */
     velri_dtype dtype;
 } velri_attention_spec;
 

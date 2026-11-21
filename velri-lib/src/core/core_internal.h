@@ -145,6 +145,7 @@ typedef struct {
             velri_prepared_op *prepared; /* Optional backend handle (may be nullptr) */
             uint32_t in_storage_idx[VELRI_OP_MAX_INPUTS];
             uint32_t out_storage_idx[VELRI_OP_MAX_OUTPUTS];
+            bool no_barrier_before; /* True => DAG analysis proved no RAW/WAR/WAW hazard in batch */
         } op;
         struct {
             velri_device_id src_device_id;
@@ -175,6 +176,9 @@ struct velri_plan {
 
     velri_launch_step *steps;
     uint32_t num_steps;
+    uint32_t max_batch_len;       /* Max consecutive same-device OP steps (for 0-alloc batching) */
+    uint32_t dag_total_ops;       /* Total VELRI_STEP_OP steps in plan */
+    uint32_t dag_elided_barriers; /* Intra-batch barriers elided by DAG hazard analysis */
 
     velri_memory_report report;
 };

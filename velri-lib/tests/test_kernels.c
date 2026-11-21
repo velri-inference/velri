@@ -300,6 +300,11 @@ static void verify_attention_case(velri_context *ctx, velri_device_id dev, const
         };
         CHECK_OK(velri_slot_run(slot, &sp_dec, nullptr), label);
         CHECK(velri_slot_last_run_allocs(slot) == 0U, "attn decode 0 allocs");
+        if (strcmp(dev_tag, "vulkan:0") == 0) {
+            /* Verifies persistent graph replay works BOTH below AND above Split-KV threshold (H5)! */
+            CHECK(velri_slot_last_run_graph_replays(slot) == 1U,
+                  "Vulkan decode (incl. Split-KV buckets) must replay persistent captured graph");
+        }
         velri_ref_attention_f32(1U, nh, nkvh, hd, kv_pos, max_ctx, 0.0f, sliding_window, causal,
                                 hqkv, qkv_stride, k_in_ptr, qkv_stride, v_in_ptr, qkv_stride,
                                 hkc_ref, hvc_ref, ho_ref, q_dim);
@@ -1006,6 +1011,98 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
         /* 15d. Shared K/V cache (same_kv_cache = true, K_in == V_in, K_cache == V_cache) + head_dim = 128 */
         verify_attention_case(ctx, dev, tag, "attn_same_kv_hd128", 4U, 2U, 128U, 18U, 32U, 17U, 2U,
                               0U, true, true, 0xA77E0004ULL);
+
+        /* 15e. FlashDecoding Split-KV long-context decode (kv_len=321..324 >= 256, GQA 4Q/2KV) */
+        verify_attention_case(ctx, dev, tag, "attn_splitkv_long324_hd64", 4U, 2U, 64U, 320U, 384U,
+                              320U, 4U, 0U, true, false, 0xA77E0005ULL);
+
+        /* 15f. FlashDecoding Split-KV with sliding window = 280 (kv_len=301..303 > 280 >= 256) */
+        verify_attention_case(ctx, dev, tag, "attn_splitkv_win280_hd64", 4U, 2U, 64U, 300U, 400U,
+                              300U, 3U, 280U, true, false, 0xA77E0006ULL);
+
+        /* 15g. C1 regression: T=1 decode with has_pos_offset=true, has_kv_len=false (fallback kv_pos=pos_offset) */
+        {
+            const uint32_t nh = 4U, nkvh = 2U, hd = 32U, max_t = 4U, max_ctx = 16U;
+            const size_t q_dim = (size_t)nh * hd, kv_dim = (size_t)nkvh * hd;
+            float *hq = (float *)xcalloc((size_t)max_t * q_dim, sizeof(float));
+            float *hk = (float *)xcalloc((size_t)max_t * kv_dim, sizeof(float));
+            float *hv = (float *)xcalloc((size_t)max_t * kv_dim, sizeof(float));
+            float *ho = (float *)xcalloc((size_t)max_t * q_dim, sizeof(float));
+            float *ho_ref = (float *)xcalloc(q_dim, sizeof(float));
+            float *hkc = (float *)xcalloc((size_t)nkvh * max_ctx * hd, sizeof(float));
+            float *hvc = (float *)xcalloc((size_t)nkvh * max_ctx * hd, sizeof(float));
+            uint64_t rng = 0xC1FA11B0ULL;
+
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "c1 attn g");
+            velri_storage_id sq = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * q_dim, dev);
+            velri_storage_id sk = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * kv_dim, dev);
+            velri_storage_id sv = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * kv_dim, dev);
+            velri_storage_id so = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, (size_t)max_t * q_dim, dev);
+            velri_storage_id skc = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)nkvh * max_ctx * hd, dev);
+            velri_storage_id svc = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)nkvh * max_ctx * hd, dev);
+
+            velri_tensor_view vkc, vvc;
+            const size_t cdims[3] = {nkvh, max_ctx, hd};
+            CHECK_OK(velri_tensor_view_contiguous(skc, VELRI_DTYPE_F32, 3U, cdims, 0U, &vkc), "c1 vkc");
+            CHECK_OK(velri_tensor_view_contiguous(svc, VELRI_DTYPE_F32, 3U, cdims, 0U, &vvc), "c1 vvc");
+            velri_view_id id_kc = VELRI_INVALID_ID, id_vc = VELRI_INVALID_ID;
+            CHECK_OK(velri_graph_add_view(g, &vkc, &id_kc), "c1 add kc");
+            CHECK_OK(velri_graph_add_view(g, &vvc, &id_vc), "c1 add vc");
+
+            velri_op_desc op = {
+                .kind = VELRI_OP_ATTENTION,
+                .num_inputs = 3U,
+                .num_outputs = 3U,
+                .inputs = {
+                    add_view_2d_strided(g, sq, VELRI_DTYPE_F32, max_t, q_dim, q_dim),
+                    add_view_2d_strided(g, sk, VELRI_DTYPE_F32, max_t, kv_dim, kv_dim),
+                    add_view_2d_strided(g, sv, VELRI_DTYPE_F32, max_t, kv_dim, kv_dim),
+                },
+                .outputs = {
+                    add_view_2d_strided(g, so, VELRI_DTYPE_F32, max_t, q_dim, q_dim),
+                    id_kc,
+                    id_vc,
+                },
+                .dynamic_seq = true,
+                .attr.attention = {.n_heads = nh, .n_kv_heads = nkvh, .head_dim = hd, .causal = true},
+            };
+            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "c1 add attn");
+            velri_plan *plan = nullptr;
+            velri_slot *slot = nullptr;
+            CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "c1 prep");
+            CHECK_OK(velri_slot_create(plan, &slot), "c1 slot");
+            CHECK_OK(velri_slot_bind_host(slot, sq, hq, (size_t)max_t * q_dim * sizeof(float)), "c1 q");
+            CHECK_OK(velri_slot_bind_host(slot, sk, hk, (size_t)max_t * kv_dim * sizeof(float)), "c1 k");
+            CHECK_OK(velri_slot_bind_host(slot, sv, hv, (size_t)max_t * kv_dim * sizeof(float)), "c1 v");
+            CHECK_OK(velri_slot_bind_host(slot, so, ho, (size_t)max_t * q_dim * sizeof(float)), "c1 o");
+
+            for (size_t step = 0U; step < 5U; ++step) {
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hq, q_dim, &rng, 0.5f);
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hk, kv_dim, &rng, 0.5f);
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hv, kv_dim, &rng, 0.5f);
+                /* Intentionally omit has_kv_len: kv_pos MUST fall back to pos_offset_override! */
+                velri_step_params sp = {
+                    .has_seq_len = true,
+                    .seq_len_override = 1U,
+                    .has_pos_offset = true,
+                    .pos_offset_override = step,
+                    .has_kv_len = false,
+                };
+                CHECK_OK(velri_slot_run(slot, &sp, nullptr), "c1 run");
+                if (is_gpu) {
+                    CHECK(velri_slot_last_run_graph_replays(slot) == 1U, "c1 vk graph replay");
+                }
+                velri_ref_attention_f32(1U, nh, nkvh, hd, step, max_ctx, 0.0f, 0U, true,
+                                        hq, q_dim, hk, kv_dim, hv, kv_dim, hkc, hvc, ho_ref, q_dim);
+                CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, 1U, q_dim, q_dim) <= 5e-5,
+                      "c1 pos_offset fallback kv_pos must match FP64 ref");
+            }
+            velri_slot_destroy(slot);
+            velri_plan_destroy(plan);
+            velri_graph_destroy(g);
+            free(hq); free(hk); free(hv); free(ho); free(ho_ref); free(hkc); free(hvc);
+        }
     }
 
     /* 16. Negative contract & dynamic_seq gating tests (Findings #3 & #10) */
@@ -1570,7 +1667,144 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
         }
     }
 
-    printf("  [PASS] %-14s — all 16 ops + edge cases verified vs FP64 reference.\n", tag);
+    /* 19. Unlimited >32-op Single-Batch + DAG Barrier Elision + Persistent Graph Replay */
+    {
+        const size_t n_branches = 20U;
+        const size_t n_elems = 64U;
+        float *hx = (float *)xcalloc(n_elems, sizeof(float));
+        float *hy = (float *)xcalloc(n_elems, sizeof(float));
+        for (size_t i = 0U; i < n_elems; ++i) {
+            hx[i] = 0.25f + (float)i * 0.01f;
+        }
+
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "batch40 g");
+        velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, n_elems, dev);
+        velri_view_id vx = add_view_1d(g, sx, VELRI_DTYPE_F32, n_elems, 0U);
+        velri_storage_id sout = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, n_elems, dev);
+        velri_view_id vout = add_view_1d(g, sout, VELRI_DTYPE_F32, n_elems, 0U);
+
+        /* 20 independent parallel branches reading sx into disjoint scratch storages (19 elidable barriers). */
+        velri_view_id br_views[20];
+        for (size_t b = 0U; b < n_branches; ++b) {
+            velri_storage_id sb = add_store(g, VELRI_STORAGE_SCRATCH, VELRI_DTYPE_F32, n_elems, dev);
+            br_views[b] = add_view_1d(g, sb, VELRI_DTYPE_F32, n_elems, 0U);
+            velri_op_desc op = {
+                .kind = VELRI_OP_VEC_AXPBY,
+                .num_inputs = 1U,
+                .num_outputs = 1U,
+                .inputs = {vx},
+                .outputs = {br_views[b]},
+                .attr.axpby = {.alpha = 1.0f + 0.05f * (float)b, .beta = 0.0f},
+            };
+            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add parallel branch");
+        }
+        /* Reduce all 20 branches via 19 sequential adds + 1 final scale = 40 ops (> 32 old cap!). */
+        velri_view_id cur = br_views[0];
+        for (size_t b = 1U; b < n_branches; ++b) {
+            velri_storage_id sc = add_store(g, VELRI_STORAGE_SCRATCH, VELRI_DTYPE_F32, n_elems, dev);
+            velri_view_id dst = add_view_1d(g, sc, VELRI_DTYPE_F32, n_elems, 0U);
+            velri_op_desc op = {
+                .kind = VELRI_OP_VEC_AXPBY,
+                .num_inputs = 2U,
+                .num_outputs = 1U,
+                .inputs = {cur, br_views[b]},
+                .outputs = {dst},
+                .attr.axpby = {.alpha = 1.0f, .beta = 1.0f},
+            };
+            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add chain add");
+            cur = dst;
+        }
+        velri_op_desc fin = {
+            .kind = VELRI_OP_VEC_AXPBY,
+            .num_inputs = 1U,
+            .num_outputs = 1U,
+            .inputs = {cur},
+            .outputs = {vout},
+            .attr.axpby = {.alpha = 0.5f, .beta = 0.0f},
+        };
+        CHECK_OK(velri_graph_add_op(g, &fin, dev, nullptr), "add final scale");
+
+        velri_plan *plan = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep batch40");
+        uint32_t total_ops = 0U, elided = 0U;
+        CHECK_OK(velri_plan_barrier_stats(plan, &total_ops, &elided), "barrier stats");
+        CHECK(total_ops == 40U, "40 ops in plan");
+        CHECK(elided >= 19U, "DAG analyzer must elide >=19 barriers across 20 parallel branches");
+
+        velri_slot *slot = nullptr;
+        CHECK_OK(velri_slot_create(plan, &slot), "slot batch40");
+        CHECK_OK(velri_slot_bind_host(slot, sx, hx, n_elems * sizeof(float)), "bind x40");
+        CHECK_OK(velri_slot_bind_host(slot, sout, hy, n_elems * sizeof(float)), "bind y40");
+
+        velri_step_params sp = {.has_seq_len = true, .seq_len_override = 1U};
+        CHECK_OK(velri_slot_run(slot, &sp, nullptr), "run batch40");
+        CHECK(velri_slot_last_run_allocs(slot) == 0U, "batch40 0 allocs");
+        if (is_gpu) {
+            CHECK(velri_slot_last_run_graph_replays(slot) == 1U,
+                  "Vulkan must replay persistent captured graph for 40-op batch");
+        }
+        /* Expected scale: 0.5 * sum_{b=0..19} (1 + 0.05 * b) = 0.5 * (20 + 0.05 * 190) = 14.75 */
+        for (size_t i = 0U; i < n_elems; ++i) {
+            double ref = 14.75 * (double)hx[i];
+            CHECK(fabs((double)hy[i] - ref) <= 1e-4, "batch40 accuracy");
+        }
+
+        velri_slot_destroy(slot);
+        velri_plan_destroy(plan);
+        velri_graph_destroy(g);
+        free(hx);
+        free(hy);
+    }
+
+    /* 20. C2 regression: static Split-K GEMM must NOT be silently captured without Split-K */
+    if (is_gpu) {
+        const size_t rows = 64U, m = 512U, k = 1024U;
+        float *hx = (float *)xcalloc(rows * k, sizeof(float));
+        float *hw = (float *)xcalloc(m * k, sizeof(float));
+        float *hy = (float *)xcalloc(rows * m, sizeof(float));
+        float *hy_ref = (float *)xcalloc(rows * m, sizeof(float));
+        uint64_t rng = 0xC25B1701ULL;
+        velri_test_fill_dtype(VELRI_DTYPE_F32, hx, rows * k, &rng, 0.25f);
+        velri_test_fill_dtype(VELRI_DTYPE_F32, hw, m * k, &rng, 0.25f);
+        velri_linear_desc ld = velri_desc_f32();
+        ref_linear_run(&ld, rows, m, k, hx, k, nullptr, hw, k, nullptr, nullptr, hy_ref, m);
+
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "c2 splitk g");
+        velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows * k, dev);
+        velri_storage_id sw = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m * k, dev);
+        velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, rows * m, dev);
+        velri_op_desc op = {
+            .kind = VELRI_OP_LINEAR,
+            .num_inputs = 2U,
+            .num_outputs = 1U,
+            .inputs = {add_view_2d_strided(g, sx, VELRI_DTYPE_F32, rows, k, k),
+                       add_view_2d_strided(g, sw, VELRI_DTYPE_F32, m, k, k)},
+            .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, rows, m, m)},
+            .dynamic_seq = false,
+            .attr.linear.desc = ld,
+        };
+        CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "c2 add splitk");
+        velri_plan *plan = nullptr;
+        velri_slot *slot = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "c2 prep");
+        CHECK_OK(velri_plan_bind_weight_host(plan, sw, hw, m * k * sizeof(float)), "c2 bw");
+        CHECK_OK(velri_slot_create(plan, &slot), "c2 slot");
+        CHECK_OK(velri_slot_bind_host(slot, sx, hx, rows * k * sizeof(float)), "c2 bx");
+        CHECK_OK(velri_slot_bind_host(slot, sy, hy, rows * m * sizeof(float)), "c2 by");
+        CHECK_OK(velri_slot_run(slot, nullptr, nullptr), "c2 run");
+        CHECK(velri_slot_last_run_graph_replays(slot) == 0U,
+              "Split-K GEMM must not be bypassed by non-Split-K graph capture");
+        CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ref, hy, rows, m, m) <= 5e-3,
+              "c2 splitk gemm accuracy");
+        velri_slot_destroy(slot);
+        velri_plan_destroy(plan);
+        velri_graph_destroy(g);
+        free(hx); free(hw); free(hy); free(hy_ref);
+    }
+
+    printf("  [PASS] %-14s — all 16 ops + Split-KV + 40-op DAG batch verified vs FP64 reference.\n", tag);
 }
 
 int main(void) {

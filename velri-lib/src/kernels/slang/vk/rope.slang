@@ -7,6 +7,7 @@ struct RopeArgs<T : IElement> {
     Ptr<float, Access.Read> cos_tbl;
     Ptr<float, Access.Read> sin_tbl;
     Ptr<T.Storage> y;
+    Ptr<uint, Access.Read> step_params; // optional [seq_len, pos_offset, kv_pos] for captured graphs
     uint n_tokens;
     uint n_heads;
     uint head_dim;
@@ -21,6 +22,7 @@ struct RopeArgs<T : IElement> {
 
 void rope_gpu_impl<T : IElement, VIO : IVecIO128<T>>(RopeArgs<T> a, uint3 gid, uint3 gtid) {
     uint half_rot = a.rotary_dim >> 1u;
+    uint eff_pos = (a.step_params != nullptr) ? a.step_params[1] : a.pos_offset;
     if ((a.mode & 2u) != 0u) {
         uint v_elems = VIO.kElems;
         uint n_vec = half_rot / v_elems;
@@ -30,7 +32,7 @@ void rope_gpu_impl<T : IElement, VIO : IVecIO128<T>>(RopeArgs<T> a, uint3 gid, u
         uint t = pair / a.n_heads;
         if (t >= a.n_tokens) return;
         uint h = pair - t * a.n_heads;
-        uint64_t cs_off = (uint64_t(a.pos_offset) + uint64_t(t)) * uint64_t(half_rot);
+        uint64_t cs_off = (uint64_t(eff_pos) + uint64_t(t)) * uint64_t(half_rot);
         Ptr<T.Storage, Access.Read> xh = a.x + uint64_t(t) * uint64_t(a.tok_sx) + uint64_t(h) * uint64_t(a.head_sx);
         Ptr<T.Storage> yh = a.y + uint64_t(t) * uint64_t(a.tok_sy) + uint64_t(h) * uint64_t(a.head_sy);
 
@@ -64,7 +66,7 @@ void rope_gpu_impl<T : IElement, VIO : IVecIO128<T>>(RopeArgs<T> a, uint3 gid, u
     uint t = gid.y;
     uint h = gid.x * 8u + grp;
     if (t >= a.n_tokens || h >= a.n_heads) return;
-    uint64_t cs_off = (uint64_t(a.pos_offset) + uint64_t(t)) * uint64_t(half_rot);
+    uint64_t cs_off = (uint64_t(eff_pos) + uint64_t(t)) * uint64_t(half_rot);
     Ptr<T.Storage, Access.Read> xh = a.x + uint64_t(t) * uint64_t(a.tok_sx) + uint64_t(h) * uint64_t(a.head_sx);
     Ptr<T.Storage> yh = a.y + uint64_t(t) * uint64_t(a.tok_sy) + uint64_t(h) * uint64_t(a.head_sy);
 

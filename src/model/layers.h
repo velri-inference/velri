@@ -27,6 +27,12 @@ typedef struct {
     bool tie_word_embeddings;
     velri_dtype dtype;
 
+    /* RoPE & optional Q/K/V bias parameters (Llama / Qwen / Mistral). */
+    float rope_theta;          /* 0.0f => 10000.0f */
+    uint32_t rotary_dim;       /* 0 => head_dim */
+    velri_rope_mode rope_mode; /* VELRI_ROPE_HALF (0) or VELRI_ROPE_INTERLEAVED (1) */
+    bool qkv_bias;             /* Optional Q/K/V projection bias (e.g. true for Qwen2, false for Llama) */
+
     /* Runtime execution & memory-policy knobs (from placement/session config). */
     uint32_t max_seq_len;
     uint32_t max_ctx;
@@ -37,7 +43,7 @@ typedef struct {
     velri_norm_kind norm_kind;
     bool norm_bias;
     bool rms_unit_offset;
-    bool has_rope;         /* True when attention applies RoPE (currently returns UNSUPPORTED until RoPE wired) */
+    bool has_rope;         /* True when attention applies Rotary Position Embeddings to Q and K */
     bool fused_qkv;
     bool qkv_bias;
     bool o_bias;
@@ -79,5 +85,9 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
 
 velri_tensor velri_layer_lm_head(velri_builder *b, velri_tensor x, const velri_model_params *p,
                                  const velri_lm_head_desc *desc);
+
+/* Populate precomputed RoPE cos/sin tables (`[max_ctx, rotary_dim / 2]` F32) in FP64 precision. */
+velri_status velri_fill_rope_tables(float *cos_out, float *sin_out, uint32_t max_ctx,
+                                    uint32_t rotary_dim, float theta);
 
 #endif /* VELRI_MODEL_LAYERS_H */

@@ -23,13 +23,33 @@ typedef struct {
     bool state_uploaded; /* Initial upload flag for host-bound non-host STATE */
 } slot_storage_binding;
 
+typedef struct {
+    uint32_t first_step;
+    uint32_t count;
+    velri_device_id device_id;
+    bool static_t1;
+    velri_captured_graph *graph;
+} slot_captured_batch;
+
 struct velri_slot {
     velri_plan *plan;
     void *arenas[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
     void *ram_staging;
     slot_storage_binding *user_bindings;
+
+    /* Pre-allocated batch scratch (sized to plan->max_batch_len => 0 B hot-path allocs). */
+    velri_submit_item *batch_items;
+    velri_buffer_binding (*batch_in)[VELRI_OP_MAX_INPUTS];
+    velri_buffer_binding (*batch_out)[VELRI_OP_MAX_OUTPUTS];
+    uint32_t batch_cap;
+
+    /* Optional pre-recorded persistent decode launch graphs (captured in velri_slot_create). */
+    slot_captured_batch *captured;
+    uint32_t num_captured;
+
     bool needs_reset;
     uint64_t last_run_allocs;
+    uint64_t last_run_graph_replays;
 };
 
 static velri_buffer_binding resolve_storage_binding(const velri_slot *slot,
@@ -205,6 +225,142 @@ velri_status velri_plan_bind_weight_host(velri_plan *plan, velri_storage_id stor
     return VELRI_OK;
 }
 
+static bool populate_batch_items(velri_slot *slot, uint32_t first_step, uint32_t count,
+                                 const velri_step_params *params) {
+    const velri_plan *plan = slot->plan;
+    for (uint32_t k = 0U; k < count; ++k) {
+        const velri_launch_step *step = &plan->steps[first_step + k];
+        const velri_resolved_op *op = &step->u.op.resolved;
+        memset(slot->batch_in[k], 0, sizeof(slot->batch_in[k]));
+        memset(slot->batch_out[k], 0, sizeof(slot->batch_out[k]));
+        for (uint32_t i = 0U; i < op->num_inputs; ++i) {
+            if (op->input_present[i]) {
+                slot->batch_in[k][i] = resolve_storage_binding(slot, step->u.op.in_storage_idx[i],
+                                                               op->inputs[i].byte_offset);
+                if (!slot->batch_in[k][i].mem_handle) {
+                    return false;
+                }
+            }
+        }
+        for (uint32_t o = 0U; o < op->num_outputs; ++o) {
+            slot->batch_out[k][o] = resolve_storage_binding(slot, step->u.op.out_storage_idx[o],
+                                                            op->outputs[o].byte_offset);
+            if (!slot->batch_out[k][o].mem_handle) {
+                return false;
+            }
+        }
+        slot->batch_items[k] = (velri_submit_item){
+            .op = op,
+            .prepared = step->u.op.prepared,
+            .inputs = slot->batch_in[k],
+            .num_inputs = op->num_inputs,
+            .outputs = slot->batch_out[k],
+            .num_outputs = op->num_outputs,
+            .params = params,
+            .no_barrier_before = (k > 0U) ? step->u.op.no_barrier_before : true,
+        };
+    }
+    return true;
+}
+
+static velri_status validate_dynamic_params(const velri_plan *plan,
+                                            const velri_step_params *params);
+
+static bool batch_is_static_t1(const velri_plan *plan, uint32_t first_step, uint32_t count) {
+    for (uint32_t k = 0U; k < count; ++k) {
+        const velri_resolved_op *op = &plan->steps[first_step + k].u.op.resolved;
+        if (!velri_op_is_dynamic_seq(op)) {
+            continue;
+        }
+        if (velri_op_static_rows(op) != 1U) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Best-effort eager capture of T=1 persistent decode graphs on backends supporting capture_graph. */
+static void slot_capture_decode_graphs(velri_slot *slot) {
+    const velri_plan *plan = slot->plan;
+    if (!slot->batch_items || plan->num_steps == 0U) {
+        return;
+    }
+
+    const velri_step_params cap_params = {
+        .pos_offset_override = 0U,
+        .has_pos_offset = true,
+        .seq_len_override = 1U,
+        .has_seq_len = true,
+        .kv_len_override = 0U,
+        .has_kv_len = true,
+    };
+    if (validate_dynamic_params(plan, &cap_params) != VELRI_OK) {
+        return;
+    }
+
+    /* Count eligible contiguous batches first so we allocate once. */
+    uint32_t max_batches = 0U;
+    uint32_t s = 0U;
+    while (s < plan->num_steps) {
+        if (plan->steps[s].kind != VELRI_STEP_OP) {
+            s++;
+            continue;
+        }
+        velri_device_id dev_id = plan->steps[s].u.op.device_id;
+        const velri_backend_vtable *vt = plan->ctx->devices[dev_id].vt;
+        uint32_t batch = 1U;
+        if (vt->submit_batch) {
+            while (s + batch < plan->num_steps && plan->steps[s + batch].kind == VELRI_STEP_OP &&
+                   plan->steps[s + batch].u.op.device_id == dev_id) {
+                batch++;
+            }
+        }
+        if (vt->capture_graph && vt->replay_graph && vt->destroy_captured_graph) {
+            max_batches++;
+        }
+        s += batch;
+    }
+    if (max_batches == 0U) {
+        return;
+    }
+
+    slot->captured = (slot_captured_batch *)calloc(max_batches, sizeof(*slot->captured));
+    if (!slot->captured) {
+        return;
+    }
+
+    s = 0U;
+    while (s < plan->num_steps) {
+        if (plan->steps[s].kind != VELRI_STEP_OP) {
+            s++;
+            continue;
+        }
+        velri_device_id dev_id = plan->steps[s].u.op.device_id;
+        velri_device_entry *de = &plan->ctx->devices[dev_id];
+        uint32_t batch = 1U;
+        if (de->vt->submit_batch) {
+            while (s + batch < plan->num_steps && plan->steps[s + batch].kind == VELRI_STEP_OP &&
+                   plan->steps[s + batch].u.op.device_id == dev_id) {
+                batch++;
+            }
+        }
+        if (de->vt->capture_graph && de->vt->replay_graph && de->vt->destroy_captured_graph &&
+            batch <= slot->batch_cap && populate_batch_items(slot, s, batch, &cap_params)) {
+            velri_captured_graph *cg = nullptr;
+            if (de->vt->capture_graph(de->dev, slot->batch_items, batch, &cg) == VELRI_OK && cg) {
+                slot->captured[slot->num_captured++] = (slot_captured_batch){
+                    .first_step = s,
+                    .count = batch,
+                    .device_id = dev_id,
+                    .static_t1 = batch_is_static_t1(plan, s, batch),
+                    .graph = cg,
+                };
+            }
+        }
+        s += batch;
+    }
+}
+
 velri_status velri_slot_create(velri_plan *plan, velri_slot **out_slot) {
     if (!plan || !out_slot) {
         return VELRI_ERR_INVALID;
@@ -226,6 +382,16 @@ velri_status velri_slot_create(velri_plan *plan, velri_slot **out_slot) {
             return VELRI_ERR_NOMEM;
         }
     }
+
+    uint32_t bcap = (plan->max_batch_len > 0U) ? plan->max_batch_len : 1U;
+    slot->batch_items = (velri_submit_item *)calloc(bcap, sizeof(*slot->batch_items));
+    slot->batch_in = calloc(bcap, sizeof(*slot->batch_in));
+    slot->batch_out = calloc(bcap, sizeof(*slot->batch_out));
+    if (!slot->batch_items || !slot->batch_in || !slot->batch_out) {
+        velri_slot_destroy(slot);
+        return VELRI_ERR_NOMEM;
+    }
+    slot->batch_cap = bcap;
 
     for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
         for (uint32_t a = 0U; a < VELRI_SLOT_ARENA_COUNT; ++a) {
@@ -258,6 +424,8 @@ velri_status velri_slot_create(velri_plan *plan, velri_slot **out_slot) {
         memset(slot->ram_staging, 0, plan->ram_staging_bytes);
     }
 
+    slot_capture_decode_graphs(slot);
+
     *out_slot = slot;
     return VELRI_OK;
 }
@@ -268,6 +436,12 @@ void velri_slot_destroy(velri_slot *slot) {
     }
     velri_plan *plan = slot->plan;
     if (plan && plan->ctx) {
+        for (uint32_t i = 0U; i < slot->num_captured; ++i) {
+            velri_device_entry *de = &plan->ctx->devices[slot->captured[i].device_id];
+            if (slot->captured[i].graph && de->vt->destroy_captured_graph) {
+                de->vt->destroy_captured_graph(de->dev, slot->captured[i].graph);
+            }
+        }
         for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
             velri_device_entry *de = &plan->ctx->devices[d];
             for (uint32_t a = VELRI_SLOT_ARENA_COUNT; a > 0U; --a) {
@@ -277,6 +451,10 @@ void velri_slot_destroy(velri_slot *slot) {
             }
         }
     }
+    free(slot->captured);
+    free(slot->batch_items);
+    free(slot->batch_in);
+    free(slot->batch_out);
     velri_os_aligned_free(slot->ram_staging);
     free(slot->user_bindings);
     free(slot);
@@ -394,6 +572,16 @@ static velri_status run_ram_transfer(velri_slot *slot, const velri_launch_step *
     return dst_de->vt->copy_from_ram(dst_de->dev, &dst_b, slot->ram_staging, n);
 }
 
+static const slot_captured_batch *find_captured_batch(const velri_slot *slot, uint32_t first_step,
+                                                      uint32_t count) {
+    for (uint32_t i = 0U; i < slot->num_captured; ++i) {
+        if (slot->captured[i].first_step == first_step && slot->captured[i].count == count) {
+            return &slot->captured[i];
+        }
+    }
+    return nullptr;
+}
+
 static velri_status run_compute_batch(velri_slot *slot, uint32_t first_step, uint32_t count,
                                       const velri_step_params *params, bool *out_accepted) {
     *out_accepted = false;
@@ -401,40 +589,50 @@ static velri_status run_compute_batch(velri_slot *slot, uint32_t first_step, uin
     velri_device_id dev_id = plan->steps[first_step].u.op.device_id;
     velri_device_entry *de = &plan->ctx->devices[dev_id];
 
-    velri_buffer_binding in_b[VELRI_MAX_SUBMIT_BATCH][VELRI_OP_MAX_INPUTS];
-    velri_buffer_binding out_b[VELRI_MAX_SUBMIT_BATCH][VELRI_OP_MAX_OUTPUTS];
-    velri_submit_item items[VELRI_MAX_SUBMIT_BATCH];
-
-    for (uint32_t k = 0U; k < count; ++k) {
-        const velri_launch_step *step = &plan->steps[first_step + k];
-        const velri_resolved_op *op = &step->u.op.resolved;
-        memset(in_b[k], 0, sizeof(in_b[k]));
-        memset(out_b[k], 0, sizeof(out_b[k]));
-        for (uint32_t i = 0U; i < op->num_inputs; ++i) {
-            if (op->input_present[i]) {
-                in_b[k][i] = resolve_storage_binding(slot, step->u.op.in_storage_idx[i],
-                                                     op->inputs[i].byte_offset);
+    /* Fast path: replay pre-recorded T=1 decode launch graph if captured and accepted. */
+    if (de->vt->replay_graph) {
+        const slot_captured_batch *cb = find_captured_batch(slot, first_step, count);
+        bool is_t1 =
+            (params && params->has_seq_len) ? (params->seq_len_override == 1U) : (cb && cb->static_t1);
+        if (cb && cb->graph && is_t1) {
+            velri_completion *comp = nullptr;
+            velri_status r_st = de->vt->replay_graph(de->dev, cb->graph, params, &comp);
+            if (r_st != VELRI_ERR_UNSUPPORTED || comp != nullptr) {
+                if (de->vt->wait) {
+                    if (!comp) {
+                        return r_st;
+                    }
+                    *out_accepted = true;
+                    velri_status wait_st = de->vt->wait(de->dev, comp);
+                    de->vt->destroy_completion(de->dev, comp);
+                    if (r_st == VELRI_OK && wait_st == VELRI_OK) {
+                        slot->last_run_graph_replays++;
+                    }
+                    return (r_st != VELRI_OK) ? r_st : wait_st;
+                }
+                if (r_st == VELRI_OK || r_st == VELRI_ERR_EXEC) {
+                    *out_accepted = true;
+                    if (r_st == VELRI_OK) {
+                        slot->last_run_graph_replays++;
+                    }
+                }
+                return r_st;
             }
+            /* Pre-accept VELRI_ERR_UNSUPPORTED (e.g. long-ctx Split-KV) -> fall through to dynamic batch. */
         }
-        for (uint32_t o = 0U; o < op->num_outputs; ++o) {
-            out_b[k][o] = resolve_storage_binding(slot, step->u.op.out_storage_idx[o],
-                                                  op->outputs[o].byte_offset);
-        }
-        items[k] = (velri_submit_item){
-            .op = op,
-            .prepared = step->u.op.prepared,
-            .inputs = in_b[k],
-            .num_inputs = op->num_inputs,
-            .outputs = out_b[k],
-            .num_outputs = op->num_outputs,
-            .params = params,
-        };
+    }
+
+    if (count > slot->batch_cap) {
+        return VELRI_ERR_INVALID;
+    }
+    if (!populate_batch_items(slot, first_step, count, params)) {
+        return VELRI_ERR_INVALID;
     }
 
     velri_completion *comp = nullptr;
     velri_status submit_st = (count > 1U && de->vt->submit_batch)
-                                 ? de->vt->submit_batch(de->dev, items, count, &comp)
-                                 : de->vt->submit(de->dev, &items[0], &comp);
+                                 ? de->vt->submit_batch(de->dev, slot->batch_items, count, &comp)
+                                 : de->vt->submit(de->dev, &slot->batch_items[0], &comp);
 
     if (de->vt->wait) {
         if (!comp) {
@@ -523,6 +721,7 @@ velri_status velri_slot_run(velri_slot *slot, const velri_step_params *params,
     const velri_plan *plan = slot->plan;
     uint64_t allocs_before = atomic_load_explicit(&plan->ctx->total_allocs, memory_order_relaxed);
     slot->last_run_allocs = 0U;
+    slot->last_run_graph_replays = 0U;
 
     bool any_work_accepted = false;
     velri_status st = slot_check_bindings(slot);
@@ -568,7 +767,7 @@ velri_status velri_slot_run(velri_slot *slot, const velri_step_params *params,
         velri_device_id dev_id = step->u.op.device_id;
         uint32_t batch = 1U;
         if (plan->ctx->devices[dev_id].vt->submit_batch) {
-            while (s + batch < plan->num_steps && batch < VELRI_MAX_SUBMIT_BATCH &&
+            while (s + batch < plan->num_steps &&
                    plan->steps[s + batch].kind == VELRI_STEP_OP &&
                    plan->steps[s + batch].u.op.device_id == dev_id) {
                 batch++;
@@ -629,4 +828,8 @@ velri_status velri_slot_reset(velri_slot *slot) {
 
 uint64_t velri_slot_last_run_allocs(const velri_slot *slot) {
     return slot ? slot->last_run_allocs : 0U;
+}
+
+uint64_t velri_slot_last_run_graph_replays(const velri_slot *slot) {
+    return slot ? slot->last_run_graph_replays : 0U;
 }

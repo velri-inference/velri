@@ -8,6 +8,7 @@ struct EmbeddingArgs {
     Ptr<float, Access.Read> table;
     Ptr<int32_t, Access.Read> ids;
     Ptr<float> y;
+    Ptr<uint, Access.Read> step_params; // optional [seq_len, pos_offset, kv_pos] for captured graphs
     uint rows;
     uint dim;
     uint vocab;
@@ -31,7 +32,8 @@ void vk_embedding_f32(uniform EmbeddingArgs a, uint3 gtid : SV_GroupThreadID, ui
         valid = (raw_id >= 0) && (uint(raw_id) < a.vocab);
         idx = uint(raw_id);
     } else {
-        uint64_t pos64 = uint64_t(a.pos_offset) + uint64_t(row);
+        uint eff_pos = (a.step_params != nullptr) ? a.step_params[1] : a.pos_offset;
+        uint64_t pos64 = uint64_t(eff_pos) + uint64_t(row);
         valid = pos64 < uint64_t(a.vocab);
         idx = uint(pos64);
     }

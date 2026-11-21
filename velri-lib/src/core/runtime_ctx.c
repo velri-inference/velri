@@ -20,6 +20,11 @@ static bool validate_vtable(const velri_backend_vtable *vt) {
     if ((vt->wait != nullptr) != (vt->destroy_completion != nullptr)) {
         return false;
     }
+    bool has_cap = (vt->capture_graph != nullptr);
+    if ((vt->destroy_captured_graph != nullptr) != has_cap ||
+        (vt->replay_graph != nullptr) != has_cap) {
+        return false;
+    }
     return true;
 }
 

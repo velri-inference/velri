@@ -521,8 +521,11 @@ static velri_status create_logical_device(velri_backend_device *dev,
     return VELRI_OK;
 }
 
-static velri_status init_cmd_slot(velri_backend_device *dev, VkCommandPool *out_pool,
-                                  VkCommandBuffer *out_cmd, VkFence *out_fence) {
+velri_status velri_vk_init_cmd_slot(velri_backend_device *dev, VkCommandPool *out_pool,
+                                    VkCommandBuffer *out_cmd, VkFence *out_fence) {
+    *out_pool = VK_NULL_HANDLE;
+    *out_cmd = VK_NULL_HANDLE;
+    *out_fence = VK_NULL_HANDLE;
     VkCommandPoolCreateInfo cp_ci = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -540,6 +543,13 @@ static velri_status init_cmd_slot(velri_backend_device *dev, VkCommandPool *out_
     VkFenceCreateInfo fn_ci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (dev->vkAllocateCommandBuffers(dev->device, &cb_ai, out_cmd) != VK_SUCCESS ||
         dev->vkCreateFence(dev->device, &fn_ci, nullptr, out_fence) != VK_SUCCESS) {
+        if (*out_fence) {
+            dev->vkDestroyFence(dev->device, *out_fence, nullptr);
+            *out_fence = VK_NULL_HANDLE;
+        }
+        dev->vkDestroyCommandPool(dev->device, *out_pool, nullptr);
+        *out_pool = VK_NULL_HANDLE;
+        *out_cmd = VK_NULL_HANDLE;
         return VELRI_ERR_NOMEM;
     }
     return VELRI_OK;
@@ -557,6 +567,7 @@ void velri_vk_close_device(velri_backend_device *dev) {
         }
         velri_vk_free_buf_locked(dev, dev->splitk_buf);
         dev->splitk_buf = nullptr;
+        velri_vk_free_all_step_slabs_locked(dev);
         if (dev->stage_map && dev->vkUnmapMemory) {
             dev->vkUnmapMemory(dev->device, dev->stage_mem);
         }
@@ -592,6 +603,7 @@ void velri_vk_close_device(velri_backend_device *dev) {
             dev->vkDestroyDevice(dev->device, nullptr);
         }
     }
+    free(dev->enc_scratch);
     velri_os_cond_destroy(dev->slot_cv);
     velri_os_mutex_destroy(dev->mtx);
     vk_inst_destroy(&dev->inst);
@@ -659,18 +671,27 @@ velri_status velri_vk_open_device(uint32_t local_index, const void *cfg,
         return VELRI_ERR_NOMEM;
     }
 
-    st = init_cmd_slot(dev, &dev->xfer_pool, &dev->xfer_cmd, &dev->xfer_fence);
+    st = velri_vk_init_cmd_slot(dev, &dev->xfer_pool, &dev->xfer_cmd, &dev->xfer_fence);
     if (st != VELRI_OK) {
         velri_vk_close_device(dev);
         return st;
     }
     for (uint32_t i = 0U; i < VK_CMD_RING_SIZE; ++i) {
-        st = init_cmd_slot(dev, &dev->ring[i].pool, &dev->ring[i].cmd, &dev->ring[i].fence);
+        st = velri_vk_init_cmd_slot(dev, &dev->ring[i].pool, &dev->ring[i].cmd,
+                                    &dev->ring[i].fence);
         if (st != VELRI_OK) {
             velri_vk_close_device(dev);
             return st;
         }
     }
+
+    dev->enc_scratch =
+        (vk_encoded_dispatch *)calloc(VK_ENC_SCRATCH_INIT_CAP, sizeof(*dev->enc_scratch));
+    if (!dev->enc_scratch) {
+        velri_vk_close_device(dev);
+        return VELRI_ERR_NOMEM;
+    }
+    dev->enc_scratch_cap = VK_ENC_SCRATCH_INIT_CAP;
 
     VkPushConstantRange pcr = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,

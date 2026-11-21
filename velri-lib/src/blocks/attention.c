@@ -130,6 +130,10 @@ velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velr
     if (!validate_attention_common(b, x, spec, &q_dim, &kv_dim, &qkv_dim)) {
         return VELRI_TENSOR_NONE;
     }
+    if (spec->rope.enabled) {
+        velri_b_set_error(b, VELRI_ERR_UNSUPPORTED);
+        return VELRI_TENSOR_NONE;
+    }
     if (!h_lat.valid || h_lat.rank != 2U || h_lat.dims[0] != x.dims[0] || h_lat.dims[1] == 0U) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
@@ -284,6 +288,39 @@ velri_tensor velri_block_dense_attention(velri_builder *b, velri_tensor x, const
     }
     if (b->err != VELRI_OK) {
         goto cleanup;
+    }
+
+    if (spec->rope.enabled) {
+        uint32_t rdim = spec->rope.rotary_dim ? spec->rope.rotary_dim : spec->head_dim;
+        if (rdim == 0U || (rdim & 1U) != 0U || rdim > spec->head_dim || !spec->rope.cos_name ||
+            spec->rope.cos_name[0] == '\0' || !spec->rope.sin_name ||
+            spec->rope.sin_name[0] == '\0') {
+            velri_b_set_error(b, VELRI_ERR_INVALID);
+            goto cleanup;
+        }
+        const size_t tbl_dims[2] = {spec->max_ctx, (size_t)(rdim / 2U)};
+        velri_tensor cos_tbl =
+            velri_b_weight_shared(b, spec->rope.cos_name, VELRI_DTYPE_F32, 2U, tbl_dims);
+        velri_tensor sin_tbl =
+            velri_b_weight_shared(b, spec->rope.sin_name, VELRI_DTYPE_F32, 2U, tbl_dims);
+        velri_tensor q3 = velri_b_reshape_2d_to_3d(b, q, spec->n_heads, spec->head_dim);
+        velri_tensor k3 = velri_b_reshape_2d_to_3d(b, k, spec->n_kv_heads, spec->head_dim);
+        velri_tensor q3_rot =
+            velri_b_rope_inplace(b, q3, cos_tbl, sin_tbl, rdim, 0U, spec->rope.mode);
+        velri_tensor k3_rot =
+            velri_b_rope_inplace(b, k3, cos_tbl, sin_tbl, rdim, 0U, spec->rope.mode);
+        if (b->err != VELRI_OK) {
+            goto cleanup;
+        }
+        if (q3_rot.storage_id != q.storage_id || q3_rot.view_id != q3.view_id) {
+            q = velri_b_reshape_3d_to_2d(b, q3_rot);
+        }
+        if (k3_rot.storage_id != k.storage_id || k3_rot.view_id != k3.view_id) {
+            k = velri_b_reshape_3d_to_2d(b, k3_rot);
+        }
+        if (b->err != VELRI_OK) {
+            goto cleanup;
+        }
     }
 
     const size_t dim_kv[3] = {spec->n_kv_heads, spec->max_ctx, spec->head_dim};

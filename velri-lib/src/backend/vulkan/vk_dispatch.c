@@ -1,6 +1,7 @@
 #include "vk_internal.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -40,7 +41,8 @@ static void set_dispatch_stage(vk_dispatch_stage *st, VkPipeline pipe, const voi
 }
 
 static velri_status encode_item_locked(velri_backend_device *dev, const velri_submit_item *item,
-                                       vk_encoded_dispatch *out) {
+                                       uint64_t step_params_bda, bool allow_splitk,
+                                       uint32_t force_splitkv, vk_encoded_dispatch *out) {
     memset(out, 0, sizeof(*out));
     if (!velri_submit_item_header_valid(item)) {
         return VELRI_ERR_INVALID;
@@ -140,7 +142,8 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         }
 
         out->num_stages = 1U;
-        if (active_pipe_id == PIPE_GEMM_F32 && plan.split_k > 1U && plan.reduce_pipe_id >= 0) {
+        if (allow_splitk && active_pipe_id == PIPE_GEMM_F32 && plan.split_k > 1U &&
+            plan.reduce_pipe_id >= 0) {
             uint32_t sk = velri_vk_choose_split_k(rows, m, k, 128U, 128U, VK_TARGET_WGS, 8U);
             if (sk > plan.split_k) {
                 sk = plan.split_k;
@@ -179,7 +182,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                     set_dispatch_stage(&out->stages[1], reduce_pipe, &red, sizeof(red),
                                        (uint32_t)rgx, 1U, 1U);
                     out->num_stages = 2U;
-                    out->uses_splitk = true;
+                    out->splitk_kind = VK_SPLITK_GEMM;
                     out->splitk_bytes = need_bytes;
                 }
             }
@@ -302,6 +305,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .cos_tbl = ib[1],
             .sin_tbl = ib[2],
             .y = ob[0],
+            .step_params = step_params_bda,
             .n_tokens = nt,
             .n_heads = nh,
             .head_dim = hd,
@@ -474,6 +478,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .table = ib[0],
             .ids = has_ids ? ib[1] : 0ULL,
             .out = ob[0],
+            .step_params = has_ids ? 0ULL : step_params_bda,
             .rows = rows,
             .dim = dim,
             .vocab = (uint32_t)op->inputs[0].dims[0],
@@ -504,6 +509,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .v_in = ib[2],
             .k_cache = ob[1],
             .v_cache = ob[2],
+            .step_params = step_params_bda,
             .rows = aa.active_t,
             .n_kv_heads = nkvh,
             .d_k = aa.d_k,
@@ -523,6 +529,72 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         set_dispatch_stage(&out->stages[0], pipe0, &s1, sizeof(s1),
                            velri_div_ceil_u32(append_cols, 256U), aa.active_t, 1U);
 
+        /* FlashDecoding Split-KV fast path for long-context T=1 decode (d_k, d_v <= 256). */
+        if (allow_splitk && aa.active_t == 1U && plan.stage2_splitkv_pipe_id >= 0 &&
+            plan.stage3_splitkv_reduce_pipe_id >= 0) {
+            uint32_t sw = op->raw.attr.attention.sliding_window;
+            uint32_t eff_max_kv = (sw > 0U && sw < aa.max_ctx) ? sw : aa.max_ctx;
+            uint32_t n_splits = (force_splitkv > 0U && eff_max_kv >= VK_SPLITKV_MIN_KV_LEN)
+                                    ? force_splitkv
+                                    : 0U;
+            if (n_splits == 0U && force_splitkv == 0U && step_params_bda == 0ULL) {
+                uint64_t kv_end64 = (uint64_t)aa.kv_pos + 1ULL;
+                uint32_t kv_end =
+                    (kv_end64 < (uint64_t)aa.max_ctx) ? (uint32_t)kv_end64 : aa.max_ctx;
+                uint32_t eff_kv_len = (sw > 0U && kv_end > sw) ? sw : kv_end;
+                n_splits = velri_vk_choose_split_kv(nh, aa.d_v, eff_kv_len);
+            }
+            uint32_t part_stride = 0U;
+            size_t need_bytes = 0U;
+            if (n_splits > 1U &&
+                velri_vk_splitkv_layout(n_splits, nh, aa.d_v, &part_stride, &need_bytes) &&
+                dev->splitk_buf && dev->splitk_buf->size >= need_bytes) {
+                VkPipeline pipe_skv = velri_vk_get_pipe_locked(dev, plan.stage2_splitkv_pipe_id);
+                VkPipeline pipe_red =
+                    velri_vk_get_pipe_locked(dev, plan.stage3_splitkv_reduce_pipe_id);
+                if (pipe_skv != VK_NULL_HANDLE && pipe_red != VK_NULL_HANDLE) {
+                    vk_splitkv_args s2 = {
+                        .q = ib[0],
+                        .k_cache = ob[1],
+                        .v_cache = ob[2],
+                        .partials = (uint64_t)dev->splitk_buf->bda,
+                        .step_params = step_params_bda,
+                        .n_heads = nh,
+                        .n_kv_heads = nkvh,
+                        .d_k = aa.d_k,
+                        .d_v = aa.d_v,
+                        .max_ctx = aa.max_ctx,
+                        .kv_pos = aa.kv_pos,
+                        .part_stride = part_stride,
+                        .k_head_stride = (uint32_t)op->outputs[1].strides[0],
+                        .k_row_stride = (uint32_t)op->outputs[1].strides[1],
+                        .v_head_stride = (uint32_t)op->outputs[2].strides[0],
+                        .v_row_stride = (uint32_t)op->outputs[2].strides[1],
+                        .sliding_window = sw,
+                        .causal = op->raw.attr.attention.causal ? 1U : 0U,
+                        .n_splits = n_splits,
+                        .pad = 0U,
+                        .scale = aa.scale,
+                    };
+                    vk_splitkv_reduce_args s3 = {
+                        .partials = (uint64_t)dev->splitk_buf->bda,
+                        .out = ob[0],
+                        .n_heads = nh,
+                        .d_v = aa.d_v,
+                        .part_stride = part_stride,
+                        .n_splits = n_splits,
+                    };
+                    set_dispatch_stage(&out->stages[1], pipe_skv, &s2, sizeof(s2), nh, n_splits,
+                                       1U);
+                    set_dispatch_stage(&out->stages[2], pipe_red, &s3, sizeof(s3), nh, 1U, 1U);
+                    out->num_stages = 3U;
+                    out->splitk_kind = VK_SPLITK_ATTN;
+                    out->splitk_bytes = need_bytes;
+                    break;
+                }
+            }
+        }
+
         int s2_pipe_id =
             (aa.active_t == 1U) ? plan.stage2_decode_pipe_id : plan.stage2_prefill_pipe_id;
         VkPipeline pipe2 = velri_vk_get_pipe_locked(dev, s2_pipe_id);
@@ -534,6 +606,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .k_cache = ob[1],
             .v_cache = ob[2],
             .out = ob[0],
+            .step_params = step_params_bda,
             .rows = aa.active_t,
             .n_heads = nh,
             .n_kv_heads = nkvh,
@@ -636,6 +709,69 @@ static void release_slot_locked(velri_backend_device *dev, struct velri_completi
     velri_os_cond_broadcast(dev->slot_cv);
 }
 
+static velri_status ensure_enc_scratch_locked(velri_backend_device *dev, uint32_t count) {
+    if (count <= dev->enc_scratch_cap) {
+        return VELRI_OK;
+    }
+    uint32_t new_cap = dev->enc_scratch_cap ? dev->enc_scratch_cap : VK_ENC_SCRATCH_INIT_CAP;
+    while (new_cap < count) {
+        if (new_cap > UINT32_MAX / 2U) {
+            new_cap = count;
+            break;
+        }
+        new_cap *= 2U;
+    }
+    vk_encoded_dispatch *nb =
+        (vk_encoded_dispatch *)realloc(dev->enc_scratch, (size_t)new_cap * sizeof(*nb));
+    if (!nb) {
+        return VELRI_ERR_NOMEM;
+    }
+    dev->enc_scratch = nb;
+    dev->enc_scratch_cap = new_cap;
+    return VELRI_OK;
+}
+
+static void record_encoded_batch(velri_backend_device *dev, VkCommandBuffer cmd,
+                                 const velri_submit_item *items, const vk_encoded_dispatch *enc,
+                                 uint32_t count) {
+    VkMemoryBarrier mbar = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    };
+
+    bool any_dispatched = false;
+    bool splitk_dirty = false;
+    for (uint32_t i = 0U; i < count; ++i) {
+        bool item_uses_sk = (enc[i].splitk_kind != VK_SPLITK_NONE);
+        for (uint32_t s = 0U; s < enc[i].num_stages; ++s) {
+            const vk_dispatch_stage *ds = &enc[i].stages[s];
+            bool need_bar = false;
+            if (s > 0U) {
+                need_bar = true;
+            } else if (any_dispatched) {
+                if (!items[i].no_barrier_before || (item_uses_sk && splitk_dirty)) {
+                    need_bar = true;
+                }
+            }
+            if (need_bar) {
+                dev->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0U, 1U, &mbar, 0U,
+                                          nullptr, 0U, nullptr);
+                splitk_dirty = false;
+            }
+            dev->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds->pipe);
+            dev->vkCmdPushConstants(cmd, dev->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0U,
+                                    ds->pc_size, ds->pc);
+            dev->vkCmdDispatch(cmd, ds->gx, ds->gy, ds->gz);
+            any_dispatched = true;
+        }
+        if (item_uses_sk) {
+            splitk_dirty = true;
+        }
+    }
+}
+
 /* ---- 5. Execution Backend Contract ---- */
 
 static velri_status vk_submit_batch(velri_backend_device *dev, const velri_submit_item *items,
@@ -644,29 +780,35 @@ static velri_status vk_submit_batch(velri_backend_device *dev, const velri_submi
         return VELRI_ERR_INVALID;
     }
     *out_completion = nullptr;
-    if (!dev || !items || count == 0U || count > VELRI_MAX_SUBMIT_BATCH) {
+    if (!dev || !items || count == 0U) {
         return VELRI_ERR_INVALID;
     }
 
-    vk_encoded_dispatch enc[VELRI_MAX_SUBMIT_BATCH];
-    bool batch_uses_splitk = false;
-
     velri_os_mutex_lock(dev->mtx);
+
+    velri_status st = ensure_enc_scratch_locked(dev, count);
+    if (st != VELRI_OK) {
+        velri_os_mutex_unlock(dev->mtx);
+        return st;
+    }
+    vk_encoded_dispatch *enc = dev->enc_scratch;
+    bool batch_uses_splitk = false;
 
     /* Validate and encode every item before touching GPU state (pre-accept safety). */
     for (uint32_t i = 0U; i < count; ++i) {
-        velri_status st = encode_item_locked(dev, &items[i], &enc[i]);
+        st = encode_item_locked(dev, &items[i], 0ULL, true, 0U, &enc[i]);
         if (st != VELRI_OK) {
             velri_os_mutex_unlock(dev->mtx);
             return st;
         }
-        if (enc[i].uses_splitk) {
+        if (enc[i].splitk_kind != VK_SPLITK_NONE) {
             batch_uses_splitk = true;
         }
     }
 
-    /* Acquire a free ring slot (and split-K exclusivity if needed). */
+    /* Acquire a free ring slot (and split-K/split-KV exclusivity if needed). */
     struct velri_completion *slot = nullptr;
+    bool waited = false;
     for (;;) {
         if (!batch_uses_splitk || !dev->splitk_busy) {
             for (uint32_t i = 0U; i < VK_CMD_RING_SIZE; ++i) {
@@ -679,70 +821,51 @@ static velri_status vk_submit_batch(velri_backend_device *dev, const velri_submi
                 break;
             }
         }
+        waited = true;
         velri_os_cond_wait(dev->slot_cv, dev->mtx);
     }
     slot->in_use = true;
     slot->uses_splitk = batch_uses_splitk;
+    slot->is_captured_graph = false;
     if (batch_uses_splitk) {
         dev->splitk_busy = true;
-        /*
-         * Re-verify and re-patch Split-K BDAs after `cond_wait` and acquiring
-         * `dev->splitk_busy`: another thread's `velri_vk_prepare_op` may have resized
-         * (and freed the previous) `dev->splitk_buf` while we were waiting.
-         */
-        for (uint32_t i = 0U; i < count; ++i) {
-            if (!enc[i].uses_splitk) {
-                continue;
-            }
-            if (!dev->splitk_buf || dev->splitk_buf->size < enc[i].splitk_bytes) {
-                release_slot_locked(dev, slot);
-                velri_os_mutex_unlock(dev->mtx);
-                return VELRI_ERR_EXEC;
-            }
-            uint64_t splitk_bda = (uint64_t)dev->splitk_buf->bda;
-            vk_linear_args lin_args;
-            memcpy(&lin_args, enc[i].stages[0].pc, sizeof(lin_args));
-            lin_args.y = splitk_bda;
-            memcpy(enc[i].stages[0].pc, &lin_args, sizeof(lin_args));
-
-            vk_splitk_reduce_args red_args;
-            memcpy(&red_args, enc[i].stages[1].pc, sizeof(red_args));
-            red_args.partials = splitk_bda;
-            memcpy(enc[i].stages[1].pc, &red_args, sizeof(red_args));
-        }
     }
 
-    VkMemoryBarrier mbar = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-    };
+    /*
+     * If we slept in `cond_wait`, another thread may have overwritten `dev->enc_scratch`
+     * or resized `dev->splitk_buf`. Now that we hold `dev->mtx` exclusively (plus
+     * `dev->splitk_busy` if needed), re-encode cleanly before recording the command buffer.
+     */
+    if (waited) {
+        st = ensure_enc_scratch_locked(dev, count);
+        if (st == VELRI_OK) {
+            enc = dev->enc_scratch;
+            for (uint32_t i = 0U; i < count; ++i) {
+                st = encode_item_locked(dev, &items[i], 0ULL, batch_uses_splitk, 0U, &enc[i]);
+                if (st != VELRI_OK) {
+                    break;
+                }
+            }
+        }
+        if (st != VELRI_OK) {
+            release_slot_locked(dev, slot);
+            velri_os_mutex_unlock(dev->mtx);
+            return st;
+        }
+    } else {
+        enc = dev->enc_scratch;
+    }
 
     VkCommandBufferBeginInfo bi = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
-    velri_status st = VELRI_OK;
+    st = VELRI_OK;
     if (dev->vkResetCommandBuffer(slot->cmd, 0U) != VK_SUCCESS ||
         dev->vkBeginCommandBuffer(slot->cmd, &bi) != VK_SUCCESS) {
         st = VELRI_ERR_EXEC;
     } else {
-        bool need_barrier = false;
-        for (uint32_t i = 0U; i < count; ++i) {
-            for (uint32_t s = 0U; s < enc[i].num_stages; ++s) {
-                const vk_dispatch_stage *ds = &enc[i].stages[s];
-                if (need_barrier) {
-                    dev->vkCmdPipelineBarrier(slot->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0U, 1U, &mbar,
-                                              0U, nullptr, 0U, nullptr);
-                }
-                dev->vkCmdBindPipeline(slot->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ds->pipe);
-                dev->vkCmdPushConstants(slot->cmd, dev->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                                        0U, ds->pc_size, ds->pc);
-                dev->vkCmdDispatch(slot->cmd, ds->gx, ds->gy, ds->gz);
-                need_barrier = true;
-            }
-        }
+        record_encoded_batch(dev, slot->cmd, items, enc, count);
         if (dev->vkEndCommandBuffer(slot->cmd) != VK_SUCCESS ||
             dev->vkResetFences(dev->device, 1U, &slot->fence) != VK_SUCCESS) {
             st = VELRI_ERR_EXEC;
@@ -774,6 +897,373 @@ static velri_status vk_submit(velri_backend_device *dev, const velri_submit_item
     return vk_submit_batch(dev, item, 1U, out_completion);
 }
 
+/* ---- 5b. Persistent Launch-Graph Capture & Zero-Recording Replay ---- */
+
+static void free_captured_graph_locked(velri_backend_device *dev, velri_captured_graph *cg) {
+    if (!cg) {
+        return;
+    }
+    if (cg->comp.in_use && cg->fence) {
+        dev->vkWaitForFences(dev->device, 1U, &cg->fence, VK_TRUE, UINT64_MAX);
+        cg->comp.in_use = false;
+        if (cg->comp.uses_splitk) {
+            dev->splitk_busy = false;
+            cg->comp.uses_splitk = false;
+            velri_os_cond_broadcast(dev->slot_cv);
+        }
+    }
+    if (cg->step_slab) {
+        velri_vk_free_step_slot_locked(cg->step_slab, cg->step_slot);
+    }
+    if (cg->fence) {
+        dev->vkDestroyFence(dev->device, cg->fence, nullptr);
+    }
+    if (cg->pool) {
+        dev->vkDestroyCommandPool(dev->device, cg->pool, nullptr);
+    }
+    free(cg);
+}
+
+static uint32_t splitkv_bucket_index(uint32_t n_splits) {
+    switch (n_splits) {
+    case 2U:
+        return 0U;
+    case 4U:
+        return 1U;
+    case 8U:
+        return 2U;
+    case 16U:
+        return 3U;
+    default:
+        return VK_SPLITKV_BUCKETS;
+    }
+}
+
+static velri_status vk_capture_graph(velri_backend_device *dev, const velri_submit_item *items,
+                                     uint32_t count, velri_captured_graph **out_graph) {
+    if (!dev || !items || count == 0U || !out_graph) {
+        return VELRI_ERR_INVALID;
+    }
+    *out_graph = nullptr;
+
+    velri_captured_graph *cg = (velri_captured_graph *)calloc(1U, sizeof(*cg));
+    if (!cg) {
+        return VELRI_ERR_NOMEM;
+    }
+
+    velri_os_mutex_lock(dev->mtx);
+
+    velri_status st = ensure_enc_scratch_locked(dev, count);
+    if (st == VELRI_OK) {
+        st = velri_vk_init_cmd_slot(dev, &cg->pool, &cg->cmd, &cg->fence);
+    }
+    if (st == VELRI_OK) {
+        st = velri_vk_alloc_step_slot_locked(dev, &cg->step_slab, &cg->step_slot, &cg->step_bda,
+                                             &cg->step_map);
+        if (st == VELRI_OK) {
+            memset(cg->step_map, 0, sizeof(*cg->step_map));
+        }
+    }
+    if (st != VELRI_OK) {
+        free_captured_graph_locked(dev, cg);
+        velri_os_mutex_unlock(dev->mtx);
+        return st;
+    }
+
+    bool seen_pos_op = false;
+    bool seen_splitkv_attn = false;
+    cg->splitkv_uniform = true;
+    cg->max_pos_offset = UINT32_MAX;
+    cg->max_kv_pos = UINT32_MAX;
+
+    vk_encoded_dispatch *enc = dev->enc_scratch;
+    for (uint32_t i = 0U; i < count; ++i) {
+        /* allow_splitk=true lets static multi-row GEMMs select VK_SPLITK_GEMM so capture rejects
+         * them cleanly (preserving Split-K GEMM execution), while Split-KV is skipped at kv_pos=0. */
+        st = encode_item_locked(dev, &items[i], (uint64_t)cg->step_bda, true, 0U, &enc[i]);
+        if (st != VELRI_OK) {
+            free_captured_graph_locked(dev, cg);
+            velri_os_mutex_unlock(dev->mtx);
+            return st;
+        }
+        if (enc[i].splitk_kind != VK_SPLITK_NONE) {
+            free_captured_graph_locked(dev, cg);
+            velri_os_mutex_unlock(dev->mtx);
+            return VELRI_ERR_UNSUPPORTED;
+        }
+
+        const velri_resolved_op *op = items[i].op;
+        if (op->kind == VELRI_OP_ROPE ||
+            (op->kind == VELRI_OP_EMBEDDING && !velri_op_embedding_has_ids(op))) {
+            size_t def_pos = (op->kind == VELRI_OP_ROPE) ? op->raw.attr.rope.pos_offset
+                                                         : op->raw.attr.embedding.pos_offset;
+            if (def_pos > (size_t)UINT32_MAX) {
+                cg->require_explicit_pos_offset = true;
+            } else if (!seen_pos_op) {
+                cg->default_pos_offset = (uint32_t)def_pos;
+                seen_pos_op = true;
+            } else if (cg->default_pos_offset != (uint32_t)def_pos) {
+                cg->require_explicit_pos_offset = true;
+            }
+            uint32_t nt = 1U;
+            (void)velri_op_active_rows(op, items[i].params, &nt);
+            size_t tbl_rows = 0U;
+            bool have_tbl = false;
+            if (op->kind == VELRI_OP_ROPE) {
+                size_t half = op->raw.attr.rope.rotary_dim / 2U;
+                size_t ct_n = 0U, st_n = 0U;
+                if (half > 0U && velri_tensor_view_num_elements(&op->inputs[1], &ct_n) == VELRI_OK &&
+                    velri_tensor_view_num_elements(&op->inputs[2], &st_n) == VELRI_OK) {
+                    tbl_rows = (ct_n < st_n ? ct_n : st_n) / half;
+                    have_tbl = true;
+                }
+            } else {
+                tbl_rows = op->inputs[0].dims[0];
+                have_tbl = true;
+            }
+            if (have_tbl) {
+                size_t rem = (tbl_rows >= (size_t)nt) ? (tbl_rows - (size_t)nt) : 0U;
+                uint32_t lim = (rem > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)rem;
+                cg->has_pos_bound = true;
+                if (lim < cg->max_pos_offset) {
+                    cg->max_pos_offset = lim;
+                }
+            }
+        } else if (op->kind == VELRI_OP_ATTENTION) {
+            uint32_t max_ctx = (uint32_t)op->outputs[1].dims[1];
+            uint32_t kv_lim = (max_ctx > 0U) ? (max_ctx - 1U) : 0U;
+            cg->has_kv_bound = true;
+            if (kv_lim < cg->max_kv_pos) {
+                cg->max_kv_pos = kv_lim;
+            }
+            uint32_t dk = op->raw.attr.attention.head_dim;
+            uint32_t dv = velri_op_attn_dv(op);
+            if (!velri_op_attn_is_wide(dk, dv)) {
+                uint32_t nh = op->raw.attr.attention.n_heads;
+                uint32_t sw = op->raw.attr.attention.sliding_window;
+                uint32_t eff_max_kv = (sw > 0U && sw < max_ctx) ? sw : max_ctx;
+                uint32_t max_sp = velri_vk_choose_split_kv(nh, dv, eff_max_kv);
+                size_t min_bytes = 0U;
+                if (max_sp > 1U &&
+                    velri_vk_splitkv_layout(2U, nh, dv, nullptr, &min_bytes) &&
+                    dev->splitk_buf && dev->splitk_buf->size >= min_bytes) {
+                    cg->splitkv_possible = true;
+                    cg->splitkv_min_kv_pos = VK_SPLITKV_MIN_KV_LEN - 1U;
+                    if (!seen_splitkv_attn) {
+                        seen_splitkv_attn = true;
+                        cg->splitkv_nh = nh;
+                        cg->splitkv_dv = dv;
+                        cg->splitkv_max_ctx = max_ctx;
+                        cg->splitkv_sw = sw;
+                        cg->splitkv_max_splits = max_sp;
+                    } else if (cg->splitkv_nh != nh || cg->splitkv_dv != dv ||
+                               cg->splitkv_max_ctx != max_ctx || cg->splitkv_sw != sw) {
+                        cg->splitkv_uniform = false;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Record primary persistent command buffer (flags = 0: Executable <-> Pending). */
+    VkCommandBufferBeginInfo bi = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = 0U,
+    };
+    if (dev->vkBeginCommandBuffer(cg->cmd, &bi) != VK_SUCCESS) {
+        free_captured_graph_locked(dev, cg);
+        velri_os_mutex_unlock(dev->mtx);
+        return VELRI_ERR_EXEC;
+    }
+    record_encoded_batch(dev, cg->cmd, items, enc, count);
+    if (dev->vkEndCommandBuffer(cg->cmd) != VK_SUCCESS) {
+        free_captured_graph_locked(dev, cg);
+        velri_os_mutex_unlock(dev->mtx);
+        return VELRI_ERR_EXEC;
+    }
+
+    /* Pre-record bucketed Split-KV command buffers ({2,4,8,16}) on the SAME pool & step slot
+     * so long-context decode (kv_len >= 256) also runs with 0 host command recording! */
+    if (cg->splitkv_possible && cg->splitkv_uniform && cg->splitkv_max_splits >= 2U) {
+        cg->splitkv_buf_gen = dev->splitk_buf_gen;
+        for (uint32_t b = 0U; b < VK_SPLITKV_BUCKETS; ++b) {
+            uint32_t b_splits = 2U << b;
+            if (b_splits > cg->splitkv_max_splits) {
+                break;
+            }
+            size_t need_bytes = 0U;
+            if (!velri_vk_splitkv_layout(b_splits, cg->splitkv_nh, cg->splitkv_dv, nullptr,
+                                         &need_bytes) ||
+                !dev->splitk_buf || dev->splitk_buf->size < need_bytes) {
+                break;
+            }
+            bool bucket_ok = true;
+            for (uint32_t i = 0U; i < count; ++i) {
+                if (encode_item_locked(dev, &items[i], (uint64_t)cg->step_bda, true, b_splits,
+                                       &enc[i]) != VELRI_OK) {
+                    bucket_ok = false;
+                    break;
+                }
+            }
+            if (!bucket_ok) {
+                break;
+            }
+            VkCommandBufferAllocateInfo cb_ai = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .commandPool = cg->pool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = 1U,
+            };
+            VkCommandBuffer bcmd = VK_NULL_HANDLE;
+            if (dev->vkAllocateCommandBuffers(dev->device, &cb_ai, &bcmd) != VK_SUCCESS ||
+                dev->vkBeginCommandBuffer(bcmd, &bi) != VK_SUCCESS) {
+                break;
+            }
+            record_encoded_batch(dev, bcmd, items, enc, count);
+            if (dev->vkEndCommandBuffer(bcmd) != VK_SUCCESS) {
+                break;
+            }
+            cg->splitkv_cmds[b] = bcmd;
+        }
+    }
+
+    cg->comp.pool = cg->pool;
+    cg->comp.cmd = cg->cmd;
+    cg->comp.fence = cg->fence;
+    cg->comp.in_use = false;
+    cg->comp.uses_splitk = false;
+    cg->comp.is_captured_graph = true;
+
+    *out_graph = cg;
+    velri_os_mutex_unlock(dev->mtx);
+    return VELRI_OK;
+}
+
+static void vk_destroy_captured_graph(velri_backend_device *dev, velri_captured_graph *graph) {
+    if (!dev || !graph) {
+        return;
+    }
+    velri_os_mutex_lock(dev->mtx);
+    free_captured_graph_locked(dev, graph);
+    velri_os_mutex_unlock(dev->mtx);
+}
+
+static velri_status vk_replay_graph(velri_backend_device *dev, velri_captured_graph *graph,
+                                    const velri_step_params *params,
+                                    velri_completion **out_completion) {
+    if (!out_completion) {
+        return VELRI_ERR_INVALID;
+    }
+    *out_completion = nullptr;
+    if (!dev || !graph) {
+        return VELRI_ERR_INVALID;
+    }
+    if (params && params->has_seq_len && params->seq_len_override != 1U) {
+        return VELRI_ERR_UNSUPPORTED;
+    }
+    if (params && params->has_pos_offset && params->pos_offset_override > (size_t)UINT32_MAX) {
+        return VELRI_ERR_OVERFLOW;
+    }
+    if (graph->require_explicit_pos_offset && (!params || !params->has_pos_offset)) {
+        return VELRI_ERR_UNSUPPORTED;
+    }
+
+    uint32_t eff_pos = (params && params->has_pos_offset) ? (uint32_t)params->pos_offset_override
+                                                          : graph->default_pos_offset;
+    uint32_t eff_kv = 0U;
+    velri_status kv_st = velri_op_resolve_kv_pos(params, &eff_kv);
+    if (kv_st != VELRI_OK) {
+        return kv_st;
+    }
+    if ((graph->has_pos_bound && eff_pos > graph->max_pos_offset) ||
+        (graph->has_kv_bound && eff_kv > graph->max_kv_pos)) {
+        return VELRI_ERR_INVALID;
+    }
+
+    uint32_t bucket = VK_SPLITKV_BUCKETS;
+    if (graph->splitkv_possible) {
+        if (!graph->splitkv_uniform) {
+            if (eff_kv >= graph->splitkv_min_kv_pos) {
+                return VELRI_ERR_UNSUPPORTED;
+            }
+        } else {
+            uint64_t kv_end64 = (uint64_t)eff_kv + 1ULL;
+            uint32_t kv_end = (kv_end64 < (uint64_t)graph->splitkv_max_ctx)
+                                  ? (uint32_t)kv_end64
+                                  : graph->splitkv_max_ctx;
+            uint32_t eff_kv_len =
+                (graph->splitkv_sw > 0U && kv_end > graph->splitkv_sw) ? graph->splitkv_sw : kv_end;
+            uint32_t want_sp =
+                velri_vk_choose_split_kv(graph->splitkv_nh, graph->splitkv_dv, eff_kv_len);
+            if (want_sp >= 2U) {
+                bucket = splitkv_bucket_index(want_sp);
+                if (bucket >= VK_SPLITKV_BUCKETS ||
+                    graph->splitkv_cmds[bucket] == VK_NULL_HANDLE) {
+                    return VELRI_ERR_UNSUPPORTED;
+                }
+            }
+        }
+    }
+
+    velri_os_mutex_lock(dev->mtx);
+    if (graph->comp.in_use) {
+        velri_os_mutex_unlock(dev->mtx);
+        return VELRI_ERR_BUSY;
+    }
+
+    bool use_splitk = (bucket < VK_SPLITKV_BUCKETS);
+    VkCommandBuffer target_cmd = use_splitk ? graph->splitkv_cmds[bucket] : graph->cmd;
+    if (use_splitk) {
+        graph->comp.in_use = true; /* Reserve graph before any cond_wait */
+        while (dev->splitk_busy) {
+            velri_os_cond_wait(dev->slot_cv, dev->mtx);
+        }
+        if (graph->splitkv_buf_gen != dev->splitk_buf_gen) {
+            graph->comp.in_use = false;
+            velri_os_mutex_unlock(dev->mtx);
+            return VELRI_ERR_UNSUPPORTED;
+        }
+        dev->splitk_busy = true;
+    } else {
+        graph->comp.in_use = true;
+    }
+
+    /* Vulkan 1.3 §6.9 guarantees HOST_COHERENT writes before vkQueueSubmit are shader-visible. */
+    graph->step_map->seq_len = 1U;
+    graph->step_map->pos_offset = eff_pos;
+    graph->step_map->kv_pos = eff_kv;
+
+    if (dev->vkResetFences(dev->device, 1U, &graph->fence) != VK_SUCCESS) {
+        graph->comp.in_use = false;
+        if (use_splitk) {
+            dev->splitk_busy = false;
+            velri_os_cond_broadcast(dev->slot_cv);
+        }
+        velri_os_mutex_unlock(dev->mtx);
+        return VELRI_ERR_EXEC;
+    }
+    VkSubmitInfo si = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1U,
+        .pCommandBuffers = &target_cmd,
+    };
+    if (dev->vkQueueSubmit(dev->queue, 1U, &si, graph->fence) != VK_SUCCESS) {
+        graph->comp.in_use = false;
+        if (use_splitk) {
+            dev->splitk_busy = false;
+            velri_os_cond_broadcast(dev->slot_cv);
+        }
+        velri_os_mutex_unlock(dev->mtx);
+        return VELRI_ERR_EXEC;
+    }
+
+    graph->comp.cmd = target_cmd;
+    graph->comp.uses_splitk = use_splitk;
+    *out_completion = &graph->comp;
+    velri_os_mutex_unlock(dev->mtx);
+    return VELRI_OK;
+}
+
 /* ---- 6. Completion Backend Contract ---- */
 
 static velri_status vk_wait(velri_backend_device *dev, velri_completion *comp) {
@@ -790,7 +1280,16 @@ static void vk_destroy_completion(velri_backend_device *dev, velri_completion *c
         return;
     }
     velri_os_mutex_lock(dev->mtx);
-    release_slot_locked(dev, comp);
+    if (comp->is_captured_graph) {
+        comp->in_use = false;
+        if (comp->uses_splitk) {
+            dev->splitk_busy = false;
+            comp->uses_splitk = false;
+            velri_os_cond_broadcast(dev->slot_cv);
+        }
+    } else {
+        release_slot_locked(dev, comp);
+    }
     velri_os_mutex_unlock(dev->mtx);
 }
 
@@ -813,6 +1312,9 @@ static const velri_backend_vtable g_vk_vtable = {
     .submit_batch = vk_submit_batch,
     .wait = vk_wait,
     .destroy_completion = vk_destroy_completion,
+    .capture_graph = vk_capture_graph,
+    .destroy_captured_graph = vk_destroy_captured_graph,
+    .replay_graph = vk_replay_graph,
 };
 
 const velri_backend_vtable *velri_vulkan_backend_vtable(void) { return &g_vk_vtable; }
