@@ -62,8 +62,8 @@ jobs:
       # QEMU TCG does not implement AVX-512. Verify runtime CPUID dispatch on baseline and AVX2 CPUs.
       - name: Run the same binary on baseline and AVX2-only CPUs
         run: |
-          qemu-x86_64 -cpu Nehalem ./build/bench_slang_cpu --verify-only
-          qemu-x86_64 -cpu Haswell,-hle,-rtm ./build/bench_slang_cpu --verify-only
+          qemu-x86_64 -cpu Nehalem ./build/test_kernels
+          qemu-x86_64 -cpu Haswell,-hle,-rtm ./build/test_kernels
 
   linux-aarch64-cross:
     runs-on: ubuntu-24.04
