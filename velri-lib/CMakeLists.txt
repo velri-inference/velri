@@ -112,6 +112,7 @@ set(VELRI_SOURCES
     src/ops/registry.c
     src/graph/graph.c
     src/blocks/builder.c
+    src/blocks/norm.c
     src/blocks/embedding.c
     src/blocks/attention.c
     src/blocks/mlp.c
@@ -124,7 +125,10 @@ set(VELRI_SOURCES
 )
 if(VELRI_ENABLE_VULKAN)
     list(APPEND VELRI_SOURCES
-        src/backend/vulkan/vk_backend.c
+        src/backend/vulkan/vk_device.c
+        src/backend/vulkan/vk_memory.c
+        src/backend/vulkan/vk_pipeline.c
+        src/backend/vulkan/vk_dispatch.c
         "${VELRI_VK_SHADER_HEADER}"
     )
 endif()
@@ -143,9 +147,12 @@ target_include_directories(velri
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src/platform"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/core"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ops"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/blocks"
 )
 if(VELRI_ENABLE_VULKAN)
     target_include_directories(velri PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/vulkan"
         "${VELRI_SLANG_GEN_DIR}"
         "${VELRI_VULKAN_INCLUDE_DIR}"
     )

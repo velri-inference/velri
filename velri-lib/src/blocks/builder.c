@@ -1,5 +1,4 @@
-#include "velri_lib/blocks.h"
-#include "core_internal.h"
+#include "blocks_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +53,19 @@ static void format_scope_path(const velri_builder *b, char out_path[VELRI_BUILDE
     out_path[pos] = '\0';
 }
 
+static const velri_manifest_entry *manifest_find_entry(const velri_manifest_entry *entries,
+                                                       uint32_t count, const char *name) {
+    if (!entries || !name || name[0] == '\0') {
+        return nullptr;
+    }
+    for (uint32_t i = 0U; i < count; ++i) {
+        if (strcmp(entries[i].name, name) == 0) {
+            return &entries[i];
+        }
+    }
+    return nullptr;
+}
+
 static velri_status manifest_append_entry(velri_manifest_entry **entries, uint32_t *count,
                                           uint32_t *cap, const char *name,
                                           const char *source_name, const velri_tensor *t) {
@@ -72,15 +84,18 @@ static velri_status manifest_append_entry(velri_manifest_entry **entries, uint32
             return VELRI_ERR_OVERFLOW;
         }
     }
+    if (manifest_find_entry(*entries, *count, name) != nullptr) {
+        return VELRI_ERR_INVALID;
+    }
     if (*count == UINT32_MAX) {
         return VELRI_ERR_OVERFLOW;
     }
 
-    void *tmp = *entries;
-    if (!velri_vec_grow(&tmp, cap, *count + 1U, sizeof(velri_manifest_entry))) {
+    void *new_ptr = nullptr;
+    if (!velri_vec_ensure(*entries, &new_ptr, cap, *count, 1U, sizeof(velri_manifest_entry))) {
         return VELRI_ERR_NOMEM;
     }
-    *entries = (velri_manifest_entry *)tmp;
+    *entries = (velri_manifest_entry *)new_ptr;
 
     velri_manifest_entry *e = &(*entries)[*count];
     memset(e, 0, sizeof(*e));
@@ -98,6 +113,38 @@ static velri_status manifest_append_entry(velri_manifest_entry **entries, uint32
     e->device_id = t->device_id;
     (*count)++;
     return VELRI_OK;
+}
+
+static velri_tensor_view view_from_tensor(const velri_tensor *t) {
+    velri_tensor_view v;
+    memset(&v, 0, sizeof(v));
+    v.storage_id = t->storage_id;
+    v.dtype = t->dtype;
+    v.rank = t->rank;
+    for (uint32_t d = 0U; d < t->rank; ++d) {
+        v.dims[d] = t->dims[d];
+        v.strides[d] = t->strides[d];
+    }
+    v.byte_offset = t->byte_offset;
+    return v;
+}
+
+static velri_tensor tensor_from_view(const velri_tensor_view *v, velri_view_id vid,
+                                     velri_device_id device_id, bool is_seq_dynamic) {
+    velri_tensor t = VELRI_TENSOR_NONE;
+    t.storage_id = v->storage_id;
+    t.view_id = vid;
+    t.dtype = v->dtype;
+    t.rank = v->rank;
+    for (uint32_t d = 0U; d < v->rank; ++d) {
+        t.dims[d] = v->dims[d];
+        t.strides[d] = v->strides[d];
+    }
+    t.byte_offset = v->byte_offset;
+    t.device_id = device_id;
+    t.is_seq_dynamic = is_seq_dynamic;
+    t.valid = true;
+    return t;
 }
 
 static velri_tensor alloc_tensor(velri_builder *b, velri_storage_kind kind,
@@ -162,30 +209,65 @@ static velri_tensor alloc_tensor(velri_builder *b, velri_storage_kind kind,
         return VELRI_TENSOR_NONE;
     }
 
-    velri_tensor t = VELRI_TENSOR_NONE;
-    t.storage_id = sid;
-    t.view_id = vid;
-    t.dtype = dtype;
-    t.rank = rank;
-    for (uint32_t d = 0U; d < rank; ++d) {
-        t.dims[d] = tv.dims[d];
-        t.strides[d] = tv.strides[d];
-    }
-    t.byte_offset = 0U;
-    t.device_id = device_id;
-    t.valid = true;
-    return t;
+    return tensor_from_view(&tv, vid, device_id, false);
 }
 
-static bool emit_op(velri_builder *b, const velri_op_desc *op) {
+static velri_tensor alloc_compute_tensor(velri_builder *b, velri_storage_kind kind,
+                                         velri_dtype dtype, uint32_t rank, const size_t *dims) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     velri_device_id compute_dev = 0U;
     velri_b_devices(b, nullptr, &compute_dev);
-    velri_status st = velri_graph_add_op(b->graph, op, compute_dev, nullptr);
+    return alloc_tensor(b, kind, compute_dev, dtype, rank, dims);
+}
+
+static velri_tensor make_subview(velri_builder *b, velri_tensor base, uint32_t rank,
+                                 const size_t *sub_dims, const size_t *sub_strides,
+                                 size_t elem_offset, bool is_seq_dynamic) {
+    size_t elem_bytes = velri_dtype_bytes(base.dtype);
+    if (elem_bytes == 0U) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    size_t extra_byte_offset = 0U;
+    if (velri_mul_overflow_size(elem_offset, elem_bytes, &extra_byte_offset)) {
+        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_tensor_view base_view = view_from_tensor(&base);
+    velri_tensor_view sub_view;
+    velri_status st = velri_tensor_view_subview(&base_view, rank, sub_dims, sub_strides,
+                                                extra_byte_offset, &sub_view);
+    if (st != VELRI_OK) {
+        velri_b_set_error(b, st);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_view_id vid = VELRI_INVALID_ID;
+    st = velri_graph_add_view(b->graph, &sub_view, &vid);
+    if (st != VELRI_OK) {
+        velri_b_set_error(b, st);
+        return VELRI_TENSOR_NONE;
+    }
+
+    return tensor_from_view(&sub_view, vid, base.device_id, is_seq_dynamic);
+}
+
+static bool emit_op_on(velri_builder *b, const velri_op_desc *op, velri_device_id dev) {
+    velri_status st = velri_graph_add_op(b->graph, op, dev, nullptr);
     if (st != VELRI_OK) {
         velri_b_set_error(b, st);
         return false;
     }
     return true;
+}
+
+static bool emit_op(velri_builder *b, const velri_op_desc *op) {
+    velri_device_id compute_dev = 0U;
+    velri_b_devices(b, nullptr, &compute_dev);
+    return emit_op_on(b, op, compute_dev);
 }
 
 static bool same_shape(const velri_tensor *a, const velri_tensor *b) {
@@ -221,27 +303,11 @@ void velri_manifest_destroy(velri_manifest *m) {
 }
 
 const velri_manifest_entry *velri_manifest_find_weight(const velri_manifest *m, const char *name) {
-    if (!m || !name || name[0] == '\0') {
-        return nullptr;
-    }
-    for (uint32_t i = 0U; i < m->num_weights; ++i) {
-        if (strcmp(m->weights[i].name, name) == 0) {
-            return &m->weights[i];
-        }
-    }
-    return nullptr;
+    return m ? manifest_find_entry(m->weights, m->num_weights, name) : nullptr;
 }
 
 const velri_manifest_entry *velri_manifest_find_state(const velri_manifest *m, const char *name) {
-    if (!m || !name || name[0] == '\0') {
-        return nullptr;
-    }
-    for (uint32_t i = 0U; i < m->num_states; ++i) {
-        if (strcmp(m->states[i].name, name) == 0) {
-            return &m->states[i];
-        }
-    }
-    return nullptr;
+    return m ? manifest_find_entry(m->states, m->num_states, name) : nullptr;
 }
 
 /* ---- Lifecycle & Sticky Error Handling ---- */
@@ -276,7 +342,11 @@ void velri_b_set_error(velri_builder *b, velri_status err) {
 /* ---- Scope Stack & Placement Resolution ---- */
 
 void velri_b_push_scope(velri_builder *b, const char *name) {
-    if (!b || b->err != VELRI_OK) {
+    if (!b) {
+        return;
+    }
+    if (b->err != VELRI_OK) {
+        b->skipped_scope_pushes++;
         return;
     }
     if (!name || name[0] == '\0') {
@@ -298,7 +368,11 @@ void velri_b_push_scope(velri_builder *b, const char *name) {
 }
 
 void velri_b_pop_scope(velri_builder *b) {
-    if (!b || b->err != VELRI_OK) {
+    if (!b) {
+        return;
+    }
+    if (b->skipped_scope_pushes > 0U) {
+        b->skipped_scope_pushes--;
         return;
     }
     if (b->scope_depth == 0U) {
@@ -310,7 +384,11 @@ void velri_b_pop_scope(velri_builder *b) {
 }
 
 void velri_b_push_layer(velri_builder *b, int32_t layer_idx) {
-    if (!b || b->err != VELRI_OK) {
+    if (!b) {
+        return;
+    }
+    if (b->err != VELRI_OK) {
+        b->skipped_layer_pushes++;
         return;
     }
     if (layer_idx < 0) {
@@ -326,7 +404,11 @@ void velri_b_push_layer(velri_builder *b, int32_t layer_idx) {
 }
 
 void velri_b_pop_layer(velri_builder *b) {
-    if (!b || b->err != VELRI_OK) {
+    if (!b) {
+        return;
+    }
+    if (b->skipped_layer_pushes > 0U) {
+        b->skipped_layer_pushes--;
         return;
     }
     if (b->layer_depth == 0U) {
@@ -343,7 +425,7 @@ void velri_b_devices(const velri_builder *b, velri_device_id *out_store,
     velri_device_id store = b ? b->default_store_dev : 0U;
     velri_device_id compute = b ? b->default_compute_dev : 0U;
 
-    if (b && b->resolve_fn) {
+    if (b && b->err == VELRI_OK && b->resolve_fn) {
         char path[VELRI_BUILDER_MAX_SCOPE_PATH];
         format_scope_path(b, path);
         b->resolve_fn(path, b->current_layer, b->resolve_user, &store, &compute);
@@ -371,6 +453,10 @@ velri_tensor velri_b_weight(velri_builder *b, const char *name, velri_dtype dtyp
         }
         if (strlen(name) >= VELRI_MANIFEST_NAME_MAX) {
             velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+            return VELRI_TENSOR_NONE;
+        }
+        if (b->manifest && velri_manifest_find_weight(b->manifest, name) != nullptr) {
+            velri_b_set_error(b, VELRI_ERR_INVALID);
             return VELRI_TENSOR_NONE;
         }
     }
@@ -401,17 +487,23 @@ velri_tensor velri_b_weight_tied(velri_builder *b, const char *name, const char 
     if (!tie_to) {
         return velri_b_weight(b, name, dtype, rank, dims);
     }
-    if (!b->manifest || !dims || rank == 0U || rank > VELRI_MAX_RANK || tie_to[0] == '\0') {
+    if (!b->manifest || !dims || rank == 0U || rank > VELRI_MAX_RANK || tie_to[0] == '\0' ||
+        (name && name[0] == '\0')) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-    if (name && strlen(name) >= VELRI_MANIFEST_NAME_MAX) {
+    if ((name && strlen(name) >= VELRI_MANIFEST_NAME_MAX) ||
+        strlen(tie_to) >= VELRI_MANIFEST_NAME_MAX) {
         velri_b_set_error(b, VELRI_ERR_OVERFLOW);
         return VELRI_TENSOR_NONE;
     }
 
     const velri_manifest_entry *src = velri_manifest_find_weight(b->manifest, tie_to);
-    if (!src || src->dtype != dtype || src->rank != rank) {
+    if (!src) {
+        velri_b_set_error(b, VELRI_ERR_NOT_FOUND);
+        return VELRI_TENSOR_NONE;
+    }
+    if (src->dtype != dtype || src->rank != rank) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
@@ -432,34 +524,20 @@ velri_tensor velri_b_weight_tied(velri_builder *b, const char *name, const char 
             velri_b_set_error(b, st);
             return VELRI_TENSOR_NONE;
         }
-
-        velri_tensor t = VELRI_TENSOR_NONE;
-        t.storage_id = src->storage_id;
-        t.view_id = src->view_id;
-        t.dtype = src->dtype;
-        t.rank = src->rank;
-        for (uint32_t d = 0U; d < src->rank; ++d) {
-            t.dims[d] = tv.dims[d];
-            t.strides[d] = tv.strides[d];
-        }
-        t.byte_offset = 0U;
-        t.device_id = src->device_id;
-        t.is_seq_dynamic = false;
-        t.valid = true;
-        return t;
+        return tensor_from_view(&tv, src->view_id, src->device_id, false);
     }
 
-    /* Cross-device placement: copy names before any manifest reallocation, then allocate on store_dev. */
-    const char *entry_name = (name && name[0] != '\0') ? name : tie_to;
-    size_t nlen = strlen(entry_name);
-    size_t slen = strlen(tie_to);
-    if (nlen >= VELRI_MANIFEST_NAME_MAX || slen >= VELRI_MANIFEST_NAME_MAX) {
-        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+    /* Cross-device placement requires a distinct logical alias name for the replicated storage. */
+    if (!name || velri_manifest_find_weight(b->manifest, name) != nullptr) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
+
+    size_t nlen = strlen(name);
+    size_t slen = strlen(tie_to);
     char name_buf[VELRI_MANIFEST_NAME_MAX];
     char src_buf[VELRI_MANIFEST_NAME_MAX];
-    memcpy(name_buf, entry_name, nlen + 1U);
+    memcpy(name_buf, name, nlen + 1U);
     memcpy(src_buf, tie_to, slen + 1U);
 
     velri_tensor t = alloc_tensor(b, VELRI_STORAGE_WEIGHT, store_dev, dtype, rank, dims);
@@ -476,22 +554,12 @@ velri_tensor velri_b_weight_tied(velri_builder *b, const char *name, const char 
 }
 
 velri_tensor velri_b_input(velri_builder *b, velri_dtype dtype, uint32_t rank, const size_t *dims) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
-    return alloc_tensor(b, VELRI_STORAGE_INPUT, compute_dev, dtype, rank, dims);
+    return alloc_compute_tensor(b, VELRI_STORAGE_INPUT, dtype, rank, dims);
 }
 
 velri_tensor velri_b_output(velri_builder *b, velri_dtype dtype, uint32_t rank,
                             const size_t *dims) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
-    return alloc_tensor(b, VELRI_STORAGE_OUTPUT, compute_dev, dtype, rank, dims);
+    return alloc_compute_tensor(b, VELRI_STORAGE_OUTPUT, dtype, rank, dims);
 }
 
 velri_tensor velri_b_state(velri_builder *b, const char *name, velri_dtype dtype, uint32_t rank,
@@ -508,11 +576,15 @@ velri_tensor velri_b_state(velri_builder *b, const char *name, velri_dtype dtype
             velri_b_set_error(b, VELRI_ERR_OVERFLOW);
             return VELRI_TENSOR_NONE;
         }
+        if (b->manifest && velri_manifest_find_state(b->manifest, name) != nullptr) {
+            velri_b_set_error(b, VELRI_ERR_INVALID);
+            return VELRI_TENSOR_NONE;
+        }
     }
 
-    velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
-    velri_tensor t = alloc_tensor(b, VELRI_STORAGE_STATE, compute_dev, dtype, rank, dims);
+    velri_device_id store_dev = 0U;
+    velri_b_devices(b, &store_dev, nullptr);
+    velri_tensor t = alloc_tensor(b, VELRI_STORAGE_STATE, store_dev, dtype, rank, dims);
     if (!t.valid) {
         return VELRI_TENSOR_NONE;
     }
@@ -530,12 +602,7 @@ velri_tensor velri_b_state(velri_builder *b, const char *name, velri_dtype dtype
 
 velri_tensor velri_b_scratch(velri_builder *b, velri_dtype dtype, uint32_t rank,
                              const size_t *dims) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
-    return alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, dtype, rank, dims);
+    return alloc_compute_tensor(b, VELRI_STORAGE_SCRATCH, dtype, rank, dims);
 }
 
 velri_tensor velri_b_subview_2d_cols(velri_builder *b, velri_tensor base, size_t col_offset,
@@ -548,60 +615,9 @@ velri_tensor velri_b_subview_2d_cols(velri_builder *b, velri_tensor base, size_t
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-
-    size_t elem_bytes = velri_dtype_bytes(base.dtype);
-    if (elem_bytes == 0U) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
-    size_t extra_byte_offset = 0U;
-    if (velri_mul_overflow_size(col_offset, elem_bytes, &extra_byte_offset)) {
-        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_tensor_view base_view;
-    memset(&base_view, 0, sizeof(base_view));
-    base_view.storage_id = base.storage_id;
-    base_view.dtype = base.dtype;
-    base_view.rank = 2U;
-    base_view.dims[0] = base.dims[0];
-    base_view.dims[1] = base.dims[1];
-    base_view.strides[0] = base.strides[0];
-    base_view.strides[1] = base.strides[1];
-    base_view.byte_offset = base.byte_offset;
-
     const size_t sub_dims[2] = {base.dims[0], num_cols};
     const size_t sub_strides[2] = {base.strides[0], 1U};
-    velri_tensor_view sub_view;
-    velri_status st = velri_tensor_view_subview(&base_view, 2U, sub_dims, sub_strides,
-                                                extra_byte_offset, &sub_view);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_view_id vid = VELRI_INVALID_ID;
-    st = velri_graph_add_view(b->graph, &sub_view, &vid);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_tensor out = VELRI_TENSOR_NONE;
-    out.storage_id = base.storage_id;
-    out.view_id = vid;
-    out.dtype = base.dtype;
-    out.rank = 2U;
-    out.dims[0] = sub_view.dims[0];
-    out.dims[1] = sub_view.dims[1];
-    out.strides[0] = sub_view.strides[0];
-    out.strides[1] = sub_view.strides[1];
-    out.byte_offset = sub_view.byte_offset;
-    out.device_id = base.device_id;
-    out.is_seq_dynamic = base.is_seq_dynamic;
-    out.valid = true;
-    return out;
+    return make_subview(b, base, 2U, sub_dims, sub_strides, col_offset, base.is_seq_dynamic);
 }
 
 velri_tensor velri_b_subview_2d_rows(velri_builder *b, velri_tensor base, size_t row_offset,
@@ -614,62 +630,15 @@ velri_tensor velri_b_subview_2d_rows(velri_builder *b, velri_tensor base, size_t
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-
-    size_t elem_bytes = velri_dtype_bytes(base.dtype);
-    if (elem_bytes == 0U) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
     size_t elem_offset = 0U;
-    size_t extra_byte_offset = 0U;
-    if (velri_mul_overflow_size(row_offset, base.strides[0], &elem_offset) ||
-        velri_mul_overflow_size(elem_offset, elem_bytes, &extra_byte_offset)) {
+    if (velri_mul_overflow_size(row_offset, base.strides[0], &elem_offset)) {
         velri_b_set_error(b, VELRI_ERR_OVERFLOW);
         return VELRI_TENSOR_NONE;
     }
-
-    velri_tensor_view base_view;
-    memset(&base_view, 0, sizeof(base_view));
-    base_view.storage_id = base.storage_id;
-    base_view.dtype = base.dtype;
-    base_view.rank = 2U;
-    base_view.dims[0] = base.dims[0];
-    base_view.dims[1] = base.dims[1];
-    base_view.strides[0] = base.strides[0];
-    base_view.strides[1] = base.strides[1];
-    base_view.byte_offset = base.byte_offset;
-
     const size_t sub_dims[2] = {num_rows, base.dims[1]};
     const size_t sub_strides[2] = {base.strides[0], base.strides[1]};
-    velri_tensor_view sub_view;
-    velri_status st = velri_tensor_view_subview(&base_view, 2U, sub_dims, sub_strides,
-                                                extra_byte_offset, &sub_view);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_view_id vid = VELRI_INVALID_ID;
-    st = velri_graph_add_view(b->graph, &sub_view, &vid);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_tensor out = VELRI_TENSOR_NONE;
-    out.storage_id = base.storage_id;
-    out.view_id = vid;
-    out.dtype = base.dtype;
-    out.rank = 2U;
-    out.dims[0] = sub_view.dims[0];
-    out.dims[1] = sub_view.dims[1];
-    out.strides[0] = sub_view.strides[0];
-    out.strides[1] = sub_view.strides[1];
-    out.byte_offset = sub_view.byte_offset;
-    out.device_id = base.device_id;
-    out.is_seq_dynamic = (row_offset == 0U && num_rows == base.dims[0]) && base.is_seq_dynamic;
-    out.valid = true;
-    return out;
+    bool dyn = (row_offset == 0U && num_rows == base.dims[0]) && base.is_seq_dynamic;
+    return make_subview(b, base, 2U, sub_dims, sub_strides, elem_offset, dyn);
 }
 
 velri_tensor velri_b_subview_1d(velri_builder *b, velri_tensor base, size_t offset, size_t len) {
@@ -681,56 +650,10 @@ velri_tensor velri_b_subview_1d(velri_builder *b, velri_tensor base, size_t offs
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-
-    size_t elem_bytes = velri_dtype_bytes(base.dtype);
-    if (elem_bytes == 0U) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
-    size_t extra_byte_offset = 0U;
-    if (velri_mul_overflow_size(offset, elem_bytes, &extra_byte_offset)) {
-        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_tensor_view base_view;
-    memset(&base_view, 0, sizeof(base_view));
-    base_view.storage_id = base.storage_id;
-    base_view.dtype = base.dtype;
-    base_view.rank = 1U;
-    base_view.dims[0] = base.dims[0];
-    base_view.strides[0] = base.strides[0];
-    base_view.byte_offset = base.byte_offset;
-
     const size_t sub_dims[1] = {len};
     const size_t sub_strides[1] = {1U};
-    velri_tensor_view sub_view;
-    velri_status st = velri_tensor_view_subview(&base_view, 1U, sub_dims, sub_strides,
-                                                extra_byte_offset, &sub_view);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_view_id vid = VELRI_INVALID_ID;
-    st = velri_graph_add_view(b->graph, &sub_view, &vid);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_tensor out = VELRI_TENSOR_NONE;
-    out.storage_id = base.storage_id;
-    out.view_id = vid;
-    out.dtype = base.dtype;
-    out.rank = 1U;
-    out.dims[0] = sub_view.dims[0];
-    out.strides[0] = sub_view.strides[0];
-    out.byte_offset = sub_view.byte_offset;
-    out.device_id = base.device_id;
-    out.is_seq_dynamic = (offset == 0U && len == base.dims[0]) && base.is_seq_dynamic;
-    out.valid = true;
-    return out;
+    bool dyn = (offset == 0U && len == base.dims[0]) && base.is_seq_dynamic;
+    return make_subview(b, base, 1U, sub_dims, sub_strides, offset, dyn);
 }
 
 /* ---- Primitive Operation Builders ---- */
@@ -822,9 +745,7 @@ velri_tensor velri_b_linear(velri_builder *b, velri_tensor x, velri_tensor w,
         return VELRI_TENSOR_NONE;
     }
 
-    velri_dtype y_dtype =
-        (x.dtype == VELRI_DTYPE_F64 && w.dtype == VELRI_DTYPE_F64) ? VELRI_DTYPE_F64
-                                                                   : VELRI_DTYPE_F32;
+    velri_dtype y_dtype = velri_blocks_linear_out_dtype(x.dtype, w.dtype);
     const size_t out_dims[2] = {x.dims[0], w.dims[0]};
     velri_tensor out = velri_b_scratch(b, y_dtype, 2U, out_dims);
     if (!out.valid) {
@@ -894,7 +815,8 @@ velri_tensor velri_b_rmsnorm(velri_builder *b, velri_tensor x, velri_tensor w, f
     return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
 }
 
-velri_tensor velri_b_activation(velri_builder *b, velri_tensor x, velri_act_kind act_kind) {
+static velri_tensor emit_activation(velri_builder *b, velri_tensor x, velri_act_kind act_kind,
+                                    bool inplace) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
@@ -903,9 +825,14 @@ velri_tensor velri_b_activation(velri_builder *b, velri_tensor x, velri_act_kind
         return VELRI_TENSOR_NONE;
     }
 
-    velri_tensor out = velri_b_scratch(b, x.dtype, x.rank, x.dims);
-    if (!out.valid) {
-        return VELRI_TENSOR_NONE;
+    velri_device_id compute_dev = 0U;
+    velri_b_devices(b, nullptr, &compute_dev);
+    velri_tensor out = x;
+    if (!inplace || x.device_id != compute_dev) {
+        out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, x.dtype, x.rank, x.dims);
+        if (!out.valid) {
+            return VELRI_TENSOR_NONE;
+        }
     }
     out.is_seq_dynamic = x.is_seq_dynamic;
 
@@ -915,89 +842,61 @@ velri_tensor velri_b_activation(velri_builder *b, velri_tensor x, velri_act_kind
     op.outputs[0] = out.view_id;
     op.attr.activation.kind = act_kind;
 
-    return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
+    return emit_op_on(b, &op, compute_dev) ? out : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_b_activation(velri_builder *b, velri_tensor x, velri_act_kind act_kind) {
+    return emit_activation(b, x, act_kind, false);
 }
 
 velri_tensor velri_b_activation_inplace(velri_builder *b, velri_tensor x, velri_act_kind act_kind) {
+    return emit_activation(b, x, act_kind, true);
+}
+
+static velri_tensor emit_gated_mlp_act(velri_builder *b, velri_tensor gate, velri_tensor up,
+                                       velri_act_kind act_kind, float clamp_limit, bool inplace) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
-    if (!x.valid || x.rank == 0U || x.rank > VELRI_MAX_RANK) {
+    if (!gate.valid || !up.valid || !same_shape(&gate, &up)) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
+
     velri_device_id compute_dev = 0U;
     velri_b_devices(b, nullptr, &compute_dev);
-    if (x.device_id != compute_dev) {
-        return velri_b_activation(b, x, act_kind);
+    velri_tensor out = gate;
+    if (!inplace || gate.device_id != compute_dev) {
+        out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, gate.dtype, gate.rank, gate.dims);
+        if (!out.valid) {
+            return VELRI_TENSOR_NONE;
+        }
     }
+    bool dyn = gate.is_seq_dynamic || up.is_seq_dynamic;
+    out.is_seq_dynamic = dyn;
 
-    velri_op_desc op = init_op_desc(VELRI_OP_ACTIVATION, 1U, 1U);
-    op.dynamic_seq = x.is_seq_dynamic;
-    op.inputs[0] = x.view_id;
-    op.outputs[0] = x.view_id;
-    op.attr.activation.kind = act_kind;
+    velri_op_desc op = init_op_desc(VELRI_OP_GATED_MLP, 2U, 1U);
+    op.dynamic_seq = dyn;
+    op.inputs[0] = gate.view_id;
+    op.inputs[1] = up.view_id;
+    op.outputs[0] = out.view_id;
+    op.attr.gated_mlp.act = act_kind;
+    op.attr.gated_mlp.clamp_limit = clamp_limit;
 
-    return emit_op(b, &op) ? x : VELRI_TENSOR_NONE;
+    return emit_op_on(b, &op, compute_dev) ? out : VELRI_TENSOR_NONE;
 }
 
 velri_tensor velri_b_gated_mlp_act(velri_builder *b, velri_tensor gate, velri_tensor up,
                                    velri_act_kind act_kind, float clamp_limit) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    if (!gate.valid || !up.valid || !same_shape(&gate, &up)) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_tensor out = velri_b_scratch(b, gate.dtype, gate.rank, gate.dims);
-    if (!out.valid) {
-        return VELRI_TENSOR_NONE;
-    }
-    bool dyn = gate.is_seq_dynamic || up.is_seq_dynamic;
-    out.is_seq_dynamic = dyn;
-
-    velri_op_desc op = init_op_desc(VELRI_OP_GATED_MLP, 2U, 1U);
-    op.dynamic_seq = dyn;
-    op.inputs[0] = gate.view_id;
-    op.inputs[1] = up.view_id;
-    op.outputs[0] = out.view_id;
-    op.attr.gated_mlp.act = act_kind;
-    op.attr.gated_mlp.clamp_limit = clamp_limit;
-
-    return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
+    return emit_gated_mlp_act(b, gate, up, act_kind, clamp_limit, false);
 }
 
 velri_tensor velri_b_gated_mlp_act_inplace(velri_builder *b, velri_tensor gate, velri_tensor up,
                                            velri_act_kind act_kind, float clamp_limit) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    if (!gate.valid || !up.valid || !same_shape(&gate, &up)) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
-    velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
-    if (gate.device_id != compute_dev) {
-        return velri_b_gated_mlp_act(b, gate, up, act_kind, clamp_limit);
-    }
-
-    bool dyn = gate.is_seq_dynamic || up.is_seq_dynamic;
-    gate.is_seq_dynamic = dyn;
-    velri_op_desc op = init_op_desc(VELRI_OP_GATED_MLP, 2U, 1U);
-    op.dynamic_seq = dyn;
-    op.inputs[0] = gate.view_id;
-    op.inputs[1] = up.view_id;
-    op.outputs[0] = gate.view_id;
-    op.attr.gated_mlp.act = act_kind;
-    op.attr.gated_mlp.clamp_limit = clamp_limit;
-
-    return emit_op(b, &op) ? gate : VELRI_TENSOR_NONE;
+    return emit_gated_mlp_act(b, gate, up, act_kind, clamp_limit, true);
 }
 
-velri_tensor velri_b_add(velri_builder *b, velri_tensor a, velri_tensor b_in) {
+static velri_tensor emit_add(velri_builder *b, velri_tensor a, velri_tensor b_in, bool inplace) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
@@ -1006,9 +905,14 @@ velri_tensor velri_b_add(velri_builder *b, velri_tensor a, velri_tensor b_in) {
         return VELRI_TENSOR_NONE;
     }
 
-    velri_tensor out = velri_b_scratch(b, a.dtype, a.rank, a.dims);
-    if (!out.valid) {
-        return VELRI_TENSOR_NONE;
+    velri_device_id compute_dev = 0U;
+    velri_b_devices(b, nullptr, &compute_dev);
+    velri_tensor out = a;
+    if (!inplace || a.device_id != compute_dev) {
+        out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, a.dtype, a.rank, a.dims);
+        if (!out.valid) {
+            return VELRI_TENSOR_NONE;
+        }
     }
     bool dyn = a.is_seq_dynamic || b_in.is_seq_dynamic;
     out.is_seq_dynamic = dyn;
@@ -1021,34 +925,15 @@ velri_tensor velri_b_add(velri_builder *b, velri_tensor a, velri_tensor b_in) {
     op.attr.axpby.alpha = 1.0f;
     op.attr.axpby.beta = 1.0f;
 
-    return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
+    return emit_op_on(b, &op, compute_dev) ? out : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_b_add(velri_builder *b, velri_tensor a, velri_tensor b_in) {
+    return emit_add(b, a, b_in, false);
 }
 
 velri_tensor velri_b_add_inplace(velri_builder *b, velri_tensor a, velri_tensor b_in) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    if (!a.valid || !b_in.valid || !same_shape(&a, &b_in)) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
-    velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
-    if (a.device_id != compute_dev) {
-        return velri_b_add(b, a, b_in);
-    }
-
-    bool dyn = a.is_seq_dynamic || b_in.is_seq_dynamic;
-    a.is_seq_dynamic = dyn;
-    velri_op_desc op = init_op_desc(VELRI_OP_VEC_AXPBY, 2U, 1U);
-    op.dynamic_seq = dyn;
-    op.inputs[0] = a.view_id;
-    op.inputs[1] = b_in.view_id;
-    op.outputs[0] = a.view_id;
-    op.attr.axpby.alpha = 1.0f;
-    op.attr.axpby.beta = 1.0f;
-
-    return emit_op(b, &op) ? a : VELRI_TENSOR_NONE;
+    return emit_add(b, a, b_in, true);
 }
 
 velri_tensor velri_b_batched_linear(velri_builder *b, velri_tensor x, velri_tensor w,
@@ -1058,9 +943,8 @@ velri_tensor velri_b_batched_linear(velri_builder *b, velri_tensor x, velri_tens
         return VELRI_TENSOR_NONE;
     }
     if (!x.valid || !w.valid || x.rank != 2U || w.rank != 2U ||
-        (bias_or_none.valid && bias_or_none.rank != 1U) ||
-        n_heads == 0U || n_groups == 0U || in_dim == 0U || out_dim == 0U ||
-        (n_heads % n_groups) != 0U) {
+        (bias_or_none.valid && bias_or_none.rank != 1U) || n_heads == 0U || n_groups == 0U ||
+        in_dim == 0U || out_dim == 0U || (n_heads % n_groups) != 0U) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
@@ -1093,11 +977,11 @@ velri_tensor velri_b_batched_linear(velri_builder *b, velri_tensor x, velri_tens
     return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
 }
 
-velri_tensor velri_b_attention_ex(velri_builder *b, velri_tensor q, velri_tensor k_in,
-                                  velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
-                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim_k,
-                                  uint32_t head_dim_v, float scale, uint32_t sliding_window,
-                                  bool causal) {
+static velri_tensor emit_attention(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                   velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
+                                   uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim_k,
+                                   uint32_t head_dim_v, float scale, uint32_t sliding_window,
+                                   bool causal, bool inplace) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
@@ -1113,10 +997,17 @@ velri_tensor velri_b_attention_ex(velri_builder *b, velri_tensor q, velri_tensor
         return VELRI_TENSOR_NONE;
     }
 
-    const size_t out_dims[2] = {q.dims[0], attn_dim};
-    velri_tensor out = velri_b_scratch(b, q.dtype, 2U, out_dims);
-    if (!out.valid) {
-        return VELRI_TENSOR_NONE;
+    velri_device_id compute_dev = 0U;
+    velri_b_devices(b, nullptr, &compute_dev);
+    velri_tensor out = q;
+    bool can_inplace = inplace && dv == head_dim_k && q.device_id == compute_dev &&
+                       q.dims[1] == attn_dim && q.strides[1] == 1U && q.strides[0] == q.dims[1];
+    if (!can_inplace) {
+        const size_t out_dims[2] = {q.dims[0], attn_dim};
+        out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, q.dtype, 2U, out_dims);
+        if (!out.valid) {
+            return VELRI_TENSOR_NONE;
+        }
     }
     out.is_seq_dynamic = true;
 
@@ -1136,7 +1027,16 @@ velri_tensor velri_b_attention_ex(velri_builder *b, velri_tensor q, velri_tensor
     op.attr.attention.sliding_window = sliding_window;
     op.attr.attention.causal = causal;
 
-    return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
+    return emit_op_on(b, &op, compute_dev) ? out : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_b_attention_ex(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                  velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim_k,
+                                  uint32_t head_dim_v, float scale, uint32_t sliding_window,
+                                  bool causal) {
+    return emit_attention(b, q, k_in, v_in, k_cache, v_cache, n_heads, n_kv_heads, head_dim_k,
+                          head_dim_v, scale, sliding_window, causal, false);
 }
 
 velri_tensor velri_b_attention_inplace(velri_builder *b, velri_tensor q, velri_tensor k_in,
@@ -1144,41 +1044,16 @@ velri_tensor velri_b_attention_inplace(velri_builder *b, velri_tensor q, velri_t
                                        velri_tensor v_cache, uint32_t n_heads, uint32_t n_kv_heads,
                                        uint32_t head_dim, float scale, uint32_t sliding_window,
                                        bool causal) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    if (!q.valid || !k_in.valid || !v_in.valid || !k_cache.valid || !v_cache.valid ||
-        q.rank != 2U || n_heads == 0U || n_kv_heads == 0U || head_dim == 0U) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
-
-    velri_op_desc op = init_op_desc(VELRI_OP_ATTENTION, 3U, 3U);
-    op.dynamic_seq = true;
-    op.inputs[0] = q.view_id;
-    op.inputs[1] = k_in.view_id;
-    op.inputs[2] = v_in.view_id;
-    op.outputs[0] = q.view_id;
-    op.outputs[1] = k_cache.view_id;
-    op.outputs[2] = v_cache.view_id;
-    op.attr.attention.n_heads = n_heads;
-    op.attr.attention.n_kv_heads = n_kv_heads;
-    op.attr.attention.head_dim = head_dim;
-    op.attr.attention.v_head_dim = head_dim;
-    op.attr.attention.scale = scale;
-    op.attr.attention.sliding_window = sliding_window;
-    op.attr.attention.causal = causal;
-
-    q.is_seq_dynamic = true;
-    return emit_op(b, &op) ? q : VELRI_TENSOR_NONE;
+    return emit_attention(b, q, k_in, v_in, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
+                          head_dim, scale, sliding_window, causal, true);
 }
 
 velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_in,
                                velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
                                uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                                float scale, uint32_t sliding_window, bool causal) {
-    return velri_b_attention_ex(b, q, k_in, v_in, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
-                                head_dim, scale, sliding_window, causal);
+    return emit_attention(b, q, k_in, v_in, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
+                          head_dim, scale, sliding_window, causal, false);
 }
 
 velri_tensor velri_b_copy_last_row(velri_builder *b, velri_tensor x) {
@@ -1203,10 +1078,5 @@ velri_tensor velri_b_copy_last_row(velri_builder *b, velri_tensor x) {
     op.inputs[0] = x.view_id;
     op.outputs[0] = out.view_id;
 
-    velri_status st = velri_graph_add_op(b->graph, &op, x.device_id, nullptr);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-    return out;
+    return emit_op_on(b, &op, x.device_id) ? out : VELRI_TENSOR_NONE;
 }

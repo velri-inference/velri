@@ -12,10 +12,10 @@ This document covers two coupled parts of the Velri engine layer: composing mode
 
 | Level | Examples | What Is Specified |
 | :--- | :--- | :--- |
-| **Operation** (`velri-lib`) | `Linear`, `RMSNorm`, `RoPE`, `Attention`, `GDN`, `FWHT` | Formula, input/output shapes & dtypes, explicit state reads/writes |
-| **Block** (`Velri`) | `GatedMLP`, `MoE`, `ProjectedAttention`, `HyperConnections` | Subgraph of operations with no family-name branches |
-| **Layer** (`Velri`) | Sequence mixer + FFN + norms and residual connections | Block ordering and intra-layer dataflow |
-| **Architecture** (`Velri`) | `Llama`, `Qwen3.5`, `Qwen3.8-Flash-Next`, `Gemma 4` | Full layer schedule, weight mapping, auxiliary branches (`PLE`, `MTP`, encoders) |
+| **Operation** (`velri-lib`, `graph.h`) | `Linear`, `BatchedLinear`, `RMSNorm`, `LayerNorm`, `RoPE`, `Attention`, `GDN`, `FWHT` | Formula, input/output shapes & dtypes, explicit state reads/writes |
+| **Reusable Block & Generic Layer** (`velri-lib`, `blocks.h`) | `velri_builder`, `velri_manifest`, `norm`, `linear`, `embedding`, `attention_core`/`dense`/`latent`, `mlp`, `lm_head`, generic `pre_norm` | Model- and config-agnostic subgraphs with zero family branches or engine scope hardcoding |
+| **Engine Layer Helpers** (`Velri`, `src/model/layers.{h,c}`) | `velri_model_params`, `velri_pre_norm_layer_desc`, `velri_lm_head_desc`, placement scopes (`input-layer`, `hidden-layers`, `attention`, `kv-cache`, `dense-mlp`, `lm-head`) | Binding engine model metadata and JSON placement scopes onto `velri-lib` blocks |
+| **Architecture** (`Velri`, `src/model/arch/`) | `GPT-2`, `Llama`, `Qwen3.5`, `Qwen3.8-Flash-Next`, `Gemma 4` | Full layer schedule, weight mapping, auxiliary branches (`PLE`, `MTP`, encoders) |
 
 Reusing a block reuses its **computation structure**: weights and state are never shared implicitly — shared ownership is always declared explicitly.
 

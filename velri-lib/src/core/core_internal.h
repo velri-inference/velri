@@ -1,15 +1,19 @@
 #ifndef VELRI_CORE_INTERNAL_H
 #define VELRI_CORE_INTERNAL_H
 
+#include "ops_internal.h"
 #include "os.h"
-#include "velri_lib/backend.h"
+#include "util_internal.h"
 #include "velri_lib/graph.h"
-#include <stdlib.h>
+
+/*
+ * Core Runtime, Graph, Plan, and Slot Internal Data Structures.
+ * (Generic math/vector helpers live in `util_internal.h`; op metadata lives in `ops_internal.h`.)
+ */
 
 enum {
     VELRI_MAX_DEVICES = VELRI_MAX_REPORT_DEVICES,
     VELRI_MAX_BACKENDS = 16,
-    VELRI_MAX_SUBMIT_BATCH = 32,
     VELRI_MAX_WEIGHT_SLABS = 64
 };
 
@@ -24,85 +28,37 @@ typedef enum {
     VELRI_ARENA_IO = 4
 } velri_arena_kind;
 
-static inline bool velri_op_is_dynamic_seq(const velri_resolved_op *op) {
-    return op && (op->raw.dynamic_seq || op->kind == VELRI_OP_EMBEDDING ||
-                  op->kind == VELRI_OP_ATTENTION || op->kind == VELRI_OP_COPY_LAST_ROW);
+typedef enum {
+    VELRI_SLOT_ARENA_SCRATCH = 0,
+    VELRI_SLOT_ARENA_STATE = 1,
+    VELRI_SLOT_ARENA_IO = 2,
+    VELRI_SLOT_ARENA_COUNT = 3
+} velri_slot_arena_id;
+
+/* ---- Buffer Binding Pointer Helpers (shared by executor & CPU backend) ---- */
+
+static inline void *velri_binding_ptr(const velri_buffer_binding *b) {
+    return (void *)((uint8_t *)b->mem_handle + b->byte_offset);
 }
 
-static inline size_t velri_effective_rows(const velri_resolved_op *op, size_t static_rows,
-                                          const velri_step_params *params) {
-    if (params && params->has_seq_len && velri_op_is_dynamic_seq(op) &&
-        params->seq_len_override > 0U && params->seq_len_override <= static_rows) {
-        return params->seq_len_override;
-    }
-    return static_rows;
+static inline const void *velri_binding_cptr(const velri_buffer_binding *b) {
+    return (const void *)((const uint8_t *)b->mem_handle + b->byte_offset);
 }
 
-static inline size_t velri_effective_elemwise_count(const velri_resolved_op *op,
-                                                    const velri_tensor_view *v,
-                                                    const velri_step_params *params) {
-    size_t n = 0U;
-    if (velri_tensor_view_num_elements(v, &n) != VELRI_OK) {
-        return 0U;
-    }
-    if (params && params->has_seq_len && velri_op_is_dynamic_seq(op) && v->rank >= 2U &&
-        v->dims[0] > 0U && params->seq_len_override > 0U &&
-        params->seq_len_override <= v->dims[0]) {
-        return params->seq_len_override * (n / v->dims[0]);
-    }
-    return n;
+static inline bool velri_binding_range_valid(const velri_buffer_binding *b, size_t bytes) {
+    return b && b->mem_handle && b->byte_offset <= b->byte_size &&
+           bytes <= b->byte_size - b->byte_offset;
 }
 
-static inline bool velri_mul_overflow_size(size_t a, size_t b, size_t *out) {
-    if (a != 0U && b > SIZE_MAX / a) {
-        return true;
-    }
-    *out = a * b;
-    return false;
-}
+/* ---- Internal Tensor-View Predicates (implemented in `src/core/tensor.c`) ---- */
 
-static inline bool velri_add_overflow_size(size_t a, size_t b, size_t *out) {
-    if (a > SIZE_MAX - b) {
-        return true;
-    }
-    *out = a + b;
-    return false;
-}
-
-static inline size_t velri_align_up(size_t n, size_t align) {
-    if (align <= 1U) {
-        return n;
-    }
-    size_t mask = align - 1U;
-    if (n > SIZE_MAX - mask) {
-        return SIZE_MAX;
-    }
-    return (n + mask) & ~mask;
-}
-
-static inline bool velri_vec_grow(void **ptr, uint32_t *cap, uint32_t need, size_t elem_size) {
-    if (need <= *cap) {
-        return true;
-    }
-    uint32_t next = (*cap == 0U) ? 16U : *cap;
-    while (next < need) {
-        if (next > UINT32_MAX / 2U) {
-            return false;
-        }
-        next *= 2U;
-    }
-    size_t bytes = 0U;
-    if (velri_mul_overflow_size((size_t)next, elem_size, &bytes)) {
-        return false;
-    }
-    void *p = realloc(*ptr, bytes);
-    if (!p) {
-        return false;
-    }
-    *ptr = p;
-    *cap = next;
-    return true;
-}
+bool velri_tensor_view_overlaps(const velri_tensor_view *a, const velri_tensor_view *b);
+bool velri_tensor_view_identical_layout(const velri_tensor_view *a, const velri_tensor_view *b);
+bool velri_tensor_view_no_partial_overlap(const velri_tensor_view *in,
+                                          const velri_tensor_view *out);
+bool velri_tensor_view_covers_storage(const velri_tensor_view *v, size_t storage_bytes);
+velri_status velri_shape_byte_size(velri_dtype dtype, uint32_t rank, const size_t *dims,
+                                   size_t *out_bytes);
 
 /* ---- Context & Registered Backends ---- */
 
@@ -181,22 +137,14 @@ typedef struct {
 } velri_plan_weight_binding;
 
 typedef struct {
-    uint32_t plan_storage_idx;
-    size_t view_byte_offset;
-    bool present;
-} velri_step_arg;
-
-typedef struct {
     velri_launch_step_kind kind;
     union {
         struct {
             velri_device_id device_id;
-            velri_resolved_op resolved;
+            velri_resolved_op resolved;  /* Authoritative num_inputs/outputs, present, byte_offset */
             velri_prepared_op *prepared; /* Optional backend handle (may be nullptr) */
-            uint32_t num_inputs;
-            uint32_t num_outputs;
-            velri_step_arg inputs[VELRI_OP_MAX_INPUTS];
-            velri_step_arg outputs[VELRI_OP_MAX_OUTPUTS];
+            uint32_t in_storage_idx[VELRI_OP_MAX_INPUTS];
+            uint32_t out_storage_idx[VELRI_OP_MAX_OUTPUTS];
         } op;
         struct {
             velri_device_id src_device_id;
@@ -221,14 +169,8 @@ struct velri_plan {
     size_t weight_slab_bytes[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
     uint32_t num_weight_slabs[VELRI_MAX_DEVICES];
 
-    size_t state_arena_bytes[VELRI_MAX_DEVICES];
-    size_t state_arena_align[VELRI_MAX_DEVICES];
-
-    size_t io_arena_bytes[VELRI_MAX_DEVICES];
-    size_t io_arena_align[VELRI_MAX_DEVICES];
-
-    size_t scratch_arena_bytes[VELRI_MAX_DEVICES];
-    size_t scratch_arena_align[VELRI_MAX_DEVICES];
+    size_t slot_arena_bytes[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
+    size_t slot_arena_align[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
     size_t ram_staging_bytes;
 
     velri_launch_step *steps;
@@ -239,9 +181,6 @@ struct velri_plan {
 
 void velri_plan_retain(velri_plan *plan);
 void velri_plan_release(velri_plan *plan);
-
-/* Central operation registry validator (src/ops/registry.c). */
-velri_status velri_op_validate(const velri_resolved_op *op);
 
 #ifdef VELRI_CORE_HAS_VULKAN
 const velri_backend_vtable *velri_vulkan_backend_vtable(void);

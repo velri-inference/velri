@@ -17,14 +17,10 @@
 /* ---- Aligned Memory ---- */
 
 void *velri_os_aligned_alloc(size_t align, size_t bytes) {
-    size_t eff_align = align < sizeof(void *) ? sizeof(void *) : align;
-    if ((eff_align & (eff_align - 1U)) != 0U) {
+    size_t eff_align = 0U, sz = 0U;
+    if (!velri_os_aligned_size(align, bytes, &eff_align, &sz)) {
         return nullptr;
     }
-    if (bytes > SIZE_MAX - (eff_align - 1U)) {
-        return nullptr;
-    }
-    size_t sz = bytes ? ((bytes + eff_align - 1U) & ~(eff_align - 1U)) : eff_align;
     return _aligned_malloc(sz, eff_align);
 }
 
@@ -55,8 +51,17 @@ void velri_os_sleep_ms(uint32_t ms) {
 
 /* ---- Dynamic Shared Library Loading ---- */
 
-velri_os_lib *velri_os_dlopen_vulkan(void) {
-    return (velri_os_lib *)LoadLibraryA("vulkan-1.dll");
+velri_os_lib *velri_os_dlopen(const char *const *candidates) {
+    if (!candidates) {
+        return nullptr;
+    }
+    for (size_t i = 0U; candidates[i] != nullptr; ++i) {
+        HMODULE h = LoadLibraryA(candidates[i]);
+        if (h) {
+            return (velri_os_lib *)h;
+        }
+    }
+    return nullptr;
 }
 
 void *velri_os_dlsym(velri_os_lib *lib, const char *symbol) {
@@ -180,12 +185,12 @@ void velri_os_cond_broadcast(velri_os_cond *cv) { WakeAllConditionVariable(&cv->
 
 int velri_os_hardware_threads(void) {
     DWORD nproc = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    if (nproc == 0) {
+    if (nproc == 0U) {
         SYSTEM_INFO si;
         GetSystemInfo(&si);
         nproc = si.dwNumberOfProcessors;
     }
-    return (nproc > 0 && nproc < 65536) ? (int)nproc : 1;
+    return (nproc > 0U && nproc < 65536U) ? (int)nproc : 1;
 }
 
 void velri_os_cpu_relax(void) { YieldProcessor(); }

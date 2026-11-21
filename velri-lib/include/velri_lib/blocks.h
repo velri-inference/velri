@@ -4,19 +4,19 @@
 #include "velri_lib/graph.h"
 
 /*
- * Composable Neural Network Graph Builder, Named Manifest, and Reusable Blocks/Layers.
+ * Composable Neural Network Graph Builder, Named Manifest, and Reusable Blocks.
  *
  * Composition hierarchy:
- *   Operations (graph.h) -> Builder & Blocks (blocks.h) -> Architectures (Velri: ~50 lines each)
+ *   Operations (graph.h) -> Builder & Reusable Blocks (blocks.h)
+ *     -> Engine Layer Helpers & Model Architectures (Velri `src/model/`)
  *
  * Design guarantees:
- *   - Zero model-family branches (`if (family == ...)`).
- *   - Automatic named weight & state registration in `velri_manifest` so weight loaders
- *     bind tensors by name without per-model boilerplate structs.
+ *   - Zero model-family branches (`if (family == ...)`) and zero engine config/scope hardcoding.
+ *   - Automatic named weight & state registration in `velri_manifest` (rejects duplicate names).
  *   - Scope & layer stack with optional `velri_placement_resolve_fn` callback for cascading
  *     per-component/per-layer `(store, compute)` device placement.
- *   - Memory-efficient by default: zero-copy QKV column subviews, in-place activations and
- *     residual additions, automatic tied-weight sharing, and last-row slicing before lm_head.
+ *   - Memory-efficient by default: zero-copy QKV views, in-place activations, residual adds,
+ *     and attention outputs, automatic tied-weight sharing, and optional last-row slicing.
  */
 
 enum {
@@ -92,9 +92,11 @@ typedef struct {
 
     const char *scopes[VELRI_BUILDER_MAX_SCOPE_DEPTH];
     uint32_t scope_depth;
+    uint32_t skipped_scope_pushes;
     int32_t current_layer;
     int32_t layer_stack[VELRI_BUILDER_MAX_SCOPE_DEPTH];
     uint32_t layer_depth;
+    uint32_t skipped_layer_pushes;
 } velri_builder;
 
 void velri_b_init(velri_builder *b, velri_graph *graph, velri_manifest *manifest,
@@ -168,7 +170,7 @@ velri_tensor velri_b_attention_inplace(velri_builder *b, velri_tensor q, velri_t
                                        bool causal);
 velri_tensor velri_b_copy_last_row(velri_builder *b, velri_tensor x);
 
-/* ---- High-Level Reusable Blocks & Layers ---- */
+/* ---- High-Level Reusable Blocks (model- & config-agnostic) ---- */
 
 typedef enum {
     VELRI_NORM_LAYER = 0,
@@ -183,7 +185,7 @@ typedef struct {
 } velri_norm_spec;
 
 typedef struct {
-    const char *scope;        /* Optional scope name (e.g. "input-layer") */
+    const char *scope;        /* Optional scope name */
     const char *token_weight; /* Required weight tensor name */
     const char *pos_weight;   /* Optional learned positional embedding table name */
     uint32_t vocab_size;
@@ -194,27 +196,30 @@ typedef struct {
 } velri_embedding_spec;
 
 typedef struct {
-    const char *scope;       /* Optional sub-scope (e.g. "attention") */
-    const char *qkv_name;    /* Prefix for fused QKV (expects ".weight", optional ".bias") */
-    const char *q_name;      /* Prefixes for split Q/K/V (when !fused_qkv) */
+    const char *scope;          /* Optional sub-scope pushed around the attention block */
+    const char *kv_cache_scope; /* Optional sub-scope pushed around KV/latent cache state creation */
+    const char *state_prefix;   /* Optional state name prefix inside layer (nullptr => "attn") */
+    const char *qkv_name;       /* Prefix for fused QKV (expects ".weight", optional ".bias") */
+    const char *q_name;         /* Prefixes for split Q/K/V (when !fused_qkv) */
     const char *k_name;
     const char *v_name;
-    const char *o_name;      /* Output projection prefix */
+    const char *o_name;         /* Output projection prefix */
     uint32_t n_heads;
     uint32_t n_kv_heads;
     uint32_t head_dim;
     uint32_t max_ctx;
     uint32_t sliding_window;
-    float scale;             /* 0.0f => 1.0f / sqrt(head_dim) */
+    float scale;                /* 0.0f => 1.0f / sqrt(head_dim) */
     bool causal;
     bool fused_qkv;
-    bool has_bias;
-    bool latent_kv;          /* True => cache single input `h_cache` + exact weight absorption (2x less STATE) */
+    bool qkv_bias;              /* Bias on Q/K/V projection (or fused QKV) */
+    bool o_bias;                /* Bias on output projection (decoupled from qkv_bias for Qwen2) */
+    bool latent_kv;             /* True => cache single input `h_cache` + exact weight absorption */
     velri_dtype dtype;
 } velri_attention_spec;
 
 typedef struct {
-    const char *scope;       /* Optional sub-scope (e.g. "dense-mlp") */
+    const char *scope;       /* Optional sub-scope */
     const char *gate_name;   /* Prefix for gate proj (when is_gated) */
     const char *up_name;     /* Prefix for up/fc proj */
     const char *down_name;   /* Prefix for down/output proj */
@@ -227,17 +232,18 @@ typedef struct {
 } velri_mlp_spec;
 
 typedef struct {
-    const char *scope;       /* Optional container scope (e.g. "hidden-layers") */
+    const char *scope;       /* Optional container scope around the layer */
+    const char *attn_scope;  /* Optional scope around norm1 + attention + residual add */
+    const char *mlp_scope;   /* Optional scope around norm2 + mlp + residual add */
     const char *norm1_name;  /* Prefix inside layer (e.g. "ln_1") */
     const char *norm2_name;  /* Prefix inside layer (e.g. "ln_2") */
     velri_norm_spec norm;
     velri_attention_spec attn;
     velri_mlp_spec mlp;
-    velri_dtype dtype;
 } velri_layer_spec;
 
 typedef struct {
-    const char *scope;       /* Optional scope name (e.g. "lm-head") */
+    const char *scope;       /* Optional scope name */
     const char *norm_name;   /* Optional final norm prefix (e.g. "transformer.ln_f") */
     velri_norm_spec norm;
     const char *weight_name; /* Weight tensor name if untied (e.g. "lm_head.weight") */
@@ -245,6 +251,8 @@ typedef struct {
     uint32_t vocab_size;
     uint32_t dim;
     velri_dtype dtype;
+    bool full_seq_logits;    /* False (default) => last-row [1, vocab]; True => full [max_seq, vocab] */
+    bool has_bias;           /* Optional bias on untied LM head */
 } velri_lm_head_spec;
 
 typedef struct {
@@ -255,15 +263,23 @@ typedef struct {
     uint32_t sliding_window;
     float scale;             /* 0.0f => 1.0f / sqrt(head_dim_k) */
     bool causal;
-    bool inplace_q;          /* Write output in-place into `q` when head_dim_k == head_dim_v (halves scratch) */
+    bool inplace_q;          /* Write output in-place into `q` when head_dim_k == head_dim_v */
 } velri_attention_core_spec;
+
+/* Named normalization block (LayerNorm or RMSNorm with automatic weight/bias registration). */
+velri_tensor velri_block_norm(velri_builder *b, velri_tensor x, const char *prefix,
+                              const char *norm_name, const velri_norm_spec *spec);
+
+/* Named linear projection block (registers `<prefix>.<proj_name>.weight` + optional `.bias`). */
+velri_tensor velri_block_linear(velri_builder *b, velri_tensor x, const char *prefix,
+                                const char *proj_name, velri_dtype w_dtype, size_t out_dim,
+                                bool has_bias);
 
 /* Creates INPUT token_ids [max_seq_len] (recorded in manifest->token_ids_in) and embeds tokens (+ optional pos). */
 velri_tensor velri_block_embedding(velri_builder *b, const velri_embedding_spec *spec);
 
 /* Unified attention core block: appends K/V into cache (supports d_k != d_v & shared K==V cache)
- * and computes scaled dot-product online-softmax attention. Shared by dense, latent, and future
- * QSA / DSA / LSA / MLA wrappers. */
+ * and computes scaled dot-product online-softmax attention. */
 velri_tensor velri_block_attention_core(velri_builder *b, velri_tensor q, velri_tensor k_in,
                                         velri_tensor v_in, velri_tensor k_cache,
                                         velri_tensor v_cache,
@@ -274,8 +290,7 @@ velri_tensor velri_block_dense_attention(velri_builder *b, velri_tensor x, const
                                          const velri_attention_spec *spec);
 
 /* Latent weight-absorbed attention wrapper: Q proj -> BatchedLinear(Q, W_K) -> single h_cache ->
- * unified attention_core (K==V==h_cache) -> BatchedLinear(h_bar, W_V, b_V) -> o_proj.
- * Works for both direct input caching (`h_lat == x`) and compressed MLA (`h_lat == c_kv`). */
+ * unified attention_core (K==V==h_cache) -> BatchedLinear(h_bar, W_V, b_V) -> o_proj. */
 velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velri_tensor h_lat,
                                           const char *prefix, const velri_attention_spec *spec);
 
@@ -287,72 +302,11 @@ velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char 
 velri_tensor velri_block_mlp(velri_builder *b, velri_tensor x, const char *prefix,
                              const velri_mlp_spec *spec);
 
-/* Pre-norm transformer layer: norm1 -> attention -> residual += -> norm2 -> mlp -> residual +=. */
+/* Generic pre-norm transformer layer: norm1 -> attention -> residual += -> norm2 -> mlp -> residual +=. */
 velri_tensor velri_layer_pre_norm(velri_builder *b, velri_tensor x, const char *layer_prefix,
                                   uint32_t layer_idx, const velri_layer_spec *spec);
 
-/* Output LM head: copy_last_row (on x's device) -> optional final norm -> linear into OUTPUT logits [1, vocab]. */
+/* Output LM head: optional copy_last_row -> optional final norm -> linear into OUTPUT logits. */
 velri_tensor velri_block_lm_head(velri_builder *b, velri_tensor x, const velri_lm_head_spec *spec);
-
-/* ---- Model-Agnostic Metadata Parameters & Composed Layer Stacks (`src/layers/`) ---- */
-
-typedef struct {
-    uint32_t vocab_size;
-    uint32_t max_position_embeddings;
-    uint32_t hidden_size;
-    uint32_t num_hidden_layers;
-    uint32_t num_attention_heads;
-    uint32_t num_key_value_heads;
-    uint32_t head_dim;
-    uint32_t intermediate_size;
-    uint32_t sliding_window;
-    float norm_eps;
-    velri_act_kind hidden_act;
-    bool tie_word_embeddings;
-    velri_dtype dtype;
-
-    /* Runtime execution & memory-policy knobs (from placement/session config). */
-    uint32_t max_seq_len;
-    uint32_t max_ctx;
-    bool latent_kv; /* Cache single latent input H_cache + exact W_K/W_V absorption (no RoPE, d_lat <= 2048). */
-} velri_model_params;
-
-typedef struct {
-    velri_norm_kind norm_kind;
-    bool norm_bias;
-    bool rms_unit_offset;
-    bool has_rope;         /* True when attention applies RoPE to Q/K (disallows raw-input latent_kv) */
-    bool fused_qkv;
-    bool attn_bias;
-    bool mlp_gated;
-    bool mlp_bias;
-    float mlp_clamp;
-
-    const char *prefix;    /* e.g. "transformer.h" or "model.layers" */
-    const char *norm1;     /* e.g. "ln_1" or "input_layernorm" */
-    const char *norm2;     /* e.g. "ln_2" or "post_attention_layernorm" */
-    const char *qkv;       /* Fused QKV projection prefix (when fused_qkv) */
-    const char *q_proj;    /* Split Q/K/V prefixes (when !fused_qkv) */
-    const char *k_proj;
-    const char *v_proj;
-    const char *o_proj;    /* Attention output projection prefix */
-    const char *gate_proj; /* MLP gate projection prefix (when mlp_gated) */
-    const char *up_proj;   /* MLP up / fc projection prefix */
-    const char *down_proj; /* MLP down / output projection prefix */
-} velri_pre_norm_layer_desc;
-
-/* High-level metadata-driven layer helpers (`src/layers/pre_norm.c`):
- * Architectures only supply topology + tensor naming; all dimensions/dtypes/eps come from `p`. */
-velri_tensor velri_layer_embedding(velri_builder *b, const velri_model_params *p,
-                                   const char *token_weight, const char *pos_weight);
-
-velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
-                                          const velri_model_params *p,
-                                          const velri_pre_norm_layer_desc *desc);
-
-velri_tensor velri_layer_lm_head(velri_builder *b, velri_tensor x, const velri_model_params *p,
-                                 const char *norm_name, velri_norm_kind norm_kind, bool norm_bias,
-                                 bool rms_unit_offset, const char *weight_name,
-                                 const char *tie_to_if_tied);
 
 #endif /* VELRI_LIB_BLOCKS_H */

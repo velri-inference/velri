@@ -20,14 +20,10 @@ static const size_t kMinWorkerStackBytes = 512U * 1024U;
 /* ---- Aligned Memory ---- */
 
 void *velri_os_aligned_alloc(size_t align, size_t bytes) {
-    size_t eff_align = align < sizeof(void *) ? sizeof(void *) : align;
-    if ((eff_align & (eff_align - 1U)) != 0U) {
+    size_t eff_align = 0U, sz = 0U;
+    if (!velri_os_aligned_size(align, bytes, &eff_align, &sz)) {
         return nullptr;
     }
-    if (bytes > SIZE_MAX - (eff_align - 1U)) {
-        return nullptr;
-    }
-    size_t sz = bytes ? ((bytes + eff_align - 1U) & ~(eff_align - 1U)) : eff_align;
     void *p = nullptr;
     if (posix_memalign(&p, eff_align, sz) != 0) {
         return nullptr;
@@ -58,18 +54,10 @@ void velri_os_sleep_ms(uint32_t ms) {
 
 /* ---- Dynamic Shared Library Loading ---- */
 
-velri_os_lib *velri_os_dlopen_vulkan(void) {
-    static const char *const candidates[] = {
-#if defined(__APPLE__)
-        "libvulkan.1.dylib",
-        "libvulkan.dylib",
-        "libMoltenVK.dylib",
-#else
-        "libvulkan.so.1",
-        "libvulkan.so",
-#endif
-        nullptr,
-    };
+velri_os_lib *velri_os_dlopen(const char *const *candidates) {
+    if (!candidates) {
+        return nullptr;
+    }
     for (size_t i = 0U; candidates[i] != nullptr; ++i) {
         void *h = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
         if (h) {

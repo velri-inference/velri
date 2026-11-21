@@ -24,6 +24,7 @@ set(VELRI_SLANG_COMMON_DEPS
     "${VELRI_SLANG_DIR}/common/numeric.slang"
     "${VELRI_SLANG_DIR}/common/activations.slang"
     "${VELRI_SLANG_DIR}/common/epilogue.slang"
+    "${VELRI_SLANG_DIR}/common/key_iter.slang"
 )
 set(VELRI_SLANG_CPU_DEPS
     ${VELRI_SLANG_COMMON_DEPS}
@@ -31,11 +32,14 @@ set(VELRI_SLANG_CPU_DEPS
     "${VELRI_SLANG_DIR}/ops/rope.slang"
     "${VELRI_SLANG_DIR}/ops/elementwise.slang"
     "${VELRI_SLANG_DIR}/ops/linear_cpu.slang"
+    "${VELRI_SLANG_DIR}/ops/gather_copy.slang"
     "${VELRI_SLANG_DIR}/ops/attention.slang"
+    "${VELRI_SLANG_DIR}/ops/batched_linear.slang"
 )
 set(VELRI_SLANG_VK_DEPS
     ${VELRI_SLANG_COMMON_DEPS}
     "${VELRI_SLANG_DIR}/common/reductions.slang"
+    "${VELRI_SLANG_DIR}/common/reductions_wide.slang"
 )
 
 set(_velri_obj_ext "${CMAKE_C_OUTPUT_EXTENSION}")
@@ -367,14 +371,14 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_f16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8_64"
-        "${_vk}/attention.slang|vk_embedding_f32"
-        "${_vk}/attention.slang|vk_copy_last_row_f32"
+        "${_vk}/gather_copy.slang|vk_embedding_f32"
+        "${_vk}/gather_copy.slang|vk_copy_last_row_f32"
         "${_vk}/attention.slang|vk_kv_append_f32"
         "${_vk}/attention.slang|vk_attention_decode_f32"
         "${_vk}/attention.slang|vk_attention_prefill_f32"
         "${_vk}/attention.slang|vk_attention_wide_f32"
-        "${_vk}/attention.slang|vk_batched_linear_nt_f32"
-        "${_vk}/attention.slang|vk_batched_linear_nn_f32"
+        "${_vk}/batched_linear.slang|vk_batched_linear_nt_f32"
+        "${_vk}/batched_linear.slang|vk_batched_linear_nn_f32"
     )
     velri_compile_vk_shaders(VELRI_VK_SHADER_HEADER
         "${VELRI_SLANG_GEN_DIR}/spv"

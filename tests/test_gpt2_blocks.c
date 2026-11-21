@@ -423,11 +423,13 @@ static double max_abs_diff(const float *a, const float *b, size_t n) {
     return mx;
 }
 
-static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id store_dev,
-                                     velri_device_id compute_dev, const char *tag,
-                                     const velri_model_params *meta, const host_gpt2_weights *w,
-                                     const int32_t *seq, size_t seq_len, const float *ref_4,
-                                     const float *ref_6, float *out_final_logits) {
+static void run_gpt2_suite_ex(velri_context *ctx, velri_device_id store_dev,
+                              velri_device_id compute_dev, velri_placement_resolve_fn resolve_fn,
+                              void *resolve_user, velri_device_id expected_state_dev,
+                              bool verify_kv_shadow_reuse, const char *tag,
+                              const velri_model_params *meta, const host_gpt2_weights *w,
+                              const int32_t *seq, size_t seq_len, const float *ref_4,
+                              const float *ref_6, float *out_final_logits) {
     velri_graph *g = nullptr;
     CHECK_OK(velri_graph_create(&g), "graph create");
 
@@ -435,7 +437,7 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id store_d
     velri_manifest_init(&manifest);
 
     velri_builder b;
-    velri_b_init(&b, g, &manifest, store_dev, compute_dev, nullptr, nullptr);
+    velri_b_init(&b, g, &manifest, store_dev, compute_dev, resolve_fn, resolve_user);
 
     CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2");
     CHECK(manifest.token_ids_in != VELRI_INVALID_ID, "manifest recorded token_ids_in");
@@ -459,6 +461,13 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id store_d
         CHECK(velri_manifest_find_state(&manifest, "transformer.h.0.attn.v_cache") != nullptr,
               "manifest contains transformer.h.0.attn.v_cache");
     }
+    for (uint32_t i = 0U; i < manifest.num_weights; ++i) {
+        CHECK(manifest.weights[i].device_id == store_dev, "weight placed on store_dev");
+    }
+    for (uint32_t i = 0U; i < manifest.num_states; ++i) {
+        CHECK(manifest.states[i].device_id == expected_state_dev,
+              "state placed on expected_state_dev");
+    }
 
     velri_plan *plan = nullptr;
     CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare gpt2");
@@ -467,20 +476,28 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id store_d
     velri_memory_report rep;
     CHECK_OK(velri_plan_memory_report(plan, &rep), "memory report");
     const velri_device_memory_report *dr_store = &rep.devices[store_dev];
+    const velri_device_memory_report *dr_state = &rep.devices[expected_state_dev];
     const velri_device_memory_report *dr_comp = &rep.devices[compute_dev];
     const size_t per_cache_bytes =
         (size_t)meta->num_hidden_layers * (size_t)meta->max_ctx * (size_t)meta->hidden_size *
         sizeof(float);
     const size_t expected_state_bytes = meta->latent_kv ? per_cache_bytes : (2U * per_cache_bytes);
-    CHECK(dr_comp->state_bytes == expected_state_bytes,
+    CHECK(dr_state->state_bytes == expected_state_bytes,
           "STATE footprint matches standard (2x) vs latent (1x) KV mode");
+    if (expected_state_dev != compute_dev) {
+        CHECK(dr_comp->state_bytes == 0U, "compute_dev holds 0 B resident STATE when offloaded");
+    }
+    if (verify_kv_shadow_reuse) {
+        CHECK(dr_comp->scratch_packed_bytes < expected_state_bytes,
+              "offloaded N-layer KV shadows must reuse GPU scratch across layers");
+    }
     CHECK(rep.ram_staging_bytes == 0U, "0 B ram_staging on single-dev or host<->dev offload");
     CHECK(dr_comp->scratch_packed_bytes < dr_comp->scratch_unpacked_bytes,
           "liveness scratch packing must reuse cells tightly");
 
     printf("  [MEM] %-18s | weights=%zu B (%u tensors) | state=%zu B | scratch=%zu B "
            "(unpacked=%zu B, %.1fx saved) | ovh=%zu B\n",
-           tag, dr_store->weight_bytes, manifest.num_weights, dr_comp->state_bytes,
+           tag, dr_store->weight_bytes, manifest.num_weights, dr_state->state_bytes,
            dr_comp->scratch_packed_bytes, dr_comp->scratch_unpacked_bytes,
            (double)dr_comp->scratch_unpacked_bytes / (double)dr_comp->scratch_packed_bytes,
            dr_comp->allocator_overhead_bytes);
@@ -572,6 +589,201 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id store_d
     velri_graph_destroy(g);
 }
 
+static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id store_dev,
+                                     velri_device_id compute_dev, const char *tag,
+                                     const velri_model_params *meta, const host_gpt2_weights *w,
+                                     const int32_t *seq, size_t seq_len, const float *ref_4,
+                                     const float *ref_6, float *out_final_logits) {
+    run_gpt2_suite_ex(ctx, store_dev, compute_dev, nullptr, nullptr, store_dev, false, tag, meta, w,
+                      seq, seq_len, ref_4, ref_6, out_final_logits);
+}
+
+static void kv_offload_placement_cb(const char *scope_path, int32_t layer_idx, void *user,
+                                    velri_device_id *out_store, velri_device_id *out_compute) {
+    (void)layer_idx;
+    (void)out_compute;
+    if (strcmp(scope_path, "hidden-layers/attention/kv-cache") == 0) {
+        *out_store = *(const velri_device_id *)user;
+    }
+}
+
+typedef struct {
+    bool saw_input_layer;
+    bool saw_attention;
+    bool saw_kv_cache;
+    bool saw_dense_mlp;
+    bool saw_lm_head;
+} scope_trace;
+
+static void trace_placement_cb(const char *scope_path, int32_t layer_idx, void *user,
+                               velri_device_id *out_store, velri_device_id *out_compute) {
+    (void)out_store;
+    (void)out_compute;
+    scope_trace *tr = (scope_trace *)user;
+    if (strcmp(scope_path, "input-layer") == 0 && layer_idx == -1) {
+        tr->saw_input_layer = true;
+    } else if (strcmp(scope_path, "hidden-layers/attention") == 0 && layer_idx >= 0) {
+        tr->saw_attention = true;
+    } else if (strcmp(scope_path, "hidden-layers/attention/kv-cache") == 0 && layer_idx >= 0) {
+        tr->saw_kv_cache = true;
+    } else if (strcmp(scope_path, "hidden-layers/dense-mlp") == 0 && layer_idx >= 0) {
+        tr->saw_dense_mlp = true;
+    } else if (strcmp(scope_path, "lm-head") == 0 && layer_idx == -1) {
+        tr->saw_lm_head = true;
+    }
+}
+
+static void test_builder_and_layer_contracts(velri_device_id cpu_dev,
+                                             const velri_model_params *meta) {
+    /* 1. RoPE layer descriptor must fail cleanly with VELRI_ERR_UNSUPPORTED until wired. */
+    {
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "rope neg graph");
+        velri_manifest m;
+        velri_manifest_init(&m);
+        velri_builder b;
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
+
+        velri_tensor x = velri_layer_embedding(&b, meta, "tok.weight", nullptr);
+        CHECK(x.valid && velri_b_status(&b) == VELRI_OK, "embed before rope check");
+
+        const velri_pre_norm_layer_desc rope_desc = {
+            .norm_kind = VELRI_NORM_RMS,
+            .has_rope = true,
+            .fused_qkv = false,
+            .mlp_gated = true,
+            .prefix = "model.layers",
+            .norm1 = "input_layernorm",
+            .norm2 = "post_attention_layernorm",
+            .q_proj = "self_attn.q_proj",
+            .k_proj = "self_attn.k_proj",
+            .v_proj = "self_attn.v_proj",
+            .o_proj = "self_attn.o_proj",
+            .gate_proj = "mlp.gate_proj",
+            .up_proj = "mlp.up_proj",
+            .down_proj = "mlp.down_proj",
+        };
+        velri_tensor out = velri_layers_pre_norm_repeat(&b, x, meta, &rope_desc);
+        CHECK(!out.valid && velri_b_status(&b) == VELRI_ERR_UNSUPPORTED,
+              "has_rope=true must fail cleanly with VELRI_ERR_UNSUPPORTED");
+
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+    }
+
+    /* 2. Manifest duplicate weight/state rejection and tied-weight validation. */
+    {
+        const size_t dim_w[2] = {4U, 4U};
+        const size_t dim_s[3] = {1U, 4U, 4U};
+        velri_graph *g = nullptr;
+        velri_manifest m;
+        velri_builder b;
+
+        CHECK_OK(velri_graph_create(&g), "dup weight graph");
+        velri_manifest_init(&m);
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
+        velri_tensor w0 = velri_b_weight(&b, "dup.weight", VELRI_DTYPE_F32, 2U, dim_w);
+        CHECK(w0.valid && velri_b_status(&b) == VELRI_OK, "first weight succeeds");
+        velri_tensor w1 = velri_b_weight(&b, "dup.weight", VELRI_DTYPE_F32, 2U, dim_w);
+        CHECK(!w1.valid && velri_b_status(&b) == VELRI_ERR_INVALID,
+              "duplicate manifest weight name must fail with VELRI_ERR_INVALID");
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+
+        CHECK_OK(velri_graph_create(&g), "dup state graph");
+        velri_manifest_init(&m);
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
+        velri_tensor s0 = velri_b_state(&b, "dup.state", VELRI_DTYPE_F32, 3U, dim_s);
+        CHECK(s0.valid && velri_b_status(&b) == VELRI_OK, "first state succeeds");
+        velri_tensor s1 = velri_b_state(&b, "dup.state", VELRI_DTYPE_F32, 3U, dim_s);
+        CHECK(!s1.valid && velri_b_status(&b) == VELRI_ERR_INVALID,
+              "duplicate manifest state name must fail with VELRI_ERR_INVALID");
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+
+        CHECK_OK(velri_graph_create(&g), "missing tie graph");
+        velri_manifest_init(&m);
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
+        velri_tensor wt =
+            velri_b_weight_tied(&b, "lm_head.weight", "missing.weight", VELRI_DTYPE_F32, 2U, dim_w);
+        CHECK(!wt.valid && velri_b_status(&b) == VELRI_ERR_NOT_FOUND,
+              "missing tie_to must fail with VELRI_ERR_NOT_FOUND");
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+
+        CHECK_OK(velri_graph_create(&g), "empty name tie graph");
+        velri_manifest_init(&m);
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, nullptr, nullptr);
+        velri_tensor wbase = velri_b_weight(&b, "base.weight", VELRI_DTYPE_F32, 2U, dim_w);
+        CHECK(wbase.valid, "base weight succeeds");
+        velri_tensor wbad = velri_b_weight_tied(&b, "", "base.weight", VELRI_DTYPE_F32, 2U, dim_w);
+        CHECK(!wbad.valid && velri_b_status(&b) == VELRI_ERR_INVALID,
+              "empty name in weight_tied must fail with VELRI_ERR_INVALID");
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+    }
+
+    /* 3. Engine placement scopes (incl. kv-cache) are visited and cleanly balanced. */
+    {
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "scope trace graph");
+        velri_manifest m;
+        velri_manifest_init(&m);
+        scope_trace tr = {0};
+        velri_builder b;
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, trace_placement_cb, &tr);
+        CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2 scope trace");
+        CHECK(tr.saw_input_layer && tr.saw_attention && tr.saw_kv_cache && tr.saw_dense_mlp &&
+                  tr.saw_lm_head,
+              "all engine placement scopes visited");
+        CHECK(b.scope_depth == 0U && b.layer_depth == 0U && b.current_layer == -1,
+              "builder scope/layer stacks cleanly balanced");
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+    }
+
+    /* 4. Sticky-error scope/layer unwinding & safe velri_b_devices after error. */
+    {
+        const size_t dim_w[2] = {4U, 4U};
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "unwind graph");
+        velri_manifest m;
+        velri_manifest_init(&m);
+        scope_trace tr = {0};
+        velri_builder b;
+        velri_b_init(&b, g, &m, cpu_dev, cpu_dev, trace_placement_cb, &tr);
+
+        char stack_scope[] = "input-layer";
+        velri_b_push_scope(&b, stack_scope);
+        velri_b_push_layer(&b, 0);
+        velri_tensor w0 = velri_b_weight(&b, "dup.w", VELRI_DTYPE_F32, 2U, dim_w);
+        CHECK(w0.valid, "unwind first weight ok");
+        velri_tensor w1 = velri_b_weight(&b, "dup.w", VELRI_DTYPE_F32, 2U, dim_w);
+        CHECK(!w1.valid && velri_b_status(&b) == VELRI_ERR_INVALID, "unwind triggers sticky err");
+
+        /* Nested push/pop after sticky error must balance, and outer pop must clear stack_scope. */
+        velri_b_push_scope(&b, "nested-after-err");
+        velri_b_pop_scope(&b);
+        velri_b_pop_layer(&b);
+        velri_b_pop_scope(&b);
+        CHECK(b.scope_depth == 0U && b.scopes[0] == nullptr && b.skipped_scope_pushes == 0U,
+              "pop_scope unwinds and clears pointers even after sticky error");
+        CHECK(b.layer_depth == 0U && b.current_layer == -1 && b.skipped_layer_pushes == 0U,
+              "pop_layer unwinds even after sticky error");
+
+        tr.saw_input_layer = false;
+        velri_device_id sdev = 99U, cdev = 99U;
+        velri_b_devices(&b, &sdev, &cdev);
+        CHECK(!tr.saw_input_layer && sdev == cpu_dev && cdev == cpu_dev,
+              "velri_b_devices must not invoke resolve_fn after sticky error");
+
+        velri_manifest_destroy(&m);
+        velri_graph_destroy(g);
+    }
+
+    printf("  [PASS] builder & layer contracts (RoPE guard, dup manifest, tie_to, scopes, unwind)\n");
+}
+
 int main(void) {
     printf("=== Velri End-to-End GPT-2 Architecture Suite ===\n");
 
@@ -607,8 +819,9 @@ int main(void) {
     float *vk_std_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
     float *vk_lat_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
     float *offload_lat_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    float *kv_offload_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
     CHECK(ref_4 && ref_6 && cpu_std_logits && cpu_lat_logits && vk_std_logits && vk_lat_logits &&
-              offload_lat_logits,
+              offload_lat_logits && kv_offload_logits,
           "oom");
 
     ref_gpt2_fp64(&meta_std, &w, seq, 4U, ref_4);
@@ -624,6 +837,7 @@ int main(void) {
 
     velri_device_id cpu_dev = 0U;
     CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
+    test_builder_and_layer_contracts(cpu_dev, &meta_std);
     run_gpt2_suite_on_device(ctx, cpu_dev, cpu_dev, "cpu:0 [std-kv]", &meta_std, &w, seq, 6U,
                              ref_4, ref_6, cpu_std_logits);
     run_gpt2_suite_on_device(ctx, cpu_dev, cpu_dev, "cpu:0 [latent-kv]", &meta_lat, &w, seq, 6U,
@@ -640,16 +854,21 @@ int main(void) {
                                  ref_4, ref_6, vk_lat_logits);
         run_gpt2_suite_on_device(ctx, cpu_dev, vk_dev, "cpu->vk [latent]", &meta_lat, &w, seq, 6U,
                                  ref_4, ref_6, offload_lat_logits);
+        run_gpt2_suite_ex(ctx, vk_dev, vk_dev, kv_offload_placement_cb, &cpu_dev, cpu_dev, true,
+                          "vk:0 [kv->cpu]", &meta_std, &w, seq, 6U, ref_4, ref_6,
+                          kv_offload_logits);
         double vk_std_vs_lat = max_abs_diff(vk_std_logits, vk_lat_logits, meta_std.vocab_size);
         double cpu_vk_std = max_abs_diff(cpu_std_logits, vk_std_logits, meta_std.vocab_size);
         double cpu_vk_lat = max_abs_diff(cpu_lat_logits, vk_lat_logits, meta_std.vocab_size);
         double offload_diff = max_abs_diff(vk_lat_logits, offload_lat_logits, meta_std.vocab_size);
+        double kv_offload_diff = max_abs_diff(vk_std_logits, kv_offload_logits, meta_std.vocab_size);
         CHECK(vk_std_vs_lat < 1e-4, "Vulkan standard KV and latent KV logits match");
         CHECK(cpu_vk_std < 1e-4, "CPU and Vulkan standard KV GPT-2 logits match");
         CHECK(cpu_vk_lat < 1e-4, "CPU and Vulkan latent KV GPT-2 logits match");
         CHECK(offload_diff < 1e-4, "Offloaded CPU->Vulkan latent KV GPT-2 logits match");
-        printf("  [PASS] vk std==lat=%.2e | cpu==vk std=%.2e | cpu==vk lat=%.2e | offload=%.2e\n",
-               vk_std_vs_lat, cpu_vk_std, cpu_vk_lat, offload_diff);
+        CHECK(kv_offload_diff < 1e-4, "Vulkan weights + CPU KV-cache offload GPT-2 logits match");
+        printf("  [PASS] vk std==lat=%.2e | cpu==vk std=%.2e | cpu==vk lat=%.2e | offload=%.2e | kv->cpu=%.2e\n",
+               vk_std_vs_lat, cpu_vk_std, cpu_vk_lat, offload_diff, kv_offload_diff);
     } else {
         printf("  [SKIP] vulkan:0 (not enabled or no GPU available)\n");
     }
@@ -662,6 +881,7 @@ int main(void) {
     free(vk_std_logits);
     free(vk_lat_logits);
     free(offload_lat_logits);
+    free(kv_offload_logits);
     free_host_weights(&w);
     printf("=== GPT-2 End-to-End Suite PASSED ===\n");
     return 0;

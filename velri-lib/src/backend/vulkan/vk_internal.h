@@ -1,0 +1,396 @@
+#ifndef VELRI_BACKEND_VK_INTERNAL_H
+#define VELRI_BACKEND_VK_INTERNAL_H
+
+#ifndef VK_NO_PROTOTYPES
+#define VK_NO_PROTOTYPES
+#endif
+
+#include "core_internal.h"
+
+#include <stddef.h>
+#include <stdint.h>
+#include <vulkan/vulkan.h>
+
+/*
+ * Internal shared types, ABI push-constant layouts, named tuning/hardware constants,
+ * and cross-TU interfaces for the built-in Vulkan 1.3 Compute Backend.
+ */
+
+enum {
+    VK_CMD_RING_SIZE          = 8U,
+    VK_STAGE_MAX_BYTES        = 16U * 1024U * 1024U,
+    VK_MAX_PC_BYTES           = 128U,
+    VK_MAX_DISPATCH_STAGES    = 2U,
+    VK_MIN_BUF_ALIGN_BYTES    = 16U,
+    VK_GEMM_F32_SMEM_BYTES    = 2U * 2U * 8U * 33U * 16U, /* 16896 B */
+    VK_COOPMAT_128_SMEM_BYTES = 2U * 128U * 5U * 16U,     /* 20480 B */
+    VK_TARGET_WGS             = 140U,
+    VK_GEMV_WG_SIZE           = 128U
+};
+
+#define VK_SPLITK_MAX_BYTES (32ULL * 1024ULL * 1024ULL)
+
+/* Push-constant layouts matching `src/kernels/slang/vk/` shaders (`-fvk-use-c-layout`). */
+typedef struct {
+    uint64_t x, w, y;
+    uint32_t rows, dim, x_stride, y_stride;
+    float eps;
+    uint32_t has_weight, unit_offset, pad;
+} vk_rmsnorm_args;
+static_assert(sizeof(vk_rmsnorm_args) == 56, "RmsNormArgs size mismatch");
+
+typedef struct {
+    uint64_t residual_inout, x, w, y;
+    uint32_t rows, dim, r_stride, x_stride, y_stride;
+    float eps;
+    uint32_t has_weight, unit_offset;
+} vk_fused_add_rmsnorm_args;
+static_assert(sizeof(vk_fused_add_rmsnorm_args) == 64, "FusedAddRmsNormArgs size mismatch");
+
+typedef struct {
+    uint64_t x, w, b, y;
+    uint32_t rows, dim, x_stride, y_stride;
+    float eps;
+    uint32_t has_weight, has_bias, pad;
+} vk_layernorm_args;
+static_assert(sizeof(vk_layernorm_args) == 64, "LayerNormArgs size mismatch");
+
+typedef struct {
+    uint64_t x, cos_tbl, sin_tbl, y;
+    uint32_t n_tokens, n_heads, head_dim, rotary_dim, pos_offset;
+    uint32_t tok_sx, head_sx, tok_sy, head_sy, mode;
+} vk_rope_args;
+static_assert(sizeof(vk_rope_args) == 72, "RopeArgs size mismatch");
+
+typedef struct {
+    uint64_t x, y;
+    uint32_t count, pad;
+} vk_activation_args;
+static_assert(sizeof(vk_activation_args) == 24, "ActivationArgs size mismatch");
+
+typedef struct {
+    uint64_t gate, up, y;
+    uint32_t count;
+    float clamp_limit;
+} vk_gated_mlp_args;
+static_assert(sizeof(vk_gated_mlp_args) == 32, "GatedMlpArgs size mismatch");
+
+typedef struct {
+    uint64_t a, b, y;
+    uint32_t count;
+    float alpha, beta;
+    uint32_t has_b, pad;
+} vk_vec_axpby_args;
+static_assert(sizeof(vk_vec_axpby_args) == 48, "VecAxpbyArgs size mismatch");
+
+typedef struct {
+    uint64_t a, b, y;
+    uint32_t count, pad;
+} vk_vec_mul_args;
+static_assert(sizeof(vk_vec_mul_args) == 32, "VecMulArgs size mismatch");
+
+typedef struct {
+    uint64_t x, y;
+    uint32_t rows, cols, x_stride, y_stride;
+} vk_softmax_args;
+static_assert(sizeof(vk_softmax_args) == 32, "SoftmaxArgs size mismatch");
+
+typedef struct {
+    uint64_t x, suh, y;
+    uint32_t rows, cols, block_size, x_stride, y_stride, suh_mode;
+    float inv_sqrt_b;
+    uint32_t pad;
+} vk_fwht_args;
+static_assert(sizeof(vk_fwht_args) == 56, "FwhtArgs size mismatch");
+
+typedef struct {
+    uint64_t x, x_i8, scale_out;
+    uint32_t rows, k, x_stride, xi8_stride;
+} vk_quantize_row_args;
+static_assert(sizeof(vk_quantize_row_args) == 40, "QuantizeRowArgs size mismatch");
+
+typedef struct {
+    uint64_t x, w, bias, x_scale, w_scale, y;
+    uint32_t rows, m, k, x_stride, w_stride, y_stride, flags, split_k;
+} vk_linear_args;
+static_assert(sizeof(vk_linear_args) == 80, "LinearArgs size mismatch");
+
+typedef struct {
+    uint64_t partials, bias, x_scale, w_scale, y;
+    uint32_t rows, m, part_stride_u4, y_stride, split_k, flags;
+} vk_splitk_reduce_args;
+static_assert(sizeof(vk_splitk_reduce_args) == 64, "SplitKReduceArgs size mismatch");
+
+typedef struct {
+    uint64_t table, ids, out;
+    uint32_t rows, dim, vocab, table_stride, out_stride, pos_offset, has_ids, pad;
+} vk_embedding_args;
+static_assert(sizeof(vk_embedding_args) == 56, "EmbeddingArgs size mismatch");
+
+typedef struct {
+    uint64_t x, y;
+    uint32_t src_row, dim, x_stride, pad;
+} vk_copy_last_row_args;
+static_assert(sizeof(vk_copy_last_row_args) == 32, "CopyLastRowArgs size mismatch");
+
+typedef struct {
+    uint64_t k_in, v_in, k_cache, v_cache;
+    uint32_t rows, n_kv_heads, d_k, d_v, max_ctx, kv_pos;
+    uint32_t k_stride, v_stride;
+    uint32_t k_head_stride, k_row_stride;
+    uint32_t v_head_stride, v_row_stride;
+    uint32_t same_kv_cache, pad;
+} vk_kv_append_args;
+static_assert(sizeof(vk_kv_append_args) == 88, "KvAppendArgs size mismatch");
+
+typedef struct {
+    uint64_t q, k_cache, v_cache, out;
+    uint32_t rows, n_heads, n_kv_heads, d_k, d_v, max_ctx, kv_pos;
+    uint32_t q_stride, o_stride;
+    uint32_t k_head_stride, k_row_stride;
+    uint32_t v_head_stride, v_row_stride;
+    uint32_t sliding_window, causal;
+    float scale;
+} vk_attention_args;
+static_assert(sizeof(vk_attention_args) == 96, "AttentionArgs size mismatch");
+
+typedef struct {
+    uint64_t x, w, bias, y;
+    uint32_t rows, n_heads, n_groups, in_dim, out_dim;
+    uint32_t x_stride, w_stride, y_stride, flags, pad;
+} vk_batched_linear_args;
+static_assert(sizeof(vk_batched_linear_args) == 72, "BatchedLinearArgs size mismatch");
+
+/* ---- Capability Bitmask & Pipeline IDs ---- */
+
+enum {
+    VK_CAP_NONE     = 0U,
+    VK_CAP_INT16    = 1U << 0,
+    VK_CAP_F16_I8   = 1U << 1,
+    VK_CAP_INT_DOT  = 1U << 2,
+    VK_CAP_F32_GEMM = 1U << 3,
+    VK_CAP_BF16_EXT = 1U << 4,
+    VK_CAP_CM_F16   = 1U << 5,
+    VK_CAP_CM_BF16  = 1U << 6,
+    VK_CAP_CM_I8    = 1U << 7
+};
+
+enum {
+    PIPE_RMSNORM_F32 = 0,
+    PIPE_RMSNORM_BF16,
+    PIPE_RMSNORM_F16,
+    PIPE_FUSED_ADD_RMSNORM_F32,
+    PIPE_LAYERNORM_F32,
+    PIPE_ROPE_F32,
+    PIPE_ROPE_BF16,
+    PIPE_ACT_SILU_F32,
+    PIPE_ACT_GELU_F32,
+    PIPE_ACT_RELU2_F32,
+    PIPE_GATED_SILU_F32,
+    PIPE_GATED_GELU_F32,
+    PIPE_VEC_AXPBY_F32,
+    PIPE_VEC_MUL_F32,
+    PIPE_SOFTMAX_F32,
+    PIPE_FWHT_F32,
+    PIPE_QUANTIZE_ROW_F32_I8,
+    PIPE_GEMV_F32,
+    PIPE_GEMV_F16,
+    PIPE_GEMV_BF16,
+    PIPE_GEMV_W8A8,
+    PIPE_GEMM_F32,
+    PIPE_SPLITK_REDUCE,
+    PIPE_GEMM_COOPMAT_F16,
+    PIPE_GEMM_COOPMAT_BF16,
+    PIPE_GEMM_COOPMAT_W8A8,
+    PIPE_GEMM_COOPMAT_F16_64,
+    PIPE_GEMM_COOPMAT_BF16_64,
+    PIPE_GEMM_COOPMAT_W8A8_64,
+    PIPE_EMBEDDING_F32,
+    PIPE_COPY_LAST_ROW_F32,
+    PIPE_KV_APPEND_F32,
+    PIPE_ATTENTION_DECODE_F32,
+    PIPE_ATTENTION_PREFILL_F32,
+    PIPE_ATTENTION_WIDE_F32,
+    PIPE_BATCHED_LINEAR_NT_F32,
+    PIPE_BATCHED_LINEAR_NN_F32,
+    PIPE_COUNT
+};
+
+/* ---- X-Macro Vulkan Loader Tables ---- */
+
+#define VK_INST_FUNCS(X)                             \
+    X(vkDestroyInstance)                             \
+    X(vkEnumeratePhysicalDevices)                    \
+    X(vkGetPhysicalDeviceProperties2)                \
+    X(vkGetPhysicalDeviceFeatures2)                  \
+    X(vkGetPhysicalDeviceMemoryProperties)           \
+    X(vkGetPhysicalDeviceQueueFamilyProperties)      \
+    X(vkEnumerateDeviceExtensionProperties)          \
+    X(vkCreateDevice)                                \
+    X(vkGetDeviceProcAddr)
+
+#define VK_DEV_FUNCS(X)                              \
+    X(vkDestroyDevice)                               \
+    X(vkGetDeviceQueue)                              \
+    X(vkCreateCommandPool)                           \
+    X(vkDestroyCommandPool)                          \
+    X(vkAllocateCommandBuffers)                      \
+    X(vkResetCommandBuffer)                          \
+    X(vkBeginCommandBuffer)                          \
+    X(vkEndCommandBuffer)                            \
+    X(vkQueueSubmit)                                 \
+    X(vkQueueWaitIdle)                               \
+    X(vkCreateFence)                                 \
+    X(vkDestroyFence)                                \
+    X(vkWaitForFences)                               \
+    X(vkResetFences)                                 \
+    X(vkCreateBuffer)                                \
+    X(vkDestroyBuffer)                               \
+    X(vkGetBufferMemoryRequirements)                 \
+    X(vkAllocateMemory)                              \
+    X(vkFreeMemory)                                  \
+    X(vkBindBufferMemory)                            \
+    X(vkMapMemory)                                   \
+    X(vkUnmapMemory)                                 \
+    X(vkGetBufferDeviceAddress)                      \
+    X(vkCreateShaderModule)                          \
+    X(vkDestroyShaderModule)                         \
+    X(vkCreatePipelineLayout)                        \
+    X(vkDestroyPipelineLayout)                       \
+    X(vkCreateComputePipelines)                      \
+    X(vkDestroyPipeline)                             \
+    X(vkCmdBindPipeline)                             \
+    X(vkCmdPushConstants)                            \
+    X(vkCmdDispatch)                                 \
+    X(vkCmdPipelineBarrier)                          \
+    X(vkCmdCopyBuffer)                               \
+    X(vkCmdFillBuffer)
+
+typedef struct {
+    velri_os_lib *dl;
+    PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
+    PFN_vkCreateInstance vkCreateInstance;
+#define DECL_INST_FIELD(NAME) PFN_##NAME NAME;
+    VK_INST_FUNCS(DECL_INST_FIELD)
+#undef DECL_INST_FIELD
+    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+        vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR;
+    VkInstance instance;
+} vk_inst_loader;
+
+typedef struct {
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkDeviceAddress bda;
+    size_t size;
+} vk_buf;
+
+struct velri_completion {
+    VkCommandPool pool;
+    VkCommandBuffer cmd;
+    VkFence fence;
+    bool in_use;
+    bool uses_splitk;
+};
+
+struct velri_prepared_op {
+    int pipe_id;
+    int alt_pipe_id;            /* LINEAR: GEMV pipeline for dynamic active_rows <= 2 */
+    int reduce_pipe_id;         /* LINEAR Split-K: PIPE_SPLITK_REDUCE */
+    int stage2_decode_pipe_id;  /* ATTENTION: stage 2 decode/wide pipeline */
+    int stage2_prefill_pipe_id; /* ATTENTION: PIPE_ATTENTION_PREFILL_F32 */
+    uint32_t split_k;
+    size_t splitk_bytes;
+};
+
+typedef struct {
+    VkPipeline pipe;
+    uint32_t gx, gy, gz;
+    uint32_t pc_size;
+    alignas(8) uint8_t pc[VK_MAX_PC_BYTES];
+} vk_dispatch_stage;
+
+typedef struct {
+    vk_dispatch_stage stages[VK_MAX_DISPATCH_STAGES];
+    uint32_t num_stages;
+    bool uses_splitk;
+    size_t splitk_bytes;
+} vk_encoded_dispatch;
+
+struct velri_backend_device {
+    vk_inst_loader inst;
+#define DECL_DEV_FIELD(NAME) PFN_##NAME NAME;
+    VK_DEV_FUNCS(DECL_DEV_FIELD)
+#undef DECL_DEV_FIELD
+
+    VkPhysicalDevice phys;
+    VkPhysicalDeviceMemoryProperties mem_props;
+    uint32_t queue_family;
+    uint32_t local_index;
+    uint32_t subgroup_size;
+    uint32_t max_wg_count[3];
+    uint32_t caps_mask;
+    velri_device_caps caps;
+
+    VkDevice device;
+    VkQueue queue;
+    VkPipelineLayout pipe_layout;
+    VkPipeline pipes[PIPE_COUNT];
+
+    velri_os_mutex *mtx;
+    velri_os_cond *slot_cv;
+    bool splitk_busy;
+
+    /* Dedicated transfer command buffer + bounded staging buffer (under `mtx`). */
+    VkCommandPool xfer_pool;
+    VkCommandBuffer xfer_cmd;
+    VkFence xfer_fence;
+    VkBuffer stage_buf;
+    VkDeviceMemory stage_mem;
+    void *stage_map;
+    size_t stage_cap;
+
+    /* Async compute submission ring (0-alloc hot path). */
+    struct velri_completion ring[VK_CMD_RING_SIZE];
+
+    /* Shared Split-K partial buffer (pre-allocated in `velri_vk_prepare_op`). */
+    vk_buf *splitk_buf;
+};
+
+/* ---- Cross-TU Vulkan Backend Functions ---- */
+
+/* vk_device.c */
+velri_status velri_vk_enumerate_devices(uint32_t *out_count);
+velri_status velri_vk_open_device(uint32_t local_index, const void *cfg,
+                                  velri_backend_device **out_dev);
+velri_status velri_vk_query_caps(const velri_backend_device *dev, velri_device_caps *out_caps);
+void velri_vk_close_device(velri_backend_device *dev);
+
+/* vk_memory.c */
+velri_status velri_vk_alloc_buf_locked(velri_backend_device *dev, size_t bytes, size_t align,
+                                       vk_buf **out_buf);
+void velri_vk_free_buf_locked(velri_backend_device *dev, vk_buf *b);
+velri_status velri_vk_init_staging_buffer(velri_backend_device *dev);
+velri_status velri_vk_alloc(velri_backend_device *dev, size_t bytes, size_t align,
+                            void **out_mem_handle);
+void velri_vk_free(velri_backend_device *dev, void *mem_handle);
+velri_status velri_vk_copy_to_ram(velri_backend_device *dev, void *dst_ram,
+                                  const velri_buffer_binding *src, size_t bytes);
+velri_status velri_vk_copy_from_ram(velri_backend_device *dev, const velri_buffer_binding *dst,
+                                    const void *src_ram, size_t bytes);
+velri_status velri_vk_zero_mem(velri_backend_device *dev, void *mem_handle, size_t bytes);
+
+/* vk_pipeline.c */
+VkPipeline velri_vk_get_pipe_locked(velri_backend_device *dev, int id);
+bool velri_vk_splitk_layout(uint32_t sk, uint32_t rows, uint32_t m, uint32_t *out_part_stride,
+                            size_t *out_bytes);
+uint32_t velri_vk_choose_split_k(uint32_t rows, uint32_t m, uint32_t k, uint32_t tile_m,
+                                 uint32_t tile_n, uint32_t target_wgs, uint32_t bk_elems);
+velri_status velri_vk_resolve_op_pipes(const velri_backend_device *dev, const velri_resolved_op *op,
+                                       struct velri_prepared_op *out_plan);
+velri_status velri_vk_query_operation(const velri_backend_device *dev, const velri_resolved_op *op);
+velri_status velri_vk_prepare_op(velri_backend_device *dev, const velri_resolved_op *op,
+                                 velri_prepared_op **out_prepared);
+void velri_vk_destroy_prepared_op(velri_backend_device *dev, velri_prepared_op *prepared);
+
+#endif /* VELRI_BACKEND_VK_INTERNAL_H */

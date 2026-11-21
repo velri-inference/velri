@@ -7,13 +7,13 @@
  * Key invariants:
  *   - Immutable `VELRI_STORAGE_WEIGHT` buffers live once in per-device weight slabs on `velri_plan`
  *     (or zero-copy host pointers on CPU) and are shared read-only across all concurrent slots.
- *   - `VELRI_STORAGE_STATE` lives in one contiguous `state_arena` per device per slot and remains
+ *   - `VELRI_STORAGE_STATE` lives in one contiguous state arena per device per slot and remains
  *     resident across steps with 0 B shadow RAM required (optional host binding for explicit sync).
- *   - `VELRI_STORAGE_INPUT`/`OUTPUT` on non-host devices share one contiguous `io_arena` per slot.
+ *   - `VELRI_STORAGE_INPUT`/`OUTPUT` on non-host devices share one contiguous IO arena per slot.
  *   - Direct CPU <-> non-host transfers bypass `ram_staging` completely (0 B staging RAM).
  *   - Consecutive ops targeting the same device are batched via `submit_batch` (0 B hot-path allocs).
  *   - Dynamic bounds (`seq_len_override`, `pos_offset_override`, `kv_len_override`) are validated
- *     strictly before launching any device work.
+ *     strictly before launching any device work via `velri_op_validate_step_params`.
  */
 
 typedef struct {
@@ -25,9 +25,7 @@ typedef struct {
 
 struct velri_slot {
     velri_plan *plan;
-    void *scratch_arenas[VELRI_MAX_DEVICES];
-    void *state_arenas[VELRI_MAX_DEVICES];
-    void *io_arenas[VELRI_MAX_DEVICES];
+    void *arenas[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];
     void *ram_staging;
     slot_storage_binding *user_bindings;
     bool needs_reset;
@@ -45,30 +43,24 @@ static velri_buffer_binding resolve_storage_binding(const velri_slot *slot,
 
     switch (ps->arena_kind) {
     case VELRI_ARENA_SCRATCH:
-        b.mem_handle = slot->scratch_arenas[ps->device_id];
+    case VELRI_ARENA_STATE:
+    case VELRI_ARENA_IO: {
+        velri_slot_arena_id aid = (ps->arena_kind == VELRI_ARENA_SCRATCH)
+                                      ? VELRI_SLOT_ARENA_SCRATCH
+                                      : (ps->arena_kind == VELRI_ARENA_STATE)
+                                            ? VELRI_SLOT_ARENA_STATE
+                                            : VELRI_SLOT_ARENA_IO;
+        b.mem_handle = slot->arenas[aid][ps->device_id];
         b.byte_offset = ps->arena_offset + view_byte_offset;
-        b.byte_size = plan->scratch_arena_bytes[ps->device_id];
-        b.is_host_ptr = de->caps.is_host_memory;
+        b.byte_size = plan->slot_arena_bytes[aid][ps->device_id];
+        b.is_host_ptr = (ps->arena_kind == VELRI_ARENA_IO) ? false : de->caps.is_host_memory;
         return b;
+    }
 
     case VELRI_ARENA_WEIGHT:
         b.mem_handle = plan->weight_slabs[ps->device_id][ps->slab_idx];
         b.byte_offset = ps->arena_offset + view_byte_offset;
         b.byte_size = plan->weight_slab_bytes[ps->device_id][ps->slab_idx];
-        b.is_host_ptr = false;
-        return b;
-
-    case VELRI_ARENA_STATE:
-        b.mem_handle = slot->state_arenas[ps->device_id];
-        b.byte_offset = ps->arena_offset + view_byte_offset;
-        b.byte_size = plan->state_arena_bytes[ps->device_id];
-        b.is_host_ptr = de->caps.is_host_memory;
-        return b;
-
-    case VELRI_ARENA_IO:
-        b.mem_handle = slot->io_arenas[ps->device_id];
-        b.byte_offset = ps->arena_offset + view_byte_offset;
-        b.byte_size = plan->io_arena_bytes[ps->device_id];
         b.is_host_ptr = false;
         return b;
 
@@ -92,6 +84,59 @@ static velri_buffer_binding resolve_storage_binding(const velri_slot *slot,
     b.byte_size = sb->bound_bytes;
     b.is_host_ptr = true;
     return b;
+}
+
+static velri_status validate_host_bind(const velri_plan *plan, velri_storage_id storage_id,
+                                       const void *host_ptr, size_t byte_size, bool expect_weight) {
+    if (!plan || !host_ptr || storage_id >= plan->num_user_storages) {
+        return VELRI_ERR_INVALID;
+    }
+    const velri_plan_storage *ps = &plan->storages[storage_id];
+    if (expect_weight) {
+        if (ps->kind != VELRI_STORAGE_WEIGHT) {
+            return VELRI_ERR_INVALID;
+        }
+    } else if (ps->kind == VELRI_STORAGE_SCRATCH || ps->kind == VELRI_STORAGE_WEIGHT) {
+        return VELRI_ERR_INVALID;
+    }
+    if (byte_size < ps->byte_size) {
+        return VELRI_ERR_INVALID;
+    }
+    size_t req_align = velri_dtype_align(ps->dtype);
+    if (((uintptr_t)host_ptr % req_align) != 0U) {
+        return VELRI_ERR_INVALID;
+    }
+    return VELRI_OK;
+}
+
+static velri_status copy_host_to_storage(const velri_slot *slot, uint32_t storage_id,
+                                         const void *src_host) {
+    const velri_plan *plan = slot->plan;
+    const velri_plan_storage *ps = &plan->storages[storage_id];
+    velri_device_entry *de = &plan->ctx->devices[ps->device_id];
+    velri_buffer_binding dst = resolve_storage_binding(slot, storage_id, 0U);
+    if (de->caps.is_host_memory) {
+        if (ps->byte_size > 0U) {
+            memcpy(velri_binding_ptr(&dst), src_host, ps->byte_size);
+        }
+        return VELRI_OK;
+    }
+    return de->vt->copy_from_ram(de->dev, &dst, src_host, ps->byte_size);
+}
+
+static velri_status copy_storage_to_host(const velri_slot *slot, uint32_t storage_id,
+                                         void *dst_host) {
+    const velri_plan *plan = slot->plan;
+    const velri_plan_storage *ps = &plan->storages[storage_id];
+    velri_device_entry *de = &plan->ctx->devices[ps->device_id];
+    velri_buffer_binding src = resolve_storage_binding(slot, storage_id, 0U);
+    if (de->caps.is_host_memory) {
+        if (ps->byte_size > 0U) {
+            memcpy(dst_host, velri_binding_cptr(&src), ps->byte_size);
+        }
+        return VELRI_OK;
+    }
+    return de->vt->copy_to_ram(de->dev, dst_host, &src, ps->byte_size);
 }
 
 static velri_status zero_device_arena(velri_context *ctx, velri_device_id d, void *handle,
@@ -132,18 +177,12 @@ static velri_status zero_device_arena(velri_context *ctx, velri_device_id d, voi
 
 velri_status velri_plan_bind_weight_host(velri_plan *plan, velri_storage_id storage_id,
                                          const void *host_ptr, size_t byte_size) {
-    if (!plan || !host_ptr || storage_id >= plan->num_user_storages) {
-        return VELRI_ERR_INVALID;
-    }
-    const velri_plan_storage *ps = &plan->storages[storage_id];
-    if (ps->kind != VELRI_STORAGE_WEIGHT || byte_size < ps->byte_size) {
-        return VELRI_ERR_INVALID;
-    }
-    size_t req_align = velri_dtype_align(ps->dtype);
-    if (((uintptr_t)host_ptr % req_align) != 0U) {
-        return VELRI_ERR_INVALID;
+    velri_status st = validate_host_bind(plan, storage_id, host_ptr, byte_size, true);
+    if (st != VELRI_OK) {
+        return st;
     }
 
+    const velri_plan_storage *ps = &plan->storages[storage_id];
     velri_plan_weight_binding *wb = &plan->weight_bindings[storage_id];
     wb->host_ptr = host_ptr;
     wb->bound_bytes = byte_size;
@@ -156,7 +195,7 @@ velri_status velri_plan_bind_weight_host(velri_plan *plan, velri_storage_id stor
             .byte_size = plan->weight_slab_bytes[ps->device_id][ps->slab_idx],
             .is_host_ptr = false,
         };
-        velri_status st = de->vt->copy_from_ram(de->dev, &dst, host_ptr, ps->byte_size);
+        st = de->vt->copy_from_ram(de->dev, &dst, host_ptr, ps->byte_size);
         if (st != VELRI_OK) {
             wb->is_bound = false;
             return st;
@@ -189,36 +228,23 @@ velri_status velri_slot_create(velri_plan *plan, velri_slot **out_slot) {
     }
 
     for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
-        if (plan->scratch_arena_bytes[d] > 0U) {
-            velri_status st = velri_device_alloc_tracked(plan->ctx, d, plan->scratch_arena_bytes[d],
-                                                         plan->scratch_arena_align[d],
-                                                         &slot->scratch_arenas[d]);
+        for (uint32_t a = 0U; a < VELRI_SLOT_ARENA_COUNT; ++a) {
+            size_t sz = plan->slot_arena_bytes[a][d];
+            if (sz == 0U) {
+                continue;
+            }
+            velri_status st = velri_device_alloc_tracked(
+                plan->ctx, d, sz, plan->slot_arena_align[a][d], &slot->arenas[a][d]);
             if (st != VELRI_OK) {
                 velri_slot_destroy(slot);
                 return st;
             }
-        }
-        if (plan->state_arena_bytes[d] > 0U) {
-            velri_status st = velri_device_alloc_tracked(plan->ctx, d, plan->state_arena_bytes[d],
-                                                         plan->state_arena_align[d],
-                                                         &slot->state_arenas[d]);
-            if (st != VELRI_OK) {
-                velri_slot_destroy(slot);
-                return st;
-            }
-            st = zero_device_arena(plan->ctx, d, slot->state_arenas[d], plan->state_arena_bytes[d]);
-            if (st != VELRI_OK) {
-                velri_slot_destroy(slot);
-                return st;
-            }
-        }
-        if (plan->io_arena_bytes[d] > 0U) {
-            velri_status st = velri_device_alloc_tracked(plan->ctx, d, plan->io_arena_bytes[d],
-                                                         plan->io_arena_align[d],
-                                                         &slot->io_arenas[d]);
-            if (st != VELRI_OK) {
-                velri_slot_destroy(slot);
-                return st;
+            if (a == VELRI_SLOT_ARENA_STATE) {
+                st = zero_device_arena(plan->ctx, d, slot->arenas[a][d], sz);
+                if (st != VELRI_OK) {
+                    velri_slot_destroy(slot);
+                    return st;
+                }
             }
         }
     }
@@ -244,9 +270,11 @@ void velri_slot_destroy(velri_slot *slot) {
     if (plan && plan->ctx) {
         for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
             velri_device_entry *de = &plan->ctx->devices[d];
-            if (slot->io_arenas[d]) de->vt->free(de->dev, slot->io_arenas[d]);
-            if (slot->state_arenas[d]) de->vt->free(de->dev, slot->state_arenas[d]);
-            if (slot->scratch_arenas[d]) de->vt->free(de->dev, slot->scratch_arenas[d]);
+            for (uint32_t a = VELRI_SLOT_ARENA_COUNT; a > 0U; --a) {
+                if (slot->arenas[a - 1U][d]) {
+                    de->vt->free(de->dev, slot->arenas[a - 1U][d]);
+                }
+            }
         }
     }
     velri_os_aligned_free(slot->ram_staging);
@@ -257,17 +285,12 @@ void velri_slot_destroy(velri_slot *slot) {
 
 velri_status velri_slot_bind_host(velri_slot *slot, velri_storage_id storage_id, void *host_ptr,
                                   size_t byte_size) {
-    if (!slot || !host_ptr || storage_id >= slot->plan->num_user_storages) {
+    if (!slot) {
         return VELRI_ERR_INVALID;
     }
-    const velri_plan_storage *ps = &slot->plan->storages[storage_id];
-    if (ps->kind == VELRI_STORAGE_SCRATCH || ps->kind == VELRI_STORAGE_WEIGHT ||
-        byte_size < ps->byte_size) {
-        return VELRI_ERR_INVALID;
-    }
-    size_t req_align = velri_dtype_align(ps->dtype);
-    if (((uintptr_t)host_ptr % req_align) != 0U) {
-        return VELRI_ERR_INVALID;
+    velri_status st = validate_host_bind(slot->plan, storage_id, host_ptr, byte_size, false);
+    if (st != VELRI_OK) {
+        return st;
     }
 
     slot_storage_binding *sb = &slot->user_bindings[storage_id];
@@ -287,16 +310,7 @@ velri_status velri_slot_sync_state_from_host(velri_slot *slot, velri_storage_id 
     if (ps->kind != VELRI_STORAGE_STATE || !sb->is_bound) {
         return VELRI_ERR_INVALID;
     }
-    velri_device_entry *de = &slot->plan->ctx->devices[ps->device_id];
-    velri_buffer_binding dst = resolve_storage_binding(slot, storage_id, 0U);
-    if (de->caps.is_host_memory) {
-        if (ps->byte_size > 0U) {
-            memcpy((uint8_t *)dst.mem_handle + dst.byte_offset, sb->host_ptr, ps->byte_size);
-        }
-        sb->state_uploaded = true;
-        return VELRI_OK;
-    }
-    velri_status st = de->vt->copy_from_ram(de->dev, &dst, sb->host_ptr, ps->byte_size);
+    velri_status st = copy_host_to_storage(slot, storage_id, sb->host_ptr);
     if (st == VELRI_OK) {
         sb->state_uploaded = true;
     }
@@ -308,19 +322,11 @@ velri_status velri_slot_sync_state_to_host(velri_slot *slot, velri_storage_id st
         return VELRI_ERR_INVALID;
     }
     const velri_plan_storage *ps = &slot->plan->storages[storage_id];
-    slot_storage_binding *sb = &slot->user_bindings[storage_id];
+    const slot_storage_binding *sb = &slot->user_bindings[storage_id];
     if (ps->kind != VELRI_STORAGE_STATE || !sb->is_bound) {
         return VELRI_ERR_INVALID;
     }
-    velri_device_entry *de = &slot->plan->ctx->devices[ps->device_id];
-    velri_buffer_binding src = resolve_storage_binding(slot, storage_id, 0U);
-    if (de->caps.is_host_memory) {
-        if (ps->byte_size > 0U) {
-            memcpy(sb->host_ptr, (const uint8_t *)src.mem_handle + src.byte_offset, ps->byte_size);
-        }
-        return VELRI_OK;
-    }
-    return de->vt->copy_to_ram(de->dev, sb->host_ptr, &src, ps->byte_size);
+    return copy_storage_to_host(slot, storage_id, sb->host_ptr);
 }
 
 static velri_status validate_dynamic_params(const velri_plan *plan,
@@ -348,57 +354,9 @@ static velri_status validate_dynamic_params(const velri_plan *plan,
         if (step->kind != VELRI_STEP_OP) {
             continue;
         }
-        const velri_resolved_op *op = &step->u.op.resolved;
-
-        /* Strictly validate seq_len_override <= static_rows for EVERY dynamic-sequence op. */
-        if (params->has_seq_len && velri_op_is_dynamic_seq(op)) {
-            size_t static_rows = (op->kind == VELRI_OP_EMBEDDING) ? op->outputs[0].dims[0]
-                                                                  : op->inputs[0].dims[0];
-            if (params->seq_len_override > static_rows) {
-                return VELRI_ERR_INVALID;
-            }
-        }
-
-        if (op->kind == VELRI_OP_ROPE && (params->has_pos_offset || params->has_seq_len)) {
-            size_t active_t = velri_effective_rows(op, op->inputs[0].dims[0], params);
-            size_t pos = params->has_pos_offset ? params->pos_offset_override
-                                                : op->raw.attr.rope.pos_offset;
-            size_t end_pos = 0U, need = 0U;
-            if (velri_add_overflow_size(pos, active_t, &end_pos) ||
-                velri_mul_overflow_size(end_pos, op->raw.attr.rope.rotary_dim / 2U, &need)) {
-                return VELRI_ERR_OVERFLOW;
-            }
-            size_t ct_n = 0U, st_n = 0U;
-            if (velri_tensor_view_num_elements(&op->inputs[1], &ct_n) != VELRI_OK ||
-                velri_tensor_view_num_elements(&op->inputs[2], &st_n) != VELRI_OK ||
-                ct_n < need || st_n < need) {
-                return VELRI_ERR_INVALID;
-            }
-        } else if (op->kind == VELRI_OP_EMBEDDING) {
-            if (!(op->num_inputs >= 2U && op->input_present[1])) {
-                size_t active_t = velri_effective_rows(op, op->outputs[0].dims[0], params);
-                size_t pos = params->has_pos_offset ? params->pos_offset_override
-                                                    : op->raw.attr.embedding.pos_offset;
-                size_t end_pos = 0U;
-                if (velri_add_overflow_size(pos, active_t, &end_pos)) {
-                    return VELRI_ERR_OVERFLOW;
-                }
-                if (end_pos > op->inputs[0].dims[0]) {
-                    return VELRI_ERR_INVALID;
-                }
-            }
-        } else if (op->kind == VELRI_OP_ATTENTION) {
-            size_t active_t = velri_effective_rows(op, op->inputs[0].dims[0], params);
-            size_t kv_pos = params->has_kv_len
-                                ? params->kv_len_override
-                                : (params->has_pos_offset ? params->pos_offset_override : 0U);
-            size_t kv_end = 0U;
-            if (velri_add_overflow_size(kv_pos, active_t, &kv_end)) {
-                return VELRI_ERR_OVERFLOW;
-            }
-            if (kv_end > op->outputs[1].dims[1]) {
-                return VELRI_ERR_INVALID;
-            }
+        velri_status st = velri_op_validate_step_params(&step->u.op.resolved, params);
+        if (st != VELRI_OK) {
+            return st;
         }
     }
     return VELRI_OK;
@@ -418,18 +376,15 @@ static velri_status run_ram_transfer(velri_slot *slot, const velri_launch_step *
     /* Direct zero-staging transfer when either side is already host memory. */
     if (src_b.is_host_ptr && dst_b.is_host_ptr) {
         if (n > 0U) {
-            memcpy((uint8_t *)dst_b.mem_handle + dst_b.byte_offset,
-                   (const uint8_t *)src_b.mem_handle + src_b.byte_offset, n);
+            memcpy(velri_binding_ptr(&dst_b), velri_binding_cptr(&src_b), n);
         }
         return VELRI_OK;
     }
     if (src_b.is_host_ptr) {
-        const void *src_ptr = (const uint8_t *)src_b.mem_handle + src_b.byte_offset;
-        return dst_de->vt->copy_from_ram(dst_de->dev, &dst_b, src_ptr, n);
+        return dst_de->vt->copy_from_ram(dst_de->dev, &dst_b, velri_binding_cptr(&src_b), n);
     }
     if (dst_b.is_host_ptr) {
-        void *dst_ptr = (uint8_t *)dst_b.mem_handle + dst_b.byte_offset;
-        return src_de->vt->copy_to_ram(src_de->dev, dst_ptr, &src_b, n);
+        return src_de->vt->copy_to_ram(src_de->dev, velri_binding_ptr(&dst_b), &src_b, n);
     }
 
     velri_status st = src_de->vt->copy_to_ram(src_de->dev, slot->ram_staging, &src_b, n);
@@ -452,25 +407,26 @@ static velri_status run_compute_batch(velri_slot *slot, uint32_t first_step, uin
 
     for (uint32_t k = 0U; k < count; ++k) {
         const velri_launch_step *step = &plan->steps[first_step + k];
+        const velri_resolved_op *op = &step->u.op.resolved;
         memset(in_b[k], 0, sizeof(in_b[k]));
         memset(out_b[k], 0, sizeof(out_b[k]));
-        for (uint32_t i = 0U; i < step->u.op.num_inputs; ++i) {
-            if (step->u.op.inputs[i].present) {
-                in_b[k][i] = resolve_storage_binding(slot, step->u.op.inputs[i].plan_storage_idx,
-                                                     step->u.op.inputs[i].view_byte_offset);
+        for (uint32_t i = 0U; i < op->num_inputs; ++i) {
+            if (op->input_present[i]) {
+                in_b[k][i] = resolve_storage_binding(slot, step->u.op.in_storage_idx[i],
+                                                     op->inputs[i].byte_offset);
             }
         }
-        for (uint32_t o = 0U; o < step->u.op.num_outputs; ++o) {
-            out_b[k][o] = resolve_storage_binding(slot, step->u.op.outputs[o].plan_storage_idx,
-                                                  step->u.op.outputs[o].view_byte_offset);
+        for (uint32_t o = 0U; o < op->num_outputs; ++o) {
+            out_b[k][o] = resolve_storage_binding(slot, step->u.op.out_storage_idx[o],
+                                                  op->outputs[o].byte_offset);
         }
         items[k] = (velri_submit_item){
-            .op = &step->u.op.resolved,
+            .op = op,
             .prepared = step->u.op.prepared,
             .inputs = in_b[k],
-            .num_inputs = step->u.op.num_inputs,
+            .num_inputs = op->num_inputs,
             .outputs = out_b[k],
-            .num_outputs = step->u.op.num_outputs,
+            .num_outputs = op->num_outputs,
             .params = params,
         };
     }
@@ -496,6 +452,65 @@ static velri_status run_compute_batch(velri_slot *slot, uint32_t first_step, uin
     return submit_st;
 }
 
+static velri_status slot_check_bindings(const velri_slot *slot) {
+    const velri_plan *plan = slot->plan;
+    for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
+        velri_storage_kind kind = plan->storages[i].kind;
+        if (kind == VELRI_STORAGE_SCRATCH || kind == VELRI_STORAGE_STATE) {
+            continue;
+        }
+        if (kind == VELRI_STORAGE_WEIGHT) {
+            if (!plan->weight_bindings[i].is_bound) {
+                return VELRI_ERR_INVALID;
+            }
+        } else if (!slot->user_bindings[i].is_bound) {
+            return VELRI_ERR_INVALID;
+        }
+    }
+    return VELRI_OK;
+}
+
+static velri_status slot_upload_inputs(velri_slot *slot, velri_cancel_token *cancel) {
+    const velri_plan *plan = slot->plan;
+    for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
+        const velri_plan_storage *ps = &plan->storages[i];
+        const velri_device_entry *de = &plan->ctx->devices[ps->device_id];
+        bool need_state_up = (ps->kind == VELRI_STORAGE_STATE && slot->user_bindings[i].is_bound &&
+                              !slot->user_bindings[i].state_uploaded);
+        bool need_input_up = (!de->caps.is_host_memory && ps->kind == VELRI_STORAGE_INPUT);
+        if (!need_input_up && !need_state_up) {
+            continue;
+        }
+        if (velri_cancel_is_requested(cancel)) {
+            return VELRI_ERR_CANCELLED;
+        }
+        velri_status st = copy_host_to_storage(slot, i, slot->user_bindings[i].host_ptr);
+        if (st != VELRI_OK) {
+            return st;
+        }
+        if (ps->kind == VELRI_STORAGE_STATE) {
+            slot->user_bindings[i].state_uploaded = true;
+        }
+    }
+    return VELRI_OK;
+}
+
+static velri_status slot_download_outputs(const velri_slot *slot) {
+    const velri_plan *plan = slot->plan;
+    for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
+        const velri_plan_storage *ps = &plan->storages[i];
+        const velri_device_entry *de = &plan->ctx->devices[ps->device_id];
+        if (de->caps.is_host_memory || ps->kind != VELRI_STORAGE_OUTPUT) {
+            continue;
+        }
+        velri_status st = copy_storage_to_host(slot, i, slot->user_bindings[i].host_ptr);
+        if (st != VELRI_OK) {
+            return st;
+        }
+    }
+    return VELRI_OK;
+}
+
 velri_status velri_slot_run(velri_slot *slot, const velri_step_params *params,
                             velri_cancel_token *cancel) {
     if (!slot) {
@@ -509,80 +524,42 @@ velri_status velri_slot_run(velri_slot *slot, const velri_step_params *params,
     uint64_t allocs_before = atomic_load_explicit(&plan->ctx->total_allocs, memory_order_relaxed);
     slot->last_run_allocs = 0U;
 
-    /* Validate all required external storages (STATE may remain purely device-resident). */
-    for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
-        velri_storage_kind kind = plan->storages[i].kind;
-        if (kind == VELRI_STORAGE_SCRATCH || kind == VELRI_STORAGE_STATE) {
-            continue;
-        }
-        if (kind == VELRI_STORAGE_WEIGHT) {
-            if (!plan->weight_bindings[i].is_bound) return VELRI_ERR_INVALID;
-        } else if (!slot->user_bindings[i].is_bound) {
-            return VELRI_ERR_INVALID;
-        }
+    bool any_work_accepted = false;
+    velri_status st = slot_check_bindings(slot);
+    if (st != VELRI_OK) {
+        goto finish;
     }
 
     velri_step_params default_params = {0};
     const velri_step_params *eff_params = params ? params : &default_params;
-    velri_status pst = validate_dynamic_params(plan, eff_params);
-    if (pst != VELRI_OK) {
-        return pst;
+    st = validate_dynamic_params(plan, eff_params);
+    if (st != VELRI_OK) {
+        goto finish;
     }
 
     if (velri_cancel_is_requested(cancel)) {
-        return VELRI_ERR_CANCELLED;
+        st = VELRI_ERR_CANCELLED;
+        goto finish;
     }
 
     /* Upload step INPUTs (non-host) and initial host-bound STATE (both host & non-host). */
-    for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
-        const velri_plan_storage *ps = &plan->storages[i];
-        velri_device_entry *de = &plan->ctx->devices[ps->device_id];
-        bool need_state_up = (ps->kind == VELRI_STORAGE_STATE && slot->user_bindings[i].is_bound &&
-                              !slot->user_bindings[i].state_uploaded);
-        bool need_input_up = (!de->caps.is_host_memory && ps->kind == VELRI_STORAGE_INPUT);
-        if (!need_input_up && !need_state_up) {
-            continue;
-        }
-        if (velri_cancel_is_requested(cancel)) {
-            return VELRI_ERR_CANCELLED;
-        }
-        velri_buffer_binding dst = resolve_storage_binding(slot, i, 0U);
-        if (de->caps.is_host_memory) {
-            if (ps->byte_size > 0U) {
-                memcpy((uint8_t *)dst.mem_handle + dst.byte_offset,
-                       slot->user_bindings[i].host_ptr, ps->byte_size);
-            }
-        } else {
-            velri_status st = de->vt->copy_from_ram(
-                de->dev, &dst, slot->user_bindings[i].host_ptr, ps->byte_size);
-            if (st != VELRI_OK) {
-                return st;
-            }
-        }
-        if (ps->kind == VELRI_STORAGE_STATE) {
-            slot->user_bindings[i].state_uploaded = true;
-        }
+    st = slot_upload_inputs(slot, cancel);
+    if (st != VELRI_OK) {
+        goto finish;
     }
 
-    bool any_work_accepted = false;
     uint32_t s = 0U;
     while (s < plan->num_steps) {
         if (velri_cancel_is_requested(cancel)) {
-            if (any_work_accepted) slot->needs_reset = true;
-            slot->last_run_allocs =
-                atomic_load_explicit(&plan->ctx->total_allocs, memory_order_relaxed) - allocs_before;
-            return VELRI_ERR_CANCELLED;
+            st = VELRI_ERR_CANCELLED;
+            goto finish;
         }
 
         const velri_launch_step *step = &plan->steps[s];
         if (step->kind == VELRI_STEP_RAM_TRANSFER) {
-            velri_status st = run_ram_transfer(slot, step);
+            st = run_ram_transfer(slot, step);
             if (st != VELRI_OK) {
-                if (any_work_accepted) slot->needs_reset = true;
-                slot->last_run_allocs =
-                    atomic_load_explicit(&plan->ctx->total_allocs, memory_order_relaxed) -
-                    allocs_before;
-                return st;
+                goto finish;
             }
             s++;
             continue;
@@ -599,40 +576,29 @@ velri_status velri_slot_run(velri_slot *slot, const velri_step_params *params,
         }
 
         bool accepted = false;
-        velri_status st = run_compute_batch(slot, s, batch, eff_params, &accepted);
+        st = run_compute_batch(slot, s, batch, eff_params, &accepted);
         if (accepted) {
             any_work_accepted = true;
         }
         if (st != VELRI_OK) {
-            if (any_work_accepted) slot->needs_reset = true;
-            slot->last_run_allocs =
-                atomic_load_explicit(&plan->ctx->total_allocs, memory_order_relaxed) - allocs_before;
-            return st;
+            goto finish;
         }
         s += batch;
     }
 
     /* Download ONLY non-host OUTPUTs (STATE remains resident on its home device!). */
-    for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
-        const velri_plan_storage *ps = &plan->storages[i];
-        velri_device_entry *de = &plan->ctx->devices[ps->device_id];
-        if (de->caps.is_host_memory || ps->kind != VELRI_STORAGE_OUTPUT) {
-            continue;
-        }
-        velri_buffer_binding src = resolve_storage_binding(slot, i, 0U);
-        velri_status st =
-            de->vt->copy_to_ram(de->dev, slot->user_bindings[i].host_ptr, &src, ps->byte_size);
-        if (st != VELRI_OK) {
-            slot->needs_reset = true;
-            slot->last_run_allocs =
-                atomic_load_explicit(&plan->ctx->total_allocs, memory_order_relaxed) - allocs_before;
-            return st;
-        }
+    st = slot_download_outputs(slot);
+    if (st != VELRI_OK) {
+        any_work_accepted = true;
     }
 
+finish:
+    if (st != VELRI_OK && any_work_accepted) {
+        slot->needs_reset = true;
+    }
     slot->last_run_allocs =
         atomic_load_explicit(&plan->ctx->total_allocs, memory_order_relaxed) - allocs_before;
-    return VELRI_OK;
+    return st;
 }
 
 bool velri_slot_needs_reset(const velri_slot *slot) { return slot ? slot->needs_reset : false; }
@@ -643,11 +609,16 @@ velri_status velri_slot_reset(velri_slot *slot) {
     }
     const velri_plan *plan = slot->plan;
     for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
-        velri_status st = zero_device_arena(plan->ctx, d, slot->scratch_arenas[d],
-                                            plan->scratch_arena_bytes[d]);
-        if (st != VELRI_OK) return st;
-        st = zero_device_arena(plan->ctx, d, slot->state_arenas[d], plan->state_arena_bytes[d]);
-        if (st != VELRI_OK) return st;
+        for (uint32_t a = 0U; a < VELRI_SLOT_ARENA_COUNT; ++a) {
+            if (a == VELRI_SLOT_ARENA_IO) {
+                continue;
+            }
+            velri_status st = zero_device_arena(plan->ctx, d, slot->arenas[a][d],
+                                                plan->slot_arena_bytes[a][d]);
+            if (st != VELRI_OK) {
+                return st;
+            }
+        }
     }
     for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
         slot->user_bindings[i].state_uploaded = false;

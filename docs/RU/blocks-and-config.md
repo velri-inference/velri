@@ -12,10 +12,10 @@
 
 | Уровень | Примеры | Что задаётся |
 | :--- | :--- | :--- |
-| **Операция** (`velri-lib`) | `Linear`, `RMSNorm`, `RoPE`, `Attention`, `GDN`, `FWHT` | Формула, формы/типы входов и выходов, чтения/записи состояния |
-| **Блок** (`Velri`) | `GatedMLP`, `MoE`, `ProjectedAttention`, `HyperConnections` | Граф связанных операций без привязки к имени семейства |
-| **Слой** (`Velri`) | Миксер контекста + FFN + нормализации и остаточные связи | Порядок блоков и движение данных внутри слоя |
-| **Архитектура** (`Velri`) | `Llama`, `Qwen3.5`, `Qwen3.8-Flash-Next`, `Gemma 4` | Полная схема слоёв, сопоставление весов, дополнительные ветви (`PLE`, `MTP`, энкодеры) |
+| **Операция** (`velri-lib`, `graph.h`) | `Linear`, `BatchedLinear`, `RMSNorm`, `LayerNorm`, `RoPE`, `Attention`, `GDN`, `FWHT` | Формула, формы/типы входов и выходов, чтения/записи состояния |
+| **Переиспользуемый блок и общий слой** (`velri-lib`, `blocks.h`) | `velri_builder`, `velri_manifest`, `norm`, `linear`, `embedding`, `attention_core`/`dense`/`latent`, `mlp`, `lm_head`, общий `pre_norm` | Подграфы без привязки к имени семейства и без хардкода скоупов конфига |
+| **Движковые хелперы слоёв** (`Velri`, `src/model/layers.{h,c}`) | `velri_model_params`, `velri_pre_norm_layer_desc`, `velri_lm_head_desc`, скоупы размещения (`input-layer`, `hidden-layers`, `attention`, `kv-cache`, `dense-mlp`, `lm-head`) | Привязка метаданных модели и JSON-скоупов размещения к блокам `velri-lib` |
+| **Архитектура** (`Velri`, `src/model/arch/`) | `GPT-2`, `Llama`, `Qwen3.5`, `Qwen3.8-Flash-Next`, `Gemma 4` | Полная схема слоёв, сопоставление весов, дополнительные ветви (`PLE`, `MTP`, энкодеры) |
 
 Повторное использование блока означает повторное использование **описания вычислений**: веса и состояние не становятся общими автоматически — совместное владение всегда объявляется явно.
 

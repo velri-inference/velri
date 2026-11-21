@@ -23,6 +23,7 @@ enum {
     VELRI_INVALID_ID = 0xFFFFFFFFU,
     VELRI_OP_MAX_INPUTS = 6,
     VELRI_OP_MAX_OUTPUTS = 3,
+    VELRI_MAX_SUBMIT_BATCH = 32,
     VELRI_ATTN_MAX_HEAD_DIM = 2048
 };
 
@@ -100,7 +101,7 @@ typedef struct {
     uint32_t num_outputs;
     velri_view_id inputs[VELRI_OP_MAX_INPUTS]; /* VELRI_INVALID_ID for optional absent inputs */
     velri_view_id outputs[VELRI_OP_MAX_OUTPUTS];
-    bool dynamic_seq; /* True => axis-0 scales dynamically with velri_step_params.seq_len_override */
+    bool dynamic_seq; /* True => axis-0 scales dynamically with seq_len_override (EMBEDDING, ATTENTION, COPY_LAST_ROW are always dynamic-seq) */
     union {
         struct {
             velri_linear_desc desc;

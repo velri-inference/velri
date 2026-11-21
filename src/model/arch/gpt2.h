@@ -1,7 +1,7 @@
 #ifndef VELRI_MODEL_ARCH_GPT2_H
 #define VELRI_MODEL_ARCH_GPT2_H
 
-#include <velri_lib/velri_lib.h>
+#include "model/layers.h"
 
 /*
  * GPT-2 Architecture Diagram:

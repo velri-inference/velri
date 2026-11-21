@@ -1193,6 +1193,120 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
             free(hy);
             free(hy_ref);
         }
+
+        /* 16c. 1D dynamic_seq=true elementwise op (ACTIVATION): active prefix matches, tail untouched */
+        {
+            const size_t total_n = 37U;
+            const size_t active_n = 13U;
+            const float sentinel = 42.25f;
+            float *hx1d = (float *)xcalloc(total_n, sizeof(float));
+            float *hy1d = (float *)xcalloc(total_n, sizeof(float));
+            float *hy1d_ref = (float *)xcalloc(active_n, sizeof(float));
+            uint64_t rng = 0x1D5E0001ULL;
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hx1d, total_n, &rng, 3.0f);
+            for (size_t i = 0U; i < total_n; ++i) {
+                hy1d[i] = sentinel;
+            }
+            ref_activation_f32(VELRI_ACT_SILU, active_n, hx1d, hy1d_ref);
+
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "dyn1d g");
+            velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, total_n, dev);
+            velri_storage_id sy = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, total_n, dev);
+            velri_op_desc op = {
+                .kind = VELRI_OP_ACTIVATION,
+                .num_inputs = 1U,
+                .num_outputs = 1U,
+                .inputs = {add_view_1d(g, sx, VELRI_DTYPE_F32, total_n, 0U)},
+                .outputs = {add_view_1d(g, sy, VELRI_DTYPE_F32, total_n, 0U)},
+                .dynamic_seq = true,
+                .attr.activation = {.kind = VELRI_ACT_SILU},
+            };
+            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add dyn1d act");
+            velri_plan *plan = nullptr;
+            velri_slot *slot = nullptr;
+            CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep dyn1d act");
+            CHECK_OK(velri_slot_create(plan, &slot), "slot dyn1d");
+            CHECK_OK(velri_slot_bind_host(slot, sx, hx1d, total_n * sizeof(float)), "bind x1d");
+            CHECK_OK(velri_slot_bind_host(slot, sy, hy1d, total_n * sizeof(float)), "bind y1d");
+
+            velri_step_params sp_oob = {.has_seq_len = true, .seq_len_override = total_n + 1U};
+            CHECK(velri_slot_run(slot, &sp_oob, nullptr) == VELRI_ERR_INVALID,
+                  "1D dynamic_seq=true must reject seq_len_override > dims[0]");
+            CHECK(!velri_slot_needs_reset(slot), "1D dyn_seq pre-accept rejection keeps slot clean");
+
+            velri_step_params sp_act = {.has_seq_len = true, .seq_len_override = active_n};
+            CHECK_OK(velri_slot_run(slot, &sp_act, nullptr), "run dyn1d act");
+            CHECK_OK(velri_slot_sync_state_to_host(slot, sy), "sync dyn1d state");
+            CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy1d_ref, hy1d, 1U, active_n,
+                                             active_n) <= 5e-4,
+                  "1D dynamic_seq=true active prefix matches reference");
+            for (size_t i = active_n; i < total_n; ++i) {
+                CHECK(hy1d[i] == sentinel, "1D dynamic_seq=true tail elements must not be overwritten");
+            }
+
+            velri_slot_destroy(slot);
+            velri_plan_destroy(plan);
+            velri_graph_destroy(g);
+            free(hx1d);
+            free(hy1d);
+            free(hy1d_ref);
+        }
+
+        /* 16d. Zero-extent dimension dims={4, 0} rejected by is_contiguous and add_view */
+        {
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "zero dim g");
+            velri_storage_id s = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, 16U, dev);
+            const velri_tensor_view bad_views[2] = {
+                {
+                    .storage_id = s,
+                    .dtype = VELRI_DTYPE_F32,
+                    .rank = 2U,
+                    .dims = {4U, 0U},
+                    .strides = {0U, 1U},
+                    .byte_offset = 0U,
+                },
+                {
+                    .storage_id = s,
+                    .dtype = VELRI_DTYPE_F32,
+                    .rank = 2U,
+                    .dims = {4U, 0U},
+                    .strides = {1U, 1U},
+                    .byte_offset = 0U,
+                },
+            };
+            for (size_t i = 0U; i < 2U; ++i) {
+                CHECK(!velri_tensor_view_is_contiguous(&bad_views[i]),
+                      "dims={4,0} must return false from velri_tensor_view_is_contiguous");
+                velri_view_id dummy_vid = VELRI_INVALID_ID;
+                CHECK(velri_graph_add_view(g, &bad_views[i], &dummy_vid) == VELRI_ERR_INVALID,
+                      "dims={4,0} must be rejected by velri_graph_add_view");
+            }
+            velri_graph_destroy(g);
+        }
+
+        /* 16e. dynamic_seq=true elemwise rejects mismatched dims[0] across reshaped views */
+        {
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "reshaped dyn elem g");
+            velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, 32U, dev);
+            velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, 32U, dev);
+            velri_view_id vx = add_view_2d_strided(g, sx, VELRI_DTYPE_F32, 4U, 8U, 8U);
+            velri_view_id vy = add_view_2d_strided(g, sy, VELRI_DTYPE_F32, 8U, 4U, 4U);
+            velri_op_desc op = {
+                .kind = VELRI_OP_ACTIVATION,
+                .num_inputs = 1U,
+                .inputs = {vx},
+                .num_outputs = 1U,
+                .outputs = {vy},
+                .dynamic_seq = true,
+                .attr.activation.kind = VELRI_ACT_SILU,
+            };
+            CHECK(velri_graph_add_op(g, &op, dev, nullptr) == VELRI_ERR_INVALID,
+                  "dynamic_seq=true elemwise must reject mismatched dims[0]");
+            velri_graph_destroy(g);
+        }
     }
 
     /* 17. Wide & Asymmetric Attention Core (d_k=768 shared, MLA prefix d_k=576/d_v=512, odd bidir) */

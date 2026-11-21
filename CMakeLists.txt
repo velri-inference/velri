@@ -25,8 +25,9 @@ else()
     find_package(VelriLib 0.1.0 EXACT CONFIG REQUIRED)
 endif()
 
-# Velri engine model architectures (thin metadata-driven graphs composed from VelriLib blocks).
+# Velri engine model layers & architectures (thin metadata-driven graphs composed from VelriLib blocks).
 add_library(velri_engine STATIC
+    src/model/layers.c
     src/model/arch/gpt2.c
 )
 target_include_directories(velri_engine PUBLIC

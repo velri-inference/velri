@@ -8,7 +8,9 @@ import norm;
 import rope;
 import elementwise;
 import linear_cpu;
+import gather_copy;
 import attention;
+import batched_linear;
 
 #define VELRI_CAT2(a, b) a##b
 #define VELRI_CAT(a, b) VELRI_CAT2(a, b)
@@ -26,19 +28,6 @@ import attention;
 #endif
 #define VSYM(name) VELRI_CAT(VELRI_CAT(velri_slang_, VELRI_ISA), VELRI_CAT(_, name))
 
-EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_scale,
-                       Ptr<float, Access.Read> w_scale, uint flags)
-{
-    EpilogueParams ep;
-    ep.bias = bias;
-    ep.x_scale = x_scale;
-    ep.w_scale = w_scale;
-    ep.has_bias = (flags & 1u);
-    ep.has_x_scale = (flags & 2u);
-    ep.has_w_scale = (flags & 4u);
-    return ep;
-}
-
 // ---- Linear (GEMV + L1-Packed BLIS Outer-Product GEMM) ----
 
 [DllExport] export __extern_cpp void VSYM(linear_f32)(
@@ -47,7 +36,7 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemF32, ElemF32, ElemF32, EpBias>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_ep(bias, bias, bias, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags));
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_f16_f32)(
@@ -56,7 +45,7 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemF16, ElemF16, ElemF32, EpBias>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_ep(bias, bias, bias, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags));
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_bf16_f32)(
@@ -65,7 +54,7 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemBF16, ElemBF16, ElemF32, EpBias>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_ep(bias, bias, bias, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags));
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_f32x_bf16w)(
@@ -74,7 +63,7 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemF32, ElemBF16, ElemF32, EpBias>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_ep(bias, bias, bias, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags));
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_f64)(
@@ -92,7 +81,7 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_w8a8_f32_slice_cpu<VELRI_MR, VELRI_NR_F32>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_ep(bias, x_scale, w_scale, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, x_scale, w_scale, flags));
 }
 
 // ---- Normalization ----
@@ -233,7 +222,7 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     quantize_rows_f32_i8_cpu(x, xs, xi8, xi8s, scale_out, r0, r1, cols);
 }
 
-// ---- Embedding, CopyLastRow, KV Append, and Scaled Dot-Product Attention ----
+// ---- Embedding, CopyLastRow, KV Append, Attention, and Batched Linear ----
 
 [DllExport] export __extern_cpp void VSYM(embedding_f32)(
     Ptr<float, Access.Read> table, uint table_stride,
@@ -276,11 +265,11 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     uint d_k, uint d_v, uint kv_pos, float scale,
     uint sliding_window, uint causal)
 {
-    attention_rows_cpu_impl<256u, 256u>(q, q_stride,
-                                        k_cache, k_head_stride, k_row_stride,
-                                        v_cache, v_head_stride, v_row_stride,
-                                        out, o_stride, w0, w1, active_t, n_heads, n_kv_heads,
-                                        d_k, d_v, kv_pos, scale, sliding_window, causal);
+    attention_rows_cpu_impl<kAttnFastHeadDim, kAttnFastHeadDim>(
+        q, q_stride, k_cache, k_head_stride, k_row_stride,
+        v_cache, v_head_stride, v_row_stride,
+        out, o_stride, w0, w1, active_t, n_heads, n_kv_heads,
+        d_k, d_v, kv_pos, scale, sliding_window, causal);
 }
 
 [DllExport] export __extern_cpp void VSYM(attention_wide_f32)(
@@ -292,11 +281,11 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     uint d_k, uint d_v, uint kv_pos, float scale,
     uint sliding_window, uint causal)
 {
-    attention_rows_cpu_impl<2048u, 2048u>(q, q_stride,
-                                          k_cache, k_head_stride, k_row_stride,
-                                          v_cache, v_head_stride, v_row_stride,
-                                          out, o_stride, w0, w1, active_t, n_heads, n_kv_heads,
-                                          d_k, d_v, kv_pos, scale, sliding_window, causal);
+    attention_rows_cpu_impl<kAttnMaxHeadDim, kAttnMaxHeadDim>(
+        q, q_stride, k_cache, k_head_stride, k_row_stride,
+        v_cache, v_head_stride, v_row_stride,
+        out, o_stride, w0, w1, active_t, n_heads, n_kv_heads,
+        d_k, d_v, kv_pos, scale, sliding_window, causal);
 }
 
 [DllExport] export __extern_cpp void VSYM(batched_linear_f32)(
