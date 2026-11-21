@@ -137,6 +137,9 @@ velri_tensor velri_b_linear(velri_builder *b, velri_tensor x, velri_tensor w,
                             velri_tensor bias_or_none);
 velri_tensor velri_b_linear_into(velri_builder *b, velri_tensor x, velri_tensor w,
                                  velri_tensor bias_or_none, velri_tensor out);
+velri_tensor velri_b_batched_linear(velri_builder *b, velri_tensor x, velri_tensor w,
+                                    velri_tensor bias_or_none, uint32_t n_heads, uint32_t n_groups,
+                                    uint32_t in_dim, uint32_t out_dim, bool weight_transposed);
 velri_tensor velri_b_layernorm(velri_builder *b, velri_tensor x, velri_tensor w,
                                velri_tensor b_opt, float eps);
 velri_tensor velri_b_rmsnorm(velri_builder *b, velri_tensor x, velri_tensor w, float eps,
@@ -153,11 +156,16 @@ velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_
                                velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
                                uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                                float scale, uint32_t sliding_window, bool causal);
-velri_tensor velri_b_latent_attention(velri_builder *b, velri_tensor q, velri_tensor h_in,
-                                      velri_tensor w_k, velri_tensor w_v, velri_tensor b_v_or_none,
-                                      velri_tensor h_cache, uint32_t n_heads, uint32_t n_kv_heads,
-                                      uint32_t head_dim, float scale, uint32_t sliding_window,
-                                      bool causal);
+velri_tensor velri_b_attention_ex(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                  velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim_k,
+                                  uint32_t head_dim_v, float scale, uint32_t sliding_window,
+                                  bool causal);
+velri_tensor velri_b_attention_inplace(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                       velri_tensor v_in, velri_tensor k_cache,
+                                       velri_tensor v_cache, uint32_t n_heads, uint32_t n_kv_heads,
+                                       uint32_t head_dim, float scale, uint32_t sliding_window,
+                                       bool causal);
 velri_tensor velri_b_copy_last_row(velri_builder *b, velri_tensor x);
 
 /* ---- High-Level Reusable Blocks & Layers ---- */
@@ -239,18 +247,41 @@ typedef struct {
     velri_dtype dtype;
 } velri_lm_head_spec;
 
+typedef struct {
+    uint32_t n_heads;
+    uint32_t n_kv_heads;
+    uint32_t head_dim_k;     /* Key/query dim d_k (1..VELRI_ATTN_MAX_HEAD_DIM) */
+    uint32_t head_dim_v;     /* Value/output dim d_v (0 => head_dim_k) */
+    uint32_t sliding_window;
+    float scale;             /* 0.0f => 1.0f / sqrt(head_dim_k) */
+    bool causal;
+    bool inplace_q;          /* Write output in-place into `q` when head_dim_k == head_dim_v (halves scratch) */
+} velri_attention_core_spec;
+
 /* Creates INPUT token_ids [max_seq_len] (recorded in manifest->token_ids_in) and embeds tokens (+ optional pos). */
 velri_tensor velri_block_embedding(velri_builder *b, const velri_embedding_spec *spec);
 
-/* Attention block: fused or split QKV projections -> zero-copy views -> KV or latent-KV attention -> o_proj. */
-velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char *prefix,
-                                   const velri_attention_spec *spec);
+/* Unified attention core block: appends K/V into cache (supports d_k != d_v & shared K==V cache)
+ * and computes scaled dot-product online-softmax attention. Shared by dense, latent, and future
+ * QSA / DSA / LSA / MLA wrappers. */
+velri_tensor velri_block_attention_core(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                        velri_tensor v_in, velri_tensor k_cache,
+                                        velri_tensor v_cache,
+                                        const velri_attention_core_spec *spec);
 
-/* Latent weight-absorbed attention block: caches arbitrary latent `h_lat` (`h_lat == x` for
- * direct input-state caching, or compressed `c_kv` for MLA) in `attn.h_cache` and absorbs
- * W_K / W_V online -> o_proj. */
+/* Dense attention wrapper: fused or split Q/K/V proj -> k/v_cache -> attention_core -> o_proj. */
+velri_tensor velri_block_dense_attention(velri_builder *b, velri_tensor x, const char *prefix,
+                                         const velri_attention_spec *spec);
+
+/* Latent weight-absorbed attention wrapper: Q proj -> BatchedLinear(Q, W_K) -> single h_cache ->
+ * unified attention_core (K==V==h_cache) -> BatchedLinear(h_bar, W_V, b_V) -> o_proj.
+ * Works for both direct input caching (`h_lat == x`) and compressed MLA (`h_lat == c_kv`). */
 velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velri_tensor h_lat,
                                           const char *prefix, const velri_attention_spec *spec);
+
+/* Convenience attention dispatcher selecting dense vs latent wrapper based on `spec->latent_kv`. */
+velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char *prefix,
+                                   const velri_attention_spec *spec);
 
 /* MLP block: standard 2-linear (in-place act) or gated 3-linear (in-place gated act). */
 velri_tensor velri_block_mlp(velri_builder *b, velri_tensor x, const char *prefix,

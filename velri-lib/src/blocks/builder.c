@@ -1051,20 +1051,64 @@ velri_tensor velri_b_add_inplace(velri_builder *b, velri_tensor a, velri_tensor 
     return emit_op(b, &op) ? a : VELRI_TENSOR_NONE;
 }
 
-velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_in,
-                               velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
-                               uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
-                               float scale, uint32_t sliding_window, bool causal) {
+velri_tensor velri_b_batched_linear(velri_builder *b, velri_tensor x, velri_tensor w,
+                                    velri_tensor bias_or_none, uint32_t n_heads, uint32_t n_groups,
+                                    uint32_t in_dim, uint32_t out_dim, bool weight_transposed) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
+    if (!x.valid || !w.valid || x.rank != 2U || w.rank != 2U ||
+        (bias_or_none.valid && bias_or_none.rank != 1U) ||
+        n_heads == 0U || n_groups == 0U || in_dim == 0U || out_dim == 0U ||
+        (n_heads % n_groups) != 0U) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    size_t out_cols = 0U;
+    if (velri_mul_overflow_size((size_t)n_heads, (size_t)out_dim, &out_cols)) {
+        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+        return VELRI_TENSOR_NONE;
+    }
+    const size_t out_dims[2] = {x.dims[0], out_cols};
+    velri_tensor out = velri_b_scratch(b, x.dtype, 2U, out_dims);
+    if (!out.valid) {
+        return VELRI_TENSOR_NONE;
+    }
+    out.is_seq_dynamic = x.is_seq_dynamic;
+
+    velri_op_desc op = init_op_desc(VELRI_OP_BATCHED_LINEAR, bias_or_none.valid ? 3U : 2U, 1U);
+    op.dynamic_seq = x.is_seq_dynamic;
+    op.inputs[0] = x.view_id;
+    op.inputs[1] = w.view_id;
+    if (bias_or_none.valid) {
+        op.inputs[2] = bias_or_none.view_id;
+    }
+    op.outputs[0] = out.view_id;
+    op.attr.batched_linear.n_heads = n_heads;
+    op.attr.batched_linear.n_groups = n_groups;
+    op.attr.batched_linear.in_dim = in_dim;
+    op.attr.batched_linear.out_dim = out_dim;
+    op.attr.batched_linear.weight_transposed = weight_transposed;
+
+    return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_b_attention_ex(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                  velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim_k,
+                                  uint32_t head_dim_v, float scale, uint32_t sliding_window,
+                                  bool causal) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    uint32_t dv = head_dim_v ? head_dim_v : head_dim_k;
     if (!q.valid || !k_in.valid || !v_in.valid || !k_cache.valid || !v_cache.valid ||
-        q.rank != 2U || n_heads == 0U || n_kv_heads == 0U || head_dim == 0U) {
+        q.rank != 2U || n_heads == 0U || n_kv_heads == 0U || head_dim_k == 0U || dv == 0U) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
     size_t attn_dim = 0U;
-    if (velri_mul_overflow_size((size_t)n_heads, (size_t)head_dim, &attn_dim)) {
+    if (velri_mul_overflow_size((size_t)n_heads, (size_t)dv, &attn_dim)) {
         velri_b_set_error(b, VELRI_ERR_OVERFLOW);
         return VELRI_TENSOR_NONE;
     }
@@ -1086,7 +1130,8 @@ velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_
     op.outputs[2] = v_cache.view_id;
     op.attr.attention.n_heads = n_heads;
     op.attr.attention.n_kv_heads = n_kv_heads;
-    op.attr.attention.head_dim = head_dim;
+    op.attr.attention.head_dim = head_dim_k;
+    op.attr.attention.v_head_dim = dv;
     op.attr.attention.scale = scale;
     op.attr.attention.sliding_window = sliding_window;
     op.attr.attention.causal = causal;
@@ -1094,53 +1139,46 @@ velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_
     return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
 }
 
-velri_tensor velri_b_latent_attention(velri_builder *b, velri_tensor q, velri_tensor h_in,
-                                      velri_tensor w_k, velri_tensor w_v, velri_tensor b_v_or_none,
-                                      velri_tensor h_cache, uint32_t n_heads, uint32_t n_kv_heads,
-                                      uint32_t head_dim, float scale, uint32_t sliding_window,
-                                      bool causal) {
+velri_tensor velri_b_attention_inplace(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                       velri_tensor v_in, velri_tensor k_cache,
+                                       velri_tensor v_cache, uint32_t n_heads, uint32_t n_kv_heads,
+                                       uint32_t head_dim, float scale, uint32_t sliding_window,
+                                       bool causal) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
-    if (!q.valid || !h_in.valid || !w_k.valid || !w_v.valid || !h_cache.valid ||
-        q.rank != 2U || h_in.rank != 2U || w_k.rank != 2U || w_v.rank != 2U ||
-        h_cache.rank != 2U || (b_v_or_none.valid && b_v_or_none.rank != 1U) ||
-        n_heads == 0U || n_kv_heads == 0U || head_dim == 0U) {
+    if (!q.valid || !k_in.valid || !v_in.valid || !k_cache.valid || !v_cache.valid ||
+        q.rank != 2U || n_heads == 0U || n_kv_heads == 0U || head_dim == 0U) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-    size_t attn_dim = 0U;
-    if (velri_mul_overflow_size((size_t)n_heads, (size_t)head_dim, &attn_dim)) {
-        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
-        return VELRI_TENSOR_NONE;
-    }
 
-    const size_t out_dims[2] = {q.dims[0], attn_dim};
-    velri_tensor out = velri_b_scratch(b, q.dtype, 2U, out_dims);
-    if (!out.valid) {
-        return VELRI_TENSOR_NONE;
-    }
-    out.is_seq_dynamic = true;
-
-    velri_op_desc op = init_op_desc(VELRI_OP_LATENT_ATTENTION, b_v_or_none.valid ? 5U : 4U, 2U);
+    velri_op_desc op = init_op_desc(VELRI_OP_ATTENTION, 3U, 3U);
     op.dynamic_seq = true;
     op.inputs[0] = q.view_id;
-    op.inputs[1] = h_in.view_id;
-    op.inputs[2] = w_k.view_id;
-    op.inputs[3] = w_v.view_id;
-    if (b_v_or_none.valid) {
-        op.inputs[4] = b_v_or_none.view_id;
-    }
-    op.outputs[0] = out.view_id;
-    op.outputs[1] = h_cache.view_id;
+    op.inputs[1] = k_in.view_id;
+    op.inputs[2] = v_in.view_id;
+    op.outputs[0] = q.view_id;
+    op.outputs[1] = k_cache.view_id;
+    op.outputs[2] = v_cache.view_id;
     op.attr.attention.n_heads = n_heads;
     op.attr.attention.n_kv_heads = n_kv_heads;
     op.attr.attention.head_dim = head_dim;
+    op.attr.attention.v_head_dim = head_dim;
     op.attr.attention.scale = scale;
     op.attr.attention.sliding_window = sliding_window;
     op.attr.attention.causal = causal;
 
-    return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
+    q.is_seq_dynamic = true;
+    return emit_op(b, &op) ? q : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                               velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
+                               uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                               float scale, uint32_t sliding_window, bool causal) {
+    return velri_b_attention_ex(b, q, k_in, v_in, k_cache, v_cache, n_heads, n_kv_heads, head_dim,
+                                head_dim, scale, sliding_window, causal);
 }
 
 velri_tensor velri_b_copy_last_row(velri_builder *b, velri_tensor x) {

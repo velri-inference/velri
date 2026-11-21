@@ -387,7 +387,7 @@ static velri_status validate_dynamic_params(const velri_plan *plan,
                     return VELRI_ERR_INVALID;
                 }
             }
-        } else if (op->kind == VELRI_OP_ATTENTION || op->kind == VELRI_OP_LATENT_ATTENTION) {
+        } else if (op->kind == VELRI_OP_ATTENTION) {
             size_t active_t = velri_effective_rows(op, op->inputs[0].dims[0], params);
             size_t kv_pos = params->has_kv_len
                                 ? params->kv_len_override
@@ -396,9 +396,7 @@ static velri_status validate_dynamic_params(const velri_plan *plan,
             if (velri_add_overflow_size(kv_pos, active_t, &kv_end)) {
                 return VELRI_ERR_OVERFLOW;
             }
-            size_t max_ctx = (op->kind == VELRI_OP_ATTENTION) ? op->outputs[1].dims[1]
-                                                              : op->outputs[1].dims[0];
-            if (kv_end > max_ctx) {
+            if (kv_end > op->outputs[1].dims[1]) {
                 return VELRI_ERR_INVALID;
             }
         }

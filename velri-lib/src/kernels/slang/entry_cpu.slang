@@ -256,48 +256,57 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
 [DllExport] export __extern_cpp void VSYM(kv_append_f32)(
     Ptr<float, Access.Read> k_in, uint k_stride,
     Ptr<float, Access.Read> v_in, uint v_stride,
-    Ptr<float> k_cache, Ptr<float> v_cache,
+    Ptr<float> k_cache, uint k_head_stride, uint k_row_stride,
+    Ptr<float> v_cache, uint v_head_stride, uint v_row_stride,
     uint same_kv_cache, uint kvh0, uint kvh1,
-    uint active_t, uint kv_pos, uint max_ctx, uint head_dim)
+    uint active_t, uint kv_pos, uint d_k, uint d_v)
 {
-    kv_append_cpu(k_in, k_stride, v_in, v_stride, k_cache, v_cache, same_kv_cache,
-                  kvh0, kvh1, active_t, kv_pos, max_ctx, head_dim);
+    kv_append_cpu(k_in, k_stride, v_in, v_stride,
+                  k_cache, k_head_stride, k_row_stride,
+                  v_cache, v_head_stride, v_row_stride,
+                  same_kv_cache, kvh0, kvh1, active_t, kv_pos, d_k, d_v);
 }
 
-[DllExport] export __extern_cpp void VSYM(attention_f32)(
+[DllExport] export __extern_cpp void VSYM(attention_small_f32)(
     Ptr<float, Access.Read> q, uint q_stride,
-    Ptr<float, Access.Read> k_cache, Ptr<float, Access.Read> v_cache,
+    Ptr<float, Access.Read> k_cache, uint k_head_stride, uint k_row_stride,
+    Ptr<float, Access.Read> v_cache, uint v_head_stride, uint v_row_stride,
     Ptr<float> out, uint o_stride,
     uint w0, uint w1, uint active_t, uint n_heads, uint n_kv_heads,
-    uint head_dim, uint kv_pos, uint max_ctx, float scale,
+    uint d_k, uint d_v, uint kv_pos, float scale,
     uint sliding_window, uint causal)
 {
-    attention_rows_cpu(q, q_stride, k_cache, v_cache, out, o_stride,
-                       w0, w1, active_t, n_heads, n_kv_heads, head_dim,
-                       kv_pos, max_ctx, scale, sliding_window, causal);
+    attention_rows_cpu_impl<256u, 256u>(q, q_stride,
+                                        k_cache, k_head_stride, k_row_stride,
+                                        v_cache, v_head_stride, v_row_stride,
+                                        out, o_stride, w0, w1, active_t, n_heads, n_kv_heads,
+                                        d_k, d_v, kv_pos, scale, sliding_window, causal);
 }
 
-[DllExport] export __extern_cpp void VSYM(latent_append_f32)(
-    Ptr<float, Access.Read> h_in, uint h_stride,
-    Ptr<float> h_cache,
-    uint t0, uint t1, uint kv_pos, uint d_lat)
-{
-    latent_append_cpu(h_in, h_stride, h_cache, t0, t1, kv_pos, d_lat);
-}
-
-[DllExport] export __extern_cpp void VSYM(latent_attention_f32)(
+[DllExport] export __extern_cpp void VSYM(attention_wide_f32)(
     Ptr<float, Access.Read> q, uint q_stride,
-    Ptr<float, Access.Read> h_cache,
-    Ptr<float, Access.Read> w_k, uint wk_stride,
-    Ptr<float, Access.Read> w_v, uint wv_stride,
-    Ptr<float, Access.Read> b_v, uint has_bv,
+    Ptr<float, Access.Read> k_cache, uint k_head_stride, uint k_row_stride,
+    Ptr<float, Access.Read> v_cache, uint v_head_stride, uint v_row_stride,
     Ptr<float> out, uint o_stride,
     uint w0, uint w1, uint active_t, uint n_heads, uint n_kv_heads,
-    uint head_dim, uint d_lat, uint kv_pos, float scale,
+    uint d_k, uint d_v, uint kv_pos, float scale,
     uint sliding_window, uint causal)
 {
-    latent_attention_rows_cpu(q, q_stride, h_cache, w_k, wk_stride, w_v, wv_stride,
-                              b_v, has_bv, out, o_stride, w0, w1, active_t, n_heads,
-                              n_kv_heads, head_dim, d_lat, kv_pos, scale,
-                              sliding_window, causal);
+    attention_rows_cpu_impl<2048u, 2048u>(q, q_stride,
+                                          k_cache, k_head_stride, k_row_stride,
+                                          v_cache, v_head_stride, v_row_stride,
+                                          out, o_stride, w0, w1, active_t, n_heads, n_kv_heads,
+                                          d_k, d_v, kv_pos, scale, sliding_window, causal);
+}
+
+[DllExport] export __extern_cpp void VSYM(batched_linear_f32)(
+    Ptr<float, Access.Read> x, uint x_stride,
+    Ptr<float, Access.Read> w, uint w_stride,
+    Ptr<float, Access.Read> bias, uint has_bias,
+    Ptr<float> y, uint y_stride,
+    uint w0, uint w1, uint n_heads, uint n_groups,
+    uint in_dim, uint out_dim, uint weight_transposed)
+{
+    batched_linear_rows_cpu(x, x_stride, w, w_stride, bias, has_bias, y, y_stride,
+                            w0, w1, n_heads, n_groups, in_dim, out_dim, weight_transposed);
 }

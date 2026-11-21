@@ -64,17 +64,20 @@
     X(embedding_f32, (const float *, uint32_t, const int32_t *, uint32_t, uint32_t, uint32_t,      \
                       float *, uint32_t, uint32_t, uint32_t, uint32_t))                            \
     X(copy_last_row_f32, (const float *, uint32_t, float *, uint32_t, uint32_t))                   \
-    X(kv_append_f32, (const float *, uint32_t, const float *, uint32_t, float *, float *,          \
-                      uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))       \
-    X(attention_f32, (const float *, uint32_t, const float *, const float *, float *, uint32_t,    \
-                      uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,        \
-                      uint32_t, float, uint32_t, uint32_t))                                        \
-    X(latent_append_f32, (const float *, uint32_t, float *, uint32_t, uint32_t, uint32_t,          \
-                          uint32_t))                                                               \
-    X(latent_attention_f32, (const float *, uint32_t, const float *, const float *, uint32_t,      \
-                             const float *, uint32_t, const float *, uint32_t, float *, uint32_t,  \
-                             uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, \
-                             uint32_t, float, uint32_t, uint32_t))
+    X(kv_append_f32, (const float *, uint32_t, const float *, uint32_t, float *, uint32_t,         \
+                      uint32_t, float *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,         \
+                      uint32_t, uint32_t, uint32_t, uint32_t))                                     \
+    X(attention_small_f32, (const float *, uint32_t, const float *, uint32_t, uint32_t,            \
+                            const float *, uint32_t, uint32_t, float *, uint32_t, uint32_t,        \
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,  \
+                            float, uint32_t, uint32_t))                                            \
+    X(attention_wide_f32, (const float *, uint32_t, const float *, uint32_t, uint32_t,             \
+                           const float *, uint32_t, uint32_t, float *, uint32_t, uint32_t,         \
+                           uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,   \
+                           float, uint32_t, uint32_t))                                             \
+    X(batched_linear_f32, (const float *, uint32_t, const float *, uint32_t, const float *,        \
+                           uint32_t, float *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,    \
+                           uint32_t, uint32_t, uint32_t))
 
 #define DECL_BASE(NAME, SIG) extern void velri_slang_base_##NAME SIG;
 SLANG_CPU_KERNELS(DECL_BASE)
@@ -342,26 +345,17 @@ static void cpu_kv_append_worker(void *vctx, size_t wid, size_t nw) {
     uint32_t kvh0 = 0U, kvh1 = 0U;
     split_1d(op->raw.attr.attention.n_kv_heads, wid, nw, &kvh0, &kvh1);
     if (kvh0 >= kvh1) return;
+    uint32_t dk = op->raw.attr.attention.head_dim;
+    uint32_t dv = op->raw.attr.attention.v_head_dim ? op->raw.attr.attention.v_head_dim : dk;
     c->vt->kv_append_f32((const float *)binding_cptr(&c->in_b[1]),
                          (uint32_t)op->inputs[1].strides[0],
                          (const float *)binding_cptr(&c->in_b[2]),
                          (uint32_t)op->inputs[2].strides[0],
                          (float *)binding_ptr(&c->out_b[1]),
-                         (float *)binding_ptr(&c->out_b[2]), c->same_kv_cache, kvh0, kvh1,
-                         c->active_rows, c->kv_pos, (uint32_t)op->outputs[1].dims[1],
-                         op->raw.attr.attention.head_dim);
-}
-
-static void cpu_latent_append_worker(void *vctx, size_t wid, size_t nw) {
-    const cpu_dispatch_ctx *c = (const cpu_dispatch_ctx *)vctx;
-    const velri_resolved_op *op = c->op;
-    uint32_t t0 = 0U, t1 = 0U;
-    split_1d(c->active_rows, wid, nw, &t0, &t1);
-    if (t0 >= t1) return;
-    c->vt->latent_append_f32((const float *)binding_cptr(&c->in_b[1]),
-                             (uint32_t)op->inputs[1].strides[0],
-                             (float *)binding_ptr(&c->out_b[1]), t0, t1, c->kv_pos,
-                             (uint32_t)op->inputs[1].dims[1]);
+                         (uint32_t)op->outputs[1].strides[0], (uint32_t)op->outputs[1].strides[1],
+                         (float *)binding_ptr(&c->out_b[2]),
+                         (uint32_t)op->outputs[2].strides[0], (uint32_t)op->outputs[2].strides[1],
+                         c->same_kv_cache, kvh0, kvh1, c->active_rows, c->kv_pos, dk, dv);
 }
 
 static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
@@ -633,17 +627,39 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
         uint32_t w0 = 0U, w1 = 0U;
         split_1d(c->attn_work, wid, nw, &w0, &w1);
         if (w0 >= w1) return;
-        vt->attention_f32((const float *)binding_cptr(&c->in_b[0]),
-                          (uint32_t)op->inputs[0].strides[0],
-                          (const float *)binding_cptr(&c->out_b[1]),
-                          (const float *)binding_cptr(&c->out_b[2]),
-                          (float *)binding_ptr(&c->out_b[0]),
-                          (uint32_t)op->outputs[0].strides[0], w0, w1, c->active_rows,
-                          op->raw.attr.attention.n_heads, op->raw.attr.attention.n_kv_heads,
-                          op->raw.attr.attention.head_dim, c->kv_pos,
-                          (uint32_t)op->outputs[1].dims[1], c->attn_scale,
-                          op->raw.attr.attention.sliding_window,
-                          op->raw.attr.attention.causal ? 1U : 0U);
+        uint32_t dk = op->raw.attr.attention.head_dim;
+        uint32_t dv = op->raw.attr.attention.v_head_dim ? op->raw.attr.attention.v_head_dim : dk;
+        if (dk <= 256U && dv <= 256U) {
+            vt->attention_small_f32((const float *)binding_cptr(&c->in_b[0]),
+                                    (uint32_t)op->inputs[0].strides[0],
+                                    (const float *)binding_cptr(&c->out_b[1]),
+                                    (uint32_t)op->outputs[1].strides[0],
+                                    (uint32_t)op->outputs[1].strides[1],
+                                    (const float *)binding_cptr(&c->out_b[2]),
+                                    (uint32_t)op->outputs[2].strides[0],
+                                    (uint32_t)op->outputs[2].strides[1],
+                                    (float *)binding_ptr(&c->out_b[0]),
+                                    (uint32_t)op->outputs[0].strides[0], w0, w1, c->active_rows,
+                                    op->raw.attr.attention.n_heads,
+                                    op->raw.attr.attention.n_kv_heads, dk, dv, c->kv_pos,
+                                    c->attn_scale, op->raw.attr.attention.sliding_window,
+                                    op->raw.attr.attention.causal ? 1U : 0U);
+        } else {
+            vt->attention_wide_f32((const float *)binding_cptr(&c->in_b[0]),
+                                   (uint32_t)op->inputs[0].strides[0],
+                                   (const float *)binding_cptr(&c->out_b[1]),
+                                   (uint32_t)op->outputs[1].strides[0],
+                                   (uint32_t)op->outputs[1].strides[1],
+                                   (const float *)binding_cptr(&c->out_b[2]),
+                                   (uint32_t)op->outputs[2].strides[0],
+                                   (uint32_t)op->outputs[2].strides[1],
+                                   (float *)binding_ptr(&c->out_b[0]),
+                                   (uint32_t)op->outputs[0].strides[0], w0, w1, c->active_rows,
+                                   op->raw.attr.attention.n_heads,
+                                   op->raw.attr.attention.n_kv_heads, dk, dv, c->kv_pos,
+                                   c->attn_scale, op->raw.attr.attention.sliding_window,
+                                   op->raw.attr.attention.causal ? 1U : 0U);
+        }
         break;
     }
 
@@ -656,28 +672,24 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
         break;
     }
 
-    case VELRI_OP_LATENT_ATTENTION: {
+    case VELRI_OP_BATCHED_LINEAR: {
         uint32_t w0 = 0U, w1 = 0U;
         split_1d(c->attn_work, wid, nw, &w0, &w1);
         if (w0 >= w1) return;
-        const float *bv = (op->num_inputs > 4U && op->input_present[4])
-                              ? (const float *)binding_cptr(&c->in_b[4])
-                              : nullptr;
-        vt->latent_attention_f32((const float *)binding_cptr(&c->in_b[0]),
-                                 (uint32_t)op->inputs[0].strides[0],
-                                 (const float *)binding_cptr(&c->out_b[1]),
-                                 (const float *)binding_cptr(&c->in_b[2]),
-                                 (uint32_t)op->inputs[2].strides[0],
-                                 (const float *)binding_cptr(&c->in_b[3]),
-                                 (uint32_t)op->inputs[3].strides[0], bv, bv ? 1U : 0U,
-                                 (float *)binding_ptr(&c->out_b[0]),
-                                 (uint32_t)op->outputs[0].strides[0], w0, w1, c->active_rows,
-                                 op->raw.attr.attention.n_heads,
-                                 op->raw.attr.attention.n_kv_heads,
-                                 op->raw.attr.attention.head_dim,
-                                 (uint32_t)op->inputs[1].dims[1], c->kv_pos, c->attn_scale,
-                                 op->raw.attr.attention.sliding_window,
-                                 op->raw.attr.attention.causal ? 1U : 0U);
+        const float *bias = (op->num_inputs > 2U && op->input_present[2])
+                                ? (const float *)binding_cptr(&c->in_b[2])
+                                : nullptr;
+        vt->batched_linear_f32((const float *)binding_cptr(&c->in_b[0]),
+                               (uint32_t)op->inputs[0].strides[0],
+                               (const float *)binding_cptr(&c->in_b[1]),
+                               (uint32_t)op->inputs[1].strides[0], bias, bias ? 1U : 0U,
+                               (float *)binding_ptr(&c->out_b[0]),
+                               (uint32_t)op->outputs[0].strides[0], w0, w1,
+                               op->raw.attr.batched_linear.n_heads,
+                               op->raw.attr.batched_linear.n_groups,
+                               op->raw.attr.batched_linear.in_dim,
+                               op->raw.attr.batched_linear.out_dim,
+                               op->raw.attr.batched_linear.weight_transposed ? 1U : 0U);
         break;
     }
 
@@ -828,46 +840,20 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         work_units = 1U;
         break;
     }
-    case VELRI_OP_LATENT_ATTENTION: {
+    case VELRI_OP_BATCHED_LINEAR: {
         size_t active_t = velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         if (active_t == 0U) {
             return VELRI_ERR_INVALID;
         }
-        uint32_t nh = op->raw.attr.attention.n_heads;
-        uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
-        uint32_t hd = op->raw.attr.attention.head_dim;
-        size_t d_lat = op->inputs[1].dims[1];
-        if (nh == 0U || nkvh == 0U || hd == 0U || hd > 256U || (nh % nkvh) != 0U ||
-            d_lat == 0U || d_lat > 2048U) {
-            return VELRI_ERR_INVALID;
-        }
-        size_t kv_pos = (item->params && item->params->has_kv_len)
-                            ? item->params->kv_len_override
-                            : ((item->params && item->params->has_pos_offset)
-                                   ? item->params->pos_offset_override
-                                   : 0U);
-        size_t kv_end = 0U;
-        if (active_t > (size_t)UINT32_MAX || kv_pos > (size_t)UINT32_MAX ||
-            velri_add_overflow_size(kv_pos, active_t, &kv_end)) {
-            return VELRI_ERR_OVERFLOW;
-        }
-        if (kv_end > op->outputs[1].dims[0]) {
-            return VELRI_ERR_INVALID;
-        }
-        if (kv_end > (size_t)UINT32_MAX) {
-            return VELRI_ERR_OVERFLOW;
-        }
-        size_t attn_work = 0U;
-        if (velri_mul_overflow_size(active_t, (size_t)nh, &attn_work) ||
-            attn_work > (size_t)UINT32_MAX) {
+        size_t work = 0U;
+        if (active_t > (size_t)UINT32_MAX ||
+            velri_mul_overflow_size(active_t, (size_t)op->raw.attr.batched_linear.n_heads, &work) ||
+            work > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
         ctx.active_rows = (uint32_t)active_t;
-        ctx.kv_pos = (uint32_t)kv_pos;
-        ctx.attn_work = (uint32_t)attn_work;
-        ctx.attn_scale = (op->raw.attr.attention.scale > 0.0f) ? op->raw.attr.attention.scale
-                                                               : (1.0f / sqrtf((float)hd));
-        work_units = attn_work;
+        ctx.attn_work = (uint32_t)work;
+        work_units = work;
         break;
     }
     default:
@@ -887,28 +873,16 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
     if (op->kind == VELRI_OP_ATTENTION) {
         /* Stage 1: append K/V tokens into cache before any worker reads the cache. */
         uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
+        uint32_t dk = op->raw.attr.attention.head_dim;
+        uint32_t dv = op->raw.attr.attention.v_head_dim ? op->raw.attr.attention.v_head_dim : dk;
         uint64_t kv_elems = (uint64_t)ctx.active_rows * (uint64_t)nkvh *
-                            (uint64_t)op->raw.attr.attention.head_dim;
+                            (uint64_t)(dk > dv ? dk : dv);
         if (use_pool && use_nw > 1U && nkvh > 1U && kv_elems >= 4096ULL) {
             velri_pool_parallel(use_pool, use_nw, cpu_kv_append_worker, &ctx);
         } else {
             cpu_kv_append_worker(&ctx, 0U, 1U);
         }
         /* Stage 2: parallel attention across active_t * n_heads. */
-        if (use_pool && use_nw > 1U) {
-            velri_pool_parallel(use_pool, use_nw, cpu_op_worker, &ctx);
-        } else {
-            cpu_op_worker(&ctx, 0U, 1U);
-        }
-    } else if (op->kind == VELRI_OP_LATENT_ATTENTION) {
-        /* Stage 1: append latent rows into H_cache before any worker reads H_cache. */
-        uint64_t h_elems = (uint64_t)ctx.active_rows * (uint64_t)op->inputs[1].dims[1];
-        if (use_pool && use_nw > 1U && ctx.active_rows > 1U && h_elems >= 4096ULL) {
-            velri_pool_parallel(use_pool, use_nw, cpu_latent_append_worker, &ctx);
-        } else {
-            cpu_latent_append_worker(&ctx, 0U, 1U);
-        }
-        /* Stage 2: parallel latent attention across active_t * n_heads. */
         if (use_pool && use_nw > 1U) {
             velri_pool_parallel(use_pool, use_nw, cpu_op_worker, &ctx);
         } else {

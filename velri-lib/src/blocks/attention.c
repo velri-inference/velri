@@ -125,6 +125,35 @@ static velri_tensor apply_output_proj(velri_builder *b, velri_tensor attn, const
     return velri_b_linear(b, attn, o_w, o_b);
 }
 
+velri_tensor velri_block_attention_core(velri_builder *b, velri_tensor q, velri_tensor k_in,
+                                        velri_tensor v_in, velri_tensor k_cache,
+                                        velri_tensor v_cache,
+                                        const velri_attention_core_spec *spec) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    if (!spec || spec->n_heads == 0U || spec->n_kv_heads == 0U || spec->head_dim_k == 0U ||
+        spec->head_dim_k > VELRI_ATTN_MAX_HEAD_DIM ||
+        spec->head_dim_v > VELRI_ATTN_MAX_HEAD_DIM ||
+        (spec->n_heads % spec->n_kv_heads) != 0U) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    if (spec->scale != 0.0f && (!(spec->scale > 0.0f) || !isfinite(spec->scale))) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    uint32_t dv = spec->head_dim_v ? spec->head_dim_v : spec->head_dim_k;
+    if (spec->inplace_q && dv == spec->head_dim_k) {
+        return velri_b_attention_inplace(b, q, k_in, v_in, k_cache, v_cache, spec->n_heads,
+                                         spec->n_kv_heads, spec->head_dim_k, spec->scale,
+                                         spec->sliding_window, spec->causal);
+    }
+    return velri_b_attention_ex(b, q, k_in, v_in, k_cache, v_cache, spec->n_heads, spec->n_kv_heads,
+                                spec->head_dim_k, dv, spec->scale, spec->sliding_window,
+                                spec->causal);
+}
+
 velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velri_tensor h_lat,
                                           const char *prefix, const velri_attention_spec *spec) {
     if (!b || b->err != VELRI_OK) {
@@ -139,7 +168,12 @@ velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velr
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-    if (h_lat.dims[1] > VELRI_LATENT_ATTN_MAX_DLAT) {
+    if (x.dtype != VELRI_DTYPE_F32 || h_lat.dtype != VELRI_DTYPE_F32 ||
+        spec->dtype != VELRI_DTYPE_F32) {
+        velri_b_set_error(b, VELRI_ERR_UNSUPPORTED);
+        return VELRI_TENSOR_NONE;
+    }
+    if (h_lat.dims[1] > VELRI_ATTN_MAX_HEAD_DIM) {
         velri_b_set_error(b, VELRI_ERR_UNSUPPORTED);
         return VELRI_TENSOR_NONE;
     }
@@ -157,7 +191,7 @@ velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velr
     }
 
     size_t d_model = x.dims[1];
-    size_t d_lat = h_lat.dims[1];
+    uint32_t d_lat = (uint32_t)h_lat.dims[1];
     velri_dtype act_dtype =
         (x.dtype == VELRI_DTYPE_F64 && spec->dtype == VELRI_DTYPE_F64) ? VELRI_DTYPE_F64
                                                                        : VELRI_DTYPE_F32;
@@ -200,16 +234,36 @@ velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velr
         q = velri_b_linear(b, x, q_w, q_b);
     }
 
+    /* 1. Weight absorption: q_abs[t, h] = q[t, h] @ W_K[kvh] ([T, n_heads * d_lat]). */
+    velri_tensor q_abs = velri_b_batched_linear(b, q, w_k, VELRI_TENSOR_NONE, spec->n_heads,
+                                                spec->n_kv_heads, spec->head_dim, d_lat, true);
+
+    /* 2. Unified attention core over single shared latent cache H_cache [1, max_ctx, d_lat].
+     *    Scale uses the original head_dim (not d_lat) because Q_abs . H^T == Q . (H W_K^T)^T. */
     char h_cache_name[VELRI_MANIFEST_NAME_MAX];
     if (!format_tensor_name(b, h_cache_name, prefix, "attn.h_cache", nullptr)) {
         return VELRI_TENSOR_NONE;
     }
-    const size_t dim_h[2] = {spec->max_ctx, d_lat};
-    velri_tensor h_cache = velri_b_state(b, h_cache_name, h_lat.dtype, 2U, dim_h);
+    const size_t dim_h[3] = {1U, spec->max_ctx, d_lat};
+    velri_tensor h_cache = velri_b_state(b, h_cache_name, h_lat.dtype, 3U, dim_h);
 
-    velri_tensor attn = velri_b_latent_attention(b, q, h_lat, w_k, w_v, b_v, h_cache, spec->n_heads,
-                                                 spec->n_kv_heads, spec->head_dim, spec->scale,
-                                                 spec->sliding_window, spec->causal);
+    const velri_attention_core_spec core = {
+        .n_heads = spec->n_heads,
+        .n_kv_heads = 1U,
+        .head_dim_k = d_lat,
+        .head_dim_v = d_lat,
+        .sliding_window = spec->sliding_window,
+        .scale = (spec->scale > 0.0f) ? spec->scale : (1.0f / sqrtf((float)spec->head_dim)),
+        .causal = spec->causal,
+        .inplace_q = true,
+    };
+    velri_tensor h_bar =
+        velri_block_attention_core(b, q_abs, h_lat, h_lat, h_cache, h_cache, &core);
+
+    /* 3. Value projection: attn[t, h] = h_bar[t, h] @ W_V[kvh]^T + b_V[kvh]. */
+    velri_tensor attn = velri_b_batched_linear(b, h_bar, w_v, b_v, spec->n_heads, spec->n_kv_heads,
+                                               d_lat, spec->head_dim, false);
+
     velri_tensor out = apply_output_proj(b, attn, prefix, spec, act_dtype, d_model, q_dim);
 
     if (spec->scope) {
@@ -218,13 +272,10 @@ velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velr
     return (b->err == VELRI_OK) ? out : VELRI_TENSOR_NONE;
 }
 
-velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char *prefix,
-                                   const velri_attention_spec *spec) {
+velri_tensor velri_block_dense_attention(velri_builder *b, velri_tensor x, const char *prefix,
+                                         const velri_attention_spec *spec) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
-    }
-    if (spec && spec->latent_kv) {
-        return velri_block_latent_attention(b, x, x, prefix, spec);
     }
 
     size_t q_dim = 0U, kv_dim = 0U, qkv_dim = 0U;
@@ -287,13 +338,31 @@ velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char 
     velri_tensor k_cache = velri_b_state(b, k_cache_name, act_dtype, 3U, dim_kv);
     velri_tensor v_cache = velri_b_state(b, v_cache_name, act_dtype, 3U, dim_kv);
 
-    velri_tensor attn = velri_b_attention(b, q, k, v, k_cache, v_cache, spec->n_heads,
-                                          spec->n_kv_heads, spec->head_dim, spec->scale,
-                                          spec->sliding_window, spec->causal);
+    const velri_attention_core_spec core = {
+        .n_heads = spec->n_heads,
+        .n_kv_heads = spec->n_kv_heads,
+        .head_dim_k = spec->head_dim,
+        .head_dim_v = spec->head_dim,
+        .sliding_window = spec->sliding_window,
+        .scale = spec->scale,
+        .causal = spec->causal,
+    };
+    velri_tensor attn = velri_block_attention_core(b, q, k, v, k_cache, v_cache, &core);
     velri_tensor out = apply_output_proj(b, attn, prefix, spec, act_dtype, d_model, q_dim);
 
     if (spec->scope) {
         velri_b_pop_scope(b);
     }
     return (b->err == VELRI_OK) ? out : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char *prefix,
+                                   const velri_attention_spec *spec) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    if (spec && spec->latent_kv) {
+        return velri_block_latent_attention(b, x, x, prefix, spec);
+    }
+    return velri_block_dense_attention(b, x, prefix, spec);
 }

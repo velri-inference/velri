@@ -127,33 +127,31 @@ static_assert(sizeof(vk_copy_last_row_args) == 32, "CopyLastRowArgs size mismatc
 
 typedef struct {
     uint64_t k_in, v_in, k_cache, v_cache;
-    uint32_t rows, n_kv_heads, head_dim, max_ctx, kv_pos, k_stride, v_stride, same_kv_cache;
+    uint32_t rows, n_kv_heads, d_k, d_v, max_ctx, kv_pos;
+    uint32_t k_stride, v_stride;
+    uint32_t k_head_stride, k_row_stride;
+    uint32_t v_head_stride, v_row_stride;
+    uint32_t same_kv_cache, pad;
 } vk_kv_append_args;
-static_assert(sizeof(vk_kv_append_args) == 64, "KvAppendArgs size mismatch");
+static_assert(sizeof(vk_kv_append_args) == 88, "KvAppendArgs size mismatch");
 
 typedef struct {
     uint64_t q, k_cache, v_cache, out;
-    uint32_t rows, n_heads, n_kv_heads, head_dim, max_ctx, kv_pos;
-    uint32_t q_stride, o_stride, sliding_window, causal;
+    uint32_t rows, n_heads, n_kv_heads, d_k, d_v, max_ctx, kv_pos;
+    uint32_t q_stride, o_stride;
+    uint32_t k_head_stride, k_row_stride;
+    uint32_t v_head_stride, v_row_stride;
+    uint32_t sliding_window, causal;
     float scale;
-    uint32_t pad;
 } vk_attention_args;
-static_assert(sizeof(vk_attention_args) == 80, "AttentionArgs size mismatch");
+static_assert(sizeof(vk_attention_args) == 96, "AttentionArgs size mismatch");
 
 typedef struct {
-    uint64_t h_in, h_cache;
-    uint32_t rows, d_lat, kv_pos, h_stride;
-} vk_latent_append_args;
-static_assert(sizeof(vk_latent_append_args) == 32, "LatentAppendArgs size mismatch");
-
-typedef struct {
-    uint64_t q, wk, wv, bv, h_cache, y;
-    uint32_t rows, n_heads, n_kv_heads, head_dim, d_lat, max_ctx, kv_pos;
-    uint32_t q_stride, wk_stride, wv_stride, o_stride, sliding_window;
-    float scale;
-    uint32_t flags;
-} vk_latent_attention_args;
-static_assert(sizeof(vk_latent_attention_args) == 104, "LatentAttentionArgs size mismatch");
+    uint64_t x, w, bias, y;
+    uint32_t rows, n_heads, n_groups, in_dim, out_dim;
+    uint32_t x_stride, w_stride, y_stride, flags, pad;
+} vk_batched_linear_args;
+static_assert(sizeof(vk_batched_linear_args) == 72, "BatchedLinearArgs size mismatch");
 
 /* ---- Capability Bitmask & Table-Driven Pipelines ---- */
 
@@ -204,8 +202,9 @@ enum {
     PIPE_KV_APPEND_F32,
     PIPE_ATTENTION_DECODE_F32,
     PIPE_ATTENTION_PREFILL_F32,
-    PIPE_LATENT_APPEND_F32,
-    PIPE_LATENT_ATTENTION_F32,
+    PIPE_ATTENTION_WIDE_F32,
+    PIPE_BATCHED_LINEAR_NT_F32,
+    PIPE_BATCHED_LINEAR_NN_F32,
     PIPE_COUNT
 };
 
@@ -250,8 +249,9 @@ static const vk_pipe_spec k_pipes[PIPE_COUNT] = {
     [PIPE_KV_APPEND_F32]         = {spv_vk_kv_append_f32, spv_vk_kv_append_f32_bytes, VK_CAP_NONE},
     [PIPE_ATTENTION_DECODE_F32]  = {spv_vk_attention_decode_f32, spv_vk_attention_decode_f32_bytes, VK_CAP_NONE},
     [PIPE_ATTENTION_PREFILL_F32] = {spv_vk_attention_prefill_f32, spv_vk_attention_prefill_f32_bytes, VK_CAP_NONE},
-    [PIPE_LATENT_APPEND_F32]     = {spv_vk_latent_append_f32, spv_vk_latent_append_f32_bytes, VK_CAP_NONE},
-    [PIPE_LATENT_ATTENTION_F32]  = {spv_vk_latent_attention_f32, spv_vk_latent_attention_f32_bytes, VK_CAP_NONE},
+    [PIPE_ATTENTION_WIDE_F32]    = {spv_vk_attention_wide_f32, spv_vk_attention_wide_f32_bytes, VK_CAP_NONE},
+    [PIPE_BATCHED_LINEAR_NT_F32] = {spv_vk_batched_linear_nt_f32, spv_vk_batched_linear_nt_f32_bytes, VK_CAP_NONE},
+    [PIPE_BATCHED_LINEAR_NN_F32] = {spv_vk_batched_linear_nn_f32, spv_vk_batched_linear_nn_f32_bytes, VK_CAP_NONE},
 };
 
 /* ---- X-Macro Vulkan Loader Tables ---- */
@@ -340,7 +340,7 @@ struct velri_prepared_op {
     int pipe_id;
     int alt_pipe_id;            /* LINEAR: GEMV pipeline for dynamic active_rows <= 2 */
     int reduce_pipe_id;         /* LINEAR Split-K: PIPE_SPLITK_REDUCE */
-    int stage2_decode_pipe_id;  /* ATTENTION / LATENT_ATTENTION: stage 2 pipeline */
+    int stage2_decode_pipe_id;  /* ATTENTION: stage 2 decode/wide pipeline */
     int stage2_prefill_pipe_id; /* ATTENTION: PIPE_ATTENTION_PREFILL_F32 */
     uint32_t split_k;
     size_t splitk_bytes;
@@ -1549,17 +1549,26 @@ static velri_status resolve_op_pipes(const velri_backend_device *dev, const velr
     case VELRI_OP_EMBEDDING:
         out_plan->pipe_id = PIPE_EMBEDDING_F32;
         break;
-    case VELRI_OP_ATTENTION:
+    case VELRI_OP_ATTENTION: {
+        uint32_t dk = op->raw.attr.attention.head_dim;
+        uint32_t dv = op->raw.attr.attention.v_head_dim ? op->raw.attr.attention.v_head_dim : dk;
         out_plan->pipe_id = PIPE_KV_APPEND_F32;
-        out_plan->stage2_decode_pipe_id = PIPE_ATTENTION_DECODE_F32;
-        out_plan->stage2_prefill_pipe_id = PIPE_ATTENTION_PREFILL_F32;
+        if (dk <= 256U && dv <= 256U) {
+            out_plan->stage2_decode_pipe_id = PIPE_ATTENTION_DECODE_F32;
+            out_plan->stage2_prefill_pipe_id = PIPE_ATTENTION_PREFILL_F32;
+        } else {
+            out_plan->stage2_decode_pipe_id = PIPE_ATTENTION_WIDE_F32;
+            out_plan->stage2_prefill_pipe_id = PIPE_ATTENTION_WIDE_F32;
+        }
         break;
+    }
     case VELRI_OP_COPY_LAST_ROW:
         out_plan->pipe_id = PIPE_COPY_LAST_ROW_F32;
         break;
-    case VELRI_OP_LATENT_ATTENTION:
-        out_plan->pipe_id = PIPE_LATENT_APPEND_F32;
-        out_plan->stage2_decode_pipe_id = PIPE_LATENT_ATTENTION_F32;
+    case VELRI_OP_BATCHED_LINEAR:
+        out_plan->pipe_id = op->raw.attr.batched_linear.weight_transposed
+                                ? PIPE_BATCHED_LINEAR_NN_F32
+                                : PIPE_BATCHED_LINEAR_NT_F32;
         break;
     default:
         break;
@@ -2179,10 +2188,12 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         uint32_t rows = (uint32_t)active_rows_sz;
         uint32_t nh = op->raw.attr.attention.n_heads;
         uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
-        uint32_t hd = op->raw.attr.attention.head_dim;
+        uint32_t dk = op->raw.attr.attention.head_dim;
+        uint32_t dv = op->raw.attr.attention.v_head_dim ? op->raw.attr.attention.v_head_dim : dk;
         uint32_t max_ctx = (uint32_t)max_ctx_sz;
+        uint32_t same_kv = (ob[1] == ob[2]) ? 1U : 0U;
         float scale = (op->raw.attr.attention.scale > 0.0f) ? op->raw.attr.attention.scale
-                                                            : (1.0f / sqrtf((float)hd));
+                                                            : (1.0f / sqrtf((float)dk));
 
         vk_kv_append_args s1 = {
             .k_in = ib[1],
@@ -2191,16 +2202,23 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .v_cache = ob[2],
             .rows = rows,
             .n_kv_heads = nkvh,
-            .head_dim = hd,
+            .d_k = dk,
+            .d_v = dv,
             .max_ctx = max_ctx,
             .kv_pos = (uint32_t)kv_pos,
             .k_stride = (uint32_t)op->inputs[1].strides[0],
             .v_stride = (uint32_t)op->inputs[2].strides[0],
-            .same_kv_cache = (ob[1] == ob[2]) ? 1U : 0U,
+            .k_head_stride = (uint32_t)op->outputs[1].strides[0],
+            .k_row_stride = (uint32_t)op->outputs[1].strides[1],
+            .v_head_stride = (uint32_t)op->outputs[2].strides[0],
+            .v_row_stride = (uint32_t)op->outputs[2].strides[1],
+            .same_kv_cache = same_kv,
+            .pad = 0U,
         };
         memcpy(out->pc, &s1, sizeof(s1));
         out->pc_size = (uint32_t)sizeof(s1);
-        out->gx = div_ceil_u32(nkvh * hd, 256U);
+        uint32_t append_cols = (same_kv || dk >= dv) ? (nkvh * dk) : (nkvh * dv);
+        out->gx = div_ceil_u32(append_cols, 256U);
         out->gy = rows;
         out->gz = 1U;
 
@@ -2217,19 +2235,23 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .rows = rows,
             .n_heads = nh,
             .n_kv_heads = nkvh,
-            .head_dim = hd,
+            .d_k = dk,
+            .d_v = dv,
             .max_ctx = max_ctx,
             .kv_pos = (uint32_t)kv_pos,
             .q_stride = (uint32_t)op->inputs[0].strides[0],
             .o_stride = (uint32_t)op->outputs[0].strides[0],
+            .k_head_stride = (uint32_t)op->outputs[1].strides[0],
+            .k_row_stride = (uint32_t)op->outputs[1].strides[1],
+            .v_head_stride = (uint32_t)op->outputs[2].strides[0],
+            .v_row_stride = (uint32_t)op->outputs[2].strides[1],
             .sliding_window = op->raw.attr.attention.sliding_window,
             .causal = op->raw.attr.attention.causal ? 1U : 0U,
             .scale = scale,
-            .pad = 0U,
         };
         memcpy(out->pc2, &s2, sizeof(s2));
         out->pc2_size = (uint32_t)sizeof(s2);
-        if (rows == 1U) {
+        if (s2_pipe_id == PIPE_ATTENTION_DECODE_F32) {
             out->gx2 = nh;
             out->gy2 = 1U;
             out->gz2 = 1U;
@@ -2261,85 +2283,38 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         break;
     }
 
-    case VELRI_OP_LATENT_ATTENTION: {
-        size_t kv_pos = 0U;
-        if (item->params) {
-            if (item->params->has_kv_len) {
-                kv_pos = item->params->kv_len_override;
-            } else if (item->params->has_pos_offset) {
-                kv_pos = item->params->pos_offset_override;
-            }
-        }
-        size_t active_rows_sz = velri_effective_rows(op, op->inputs[0].dims[0], item->params);
-        size_t max_ctx_sz = op->outputs[1].dims[0];
-        size_t end_kv = 0U;
-        if (velri_add_overflow_size(kv_pos, active_rows_sz, &end_kv)) {
-            return VELRI_ERR_OVERFLOW;
-        }
-        if (end_kv > max_ctx_sz) {
-            return VELRI_ERR_INVALID;
-        }
-        if (max_ctx_sz > (size_t)UINT32_MAX) {
-            return VELRI_ERR_OVERFLOW;
-        }
-
-        uint32_t rows = (uint32_t)active_rows_sz;
-        uint32_t nh = op->raw.attr.attention.n_heads;
-        uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
-        uint32_t hd = op->raw.attr.attention.head_dim;
-        uint32_t d_lat = (uint32_t)op->inputs[1].dims[1];
-        uint32_t max_ctx = (uint32_t)max_ctx_sz;
-        float scale = (op->raw.attr.attention.scale > 0.0f) ? op->raw.attr.attention.scale
-                                                            : (1.0f / sqrtf((float)hd));
-        bool has_bv = (op->num_inputs >= 5U && op->input_present[4]);
-        uint32_t flags = (op->raw.attr.attention.causal ? 1U : 0U) | (has_bv ? 2U : 0U);
-
-        vk_latent_append_args s1 = {
-            .h_in = ib[1],
-            .h_cache = ob[1],
-            .rows = rows,
-            .d_lat = d_lat,
-            .kv_pos = (uint32_t)kv_pos,
-            .h_stride = (uint32_t)op->inputs[1].strides[0],
-        };
-        memcpy(out->pc, &s1, sizeof(s1));
-        out->pc_size = (uint32_t)sizeof(s1);
-        out->gx = div_ceil_u32(div_ceil_u32(d_lat, 4U), 256U);
-        out->gy = rows;
-        out->gz = 1U;
-
-        out->pipe2 = get_pipe_locked(dev, plan.stage2_decode_pipe_id);
-        if (!out->pipe2) {
-            return VELRI_ERR_UNSUPPORTED;
-        }
-        vk_latent_attention_args s2 = {
-            .q = ib[0],
-            .wk = ib[2],
-            .wv = ib[3],
-            .bv = has_bv ? ib[4] : 0ULL,
-            .h_cache = ob[1],
+    case VELRI_OP_BATCHED_LINEAR: {
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
+        uint32_t nh = op->raw.attr.batched_linear.n_heads;
+        uint32_t ng = op->raw.attr.batched_linear.n_groups;
+        uint32_t in_dim = op->raw.attr.batched_linear.in_dim;
+        uint32_t out_dim = op->raw.attr.batched_linear.out_dim;
+        bool has_bias = (op->num_inputs >= 3U && op->input_present[2]);
+        vk_batched_linear_args args = {
+            .x = ib[0],
+            .w = ib[1],
+            .bias = has_bias ? ib[2] : 0ULL,
             .y = ob[0],
             .rows = rows,
             .n_heads = nh,
-            .n_kv_heads = nkvh,
-            .head_dim = hd,
-            .d_lat = d_lat,
-            .max_ctx = max_ctx,
-            .kv_pos = (uint32_t)kv_pos,
-            .q_stride = (uint32_t)op->inputs[0].strides[0],
-            .wk_stride = (uint32_t)op->inputs[2].strides[0],
-            .wv_stride = (uint32_t)op->inputs[3].strides[0],
-            .o_stride = (uint32_t)op->outputs[0].strides[0],
-            .sliding_window = op->raw.attr.attention.sliding_window,
-            .scale = scale,
-            .flags = flags,
+            .n_groups = ng,
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .x_stride = (uint32_t)op->inputs[0].strides[0],
+            .w_stride = (uint32_t)op->inputs[1].strides[0],
+            .y_stride = (uint32_t)op->outputs[0].strides[0],
+            .flags = has_bias ? 1U : 0U,
+            .pad = 0U,
         };
-        memcpy(out->pc2, &s2, sizeof(s2));
-        out->pc2_size = (uint32_t)sizeof(s2);
-        out->gx2 = rows;
-        out->gy2 = nh;
-        out->gz2 = 1U;
-        out->has_stage2 = true;
+        memcpy(out->pc, &args, sizeof(args));
+        out->pc_size = (uint32_t)sizeof(args);
+        if (op->raw.attr.batched_linear.weight_transposed) {
+            out->gx = div_ceil_u32(out_dim, 256U);
+        } else {
+            out->gx = div_ceil_u32(out_dim, 4U);
+        }
+        out->gy = rows;
+        out->gz = nh;
         break;
     }
 

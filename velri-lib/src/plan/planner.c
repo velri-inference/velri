@@ -530,12 +530,12 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
         st = pack_state_and_io_arenas(plan);
     }
 
-    /* 1-step-adjacent offloaded WEIGHT shadow cache: deduplicates both intra-op subviews
-     * (e.g. W_K & W_V inside latent_attention) and immediately consecutive ops on the same
-     * device (e.g. q_linear -> latent_attention reading fused qkv_w), without pinning
-     * non-adjacent tied weights (e.g. wte / lm_head) across the graph. */
+    /* Short-horizon offloaded WEIGHT shadow cache: deduplicates intra-op subviews and consecutive
+     * weighted ops on the same device (bridging at most 1 weightless op such as ATTENTION between
+     * q_abs and v_proj on fused qkv_w), without pinning non-adjacent tied weights (wte / lm_head). */
     velri_device_id prev_w_dev = VELRI_INVALID_ID;
     uint32_t prev_w_cnt = 0U;
+    uint32_t prev_w_skip = 0U;
     velri_storage_id prev_w_sids[VELRI_OP_MAX_INPUTS];
     uint32_t prev_w_idxs[VELRI_OP_MAX_INPUTS];
 
@@ -626,8 +626,7 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
 
             if (dst_idx == UINT32_MAX) {
                 bool is_rmw = (resolved.kind == VELRI_OP_FUSED_ADD_RMSNORM && o == 0U) ||
-                              (resolved.kind == VELRI_OP_ATTENTION && (o == 1U || o == 2U)) ||
-                              (resolved.kind == VELRI_OP_LATENT_ATTENTION && o == 1U);
+                              (resolved.kind == VELRI_OP_ATTENTION && (o == 1U || o == 2U));
                 bool need_preserve =
                     is_rmw || !view_covers_full_storage(&resolved.outputs[o],
                                                         plan->storages[sid].byte_size);
@@ -674,11 +673,22 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
             owner_idx[sid] = out_dsts[o];
         }
 
-        prev_w_dev = chosen_dev;
-        prev_w_cnt = cur_w_cnt;
-        for (uint32_t k = 0U; k < cur_w_cnt; ++k) {
-            prev_w_sids[k] = cur_w_sids[k];
-            prev_w_idxs[k] = cur_w_idxs[k];
+        if (cur_w_cnt > 0U) {
+            prev_w_dev = chosen_dev;
+            prev_w_cnt = cur_w_cnt;
+            prev_w_skip = 0U;
+            for (uint32_t k = 0U; k < cur_w_cnt; ++k) {
+                prev_w_sids[k] = cur_w_sids[k];
+                prev_w_idxs[k] = cur_w_idxs[k];
+            }
+        } else if (prev_w_dev == chosen_dev && prev_w_cnt > 0U && prev_w_skip == 0U) {
+            /* Bridge at most one weightless op on the same device (e.g. ATTENTION between
+             * batched_linear(W_K) and batched_linear(W_V) sharing fused qkv_w). */
+            prev_w_skip = 1U;
+        } else {
+            prev_w_dev = VELRI_INVALID_ID;
+            prev_w_cnt = 0U;
+            prev_w_skip = 0U;
         }
 
         /* 4. Optional backend preparation hook. */

@@ -1195,117 +1195,264 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
         }
     }
 
-    /* 17. Latent Attention (exact h_cache + weight absorption: GPT-2 d_lat=768 + GQA/sliding/bidir) */
+    /* 17. Wide & Asymmetric Attention Core (d_k=768 shared, MLA prefix d_k=576/d_v=512, odd bidir) */
     {
         struct {
             const char *name;
-            uint32_t nh, nkvh, hd, d_lat, max_t, max_ctx, prefill_t, dec_steps, win;
-            bool causal, has_bv;
+            uint32_t nh, nkvh, dk, dv, max_t, max_ctx, prefill_t, dec_steps, win;
+            bool causal, shared_prefix;
+            float scale;
             uint64_t seed;
         } cases[3] = {
-            {"lat_gpt2_d768_bv", 12U, 12U, 64U, 768U, 24U, 40U, 24U, 2U, 0U, true, true, 0x1A7E0001ULL},
-            {"lat_gqa_win5_nobv", 6U, 2U, 64U, 300U, 12U, 24U, 9U, 2U, 5U, true, false, 0x1A7E0002ULL},
-            {"lat_bidir_odd513", 4U, 2U, 48U, 513U, 18U, 32U, 17U, 2U, 0U, false, true, 0x1A7E0003ULL},
+            {"attn_wide_shared768", 8U, 1U, 768U, 768U, 20U, 36U, 18U, 2U, 0U, true, true, 0.125f, 0x1A7E0001ULL},
+            {"attn_mla_576_512", 8U, 1U, 576U, 512U, 12U, 24U, 9U, 2U, 5U, true, true, 0.088388f, 0x1A7E0002ULL},
+            {"attn_wide_bidir_odd", 4U, 2U, 513U, 321U, 14U, 28U, 12U, 2U, 0U, false, false, 0.0f, 0x1A7E0003ULL},
         };
         for (int ci = 0; ci < 3; ++ci) {
-            uint32_t nh = cases[ci].nh, nkvh = cases[ci].nkvh, hd = cases[ci].hd;
-            uint32_t d_lat = cases[ci].d_lat, max_t = cases[ci].max_t, max_ctx = cases[ci].max_ctx;
-            size_t q_dim = (size_t)nh * hd, kv_dim = (size_t)nkvh * hd;
-            size_t q_str = q_dim + 3U, h_str = (size_t)d_lat + 5U;
-            size_t wk_str = (size_t)d_lat + 3U, wv_str = (size_t)d_lat + 7U, o_str = q_dim + 1U;
+            uint32_t nh = cases[ci].nh, nkvh = cases[ci].nkvh;
+            uint32_t dk = cases[ci].dk, dv = cases[ci].dv;
+            uint32_t max_t = cases[ci].max_t, max_ctx = cases[ci].max_ctx;
+            size_t q_dim = (size_t)nh * dk, o_dim = (size_t)nh * dv;
+            size_t k_dim = (size_t)nkvh * dk, v_dim = (size_t)nkvh * dv;
+            size_t q_str = q_dim + 3U, k_str = k_dim + 5U, v_str = cases[ci].shared_prefix ? k_str : (v_dim + 3U);
+            size_t o_str = o_dim + 1U;
 
             float *hq = (float *)xcalloc((size_t)max_t * q_str, sizeof(float));
-            float *hh = (float *)xcalloc((size_t)max_t * h_str, sizeof(float));
-            float *hwk = (float *)xcalloc(kv_dim * wk_str, sizeof(float));
-            float *hwv = (float *)xcalloc(kv_dim * wv_str, sizeof(float));
-            float *hbv = cases[ci].has_bv ? (float *)xcalloc(kv_dim, sizeof(float)) : nullptr;
+            float *hk = (float *)xcalloc((size_t)max_t * k_str, sizeof(float));
+            float *hv = cases[ci].shared_prefix ? hk : (float *)xcalloc((size_t)max_t * v_str, sizeof(float));
             float *ho = (float *)xcalloc((size_t)max_t * o_str, sizeof(float));
             float *ho_ref = (float *)xcalloc((size_t)max_t * o_str, sizeof(float));
-            float *hhc_ref = (float *)xcalloc((size_t)max_ctx * d_lat, sizeof(float));
-
-            uint64_t rng = cases[ci].seed;
-            velri_test_fill_dtype(VELRI_DTYPE_F32, hwk, kv_dim * wk_str, &rng, 0.12f);
-            velri_test_fill_dtype(VELRI_DTYPE_F32, hwv, kv_dim * wv_str, &rng, 0.12f);
-            if (hbv) velri_test_fill_dtype(VELRI_DTYPE_F32, hbv, kv_dim, &rng, 0.25f);
+            float *hkc_ref = (float *)xcalloc((size_t)nkvh * max_ctx * dk, sizeof(float));
+            float *hvc_ref = cases[ci].shared_prefix ? hkc_ref : (float *)xcalloc((size_t)nkvh * max_ctx * dv, sizeof(float));
+            size_t khs = (size_t)max_ctx * dk, krs = dk;
+            size_t vhs = cases[ci].shared_prefix ? khs : ((size_t)max_ctx * dv);
+            size_t vrs = cases[ci].shared_prefix ? krs : dv;
 
             velri_graph *g = nullptr;
-            CHECK_OK(velri_graph_create(&g), "lat g");
+            CHECK_OK(velri_graph_create(&g), "wide attn g");
             velri_storage_id sq = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * q_str, dev);
-            velri_storage_id sh = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * h_str, dev);
-            velri_storage_id swk = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, kv_dim * wk_str, dev);
-            velri_storage_id swv = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, kv_dim * wv_str, dev);
-            velri_storage_id sbv = cases[ci].has_bv ? add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, kv_dim, dev) : 0U;
+            velri_storage_id sk = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * k_str, dev);
+            velri_storage_id sv = cases[ci].shared_prefix ? sk : add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * v_str, dev);
             velri_storage_id so = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, (size_t)max_t * o_str, dev);
-            velri_storage_id shc = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)max_ctx * d_lat, dev);
+            velri_storage_id skc = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)nkvh * max_ctx * dk, dev);
+            velri_storage_id svc = cases[ci].shared_prefix ? skc : add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)nkvh * max_ctx * dv, dev);
+
+            velri_tensor_view vkc, vvc;
+            const size_t kc_dims[3] = {nkvh, max_ctx, dk};
+            CHECK_OK(velri_tensor_view_contiguous(skc, VELRI_DTYPE_F32, 3U, kc_dims, 0U, &vkc), "vkc");
+            velri_view_id id_kc = VELRI_INVALID_ID, id_vc = VELRI_INVALID_ID;
+            CHECK_OK(velri_graph_add_view(g, &vkc, &id_kc), "add vkc");
+            if (cases[ci].shared_prefix && dv < dk) {
+                const size_t vc_dims[3] = {nkvh, max_ctx, dv};
+                const size_t vc_strides[3] = {khs, krs, 1U};
+                CHECK_OK(velri_tensor_view_subview(&vkc, 3U, vc_dims, vc_strides, 0U, &vvc), "vvc sub");
+                CHECK_OK(velri_graph_add_view(g, &vvc, &id_vc), "add vvc");
+            } else if (cases[ci].shared_prefix) {
+                id_vc = id_kc;
+            } else {
+                const size_t vc_dims[3] = {nkvh, max_ctx, dv};
+                CHECK_OK(velri_tensor_view_contiguous(svc, VELRI_DTYPE_F32, 3U, vc_dims, 0U, &vvc), "vvc");
+                CHECK_OK(velri_graph_add_view(g, &vvc, &id_vc), "add vvc");
+            }
+
+            velri_view_id id_ki = add_view_2d_strided(g, sk, VELRI_DTYPE_F32, max_t, k_dim, k_str);
+            velri_view_id id_vi = (cases[ci].shared_prefix && dv == dk)
+                                      ? id_ki
+                                      : add_view_2d_strided(g, sv, VELRI_DTYPE_F32, max_t, v_dim, v_str);
 
             velri_op_desc op = {
-                .kind = VELRI_OP_LATENT_ATTENTION,
-                .num_inputs = cases[ci].has_bv ? 5U : 4U,
-                .num_outputs = 2U,
-                .inputs = {
-                    add_view_2d_strided(g, sq, VELRI_DTYPE_F32, max_t, q_dim, q_str),
-                    add_view_2d_strided(g, sh, VELRI_DTYPE_F32, max_t, d_lat, h_str),
-                    add_view_2d_strided(g, swk, VELRI_DTYPE_F32, kv_dim, d_lat, wk_str),
-                    add_view_2d_strided(g, swv, VELRI_DTYPE_F32, kv_dim, d_lat, wv_str),
-                    cases[ci].has_bv ? add_view_1d(g, sbv, VELRI_DTYPE_F32, kv_dim, 0U) : VELRI_INVALID_ID,
-                },
-                .outputs = {
-                    add_view_2d_strided(g, so, VELRI_DTYPE_F32, max_t, q_dim, o_str),
-                    add_view_2d_strided(g, shc, VELRI_DTYPE_F32, max_ctx, d_lat, d_lat),
-                },
+                .kind = VELRI_OP_ATTENTION,
+                .num_inputs = 3U,
+                .num_outputs = 3U,
+                .inputs = {add_view_2d_strided(g, sq, VELRI_DTYPE_F32, max_t, q_dim, q_str), id_ki, id_vi},
+                .outputs = {add_view_2d_strided(g, so, VELRI_DTYPE_F32, max_t, o_dim, o_str), id_kc, id_vc},
                 .dynamic_seq = true,
                 .attr.attention = {
-                    .n_heads = nh, .n_kv_heads = nkvh, .head_dim = hd,
-                    .scale = 0.0f, .sliding_window = cases[ci].win, .causal = cases[ci].causal,
+                    .n_heads = nh, .n_kv_heads = nkvh, .head_dim = dk, .v_head_dim = dv,
+                    .scale = cases[ci].scale, .sliding_window = cases[ci].win, .causal = cases[ci].causal,
                 },
             };
-            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add lat");
+            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add wide attn");
             velri_plan *plan = nullptr;
             velri_slot *slot = nullptr;
-            CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep lat");
-            CHECK_OK(velri_plan_bind_weight_host(plan, swk, hwk, kv_dim * wk_str * sizeof(float)), "wk");
-            CHECK_OK(velri_plan_bind_weight_host(plan, swv, hwv, kv_dim * wv_str * sizeof(float)), "wv");
-            if (hbv) CHECK_OK(velri_plan_bind_weight_host(plan, sbv, hbv, kv_dim * sizeof(float)), "bv");
-            CHECK_OK(velri_slot_create(plan, &slot), "slot lat");
+            CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep wide attn");
+            CHECK_OK(velri_slot_create(plan, &slot), "slot wide attn");
             CHECK_OK(velri_slot_bind_host(slot, sq, hq, (size_t)max_t * q_str * sizeof(float)), "q");
-            CHECK_OK(velri_slot_bind_host(slot, sh, hh, (size_t)max_t * h_str * sizeof(float)), "h");
+            CHECK_OK(velri_slot_bind_host(slot, sk, hk, (size_t)max_t * k_str * sizeof(float)), "k");
+            if (!cases[ci].shared_prefix) {
+                CHECK_OK(velri_slot_bind_host(slot, sv, hv, (size_t)max_t * v_str * sizeof(float)), "v");
+            }
             CHECK_OK(velri_slot_bind_host(slot, so, ho, (size_t)max_t * o_str * sizeof(float)), "o");
 
-            /* Prefill step */
-            velri_test_fill_dtype(VELRI_DTYPE_F32, hq, (size_t)cases[ci].prefill_t * q_str, &rng, 0.5f);
-            velri_test_fill_dtype(VELRI_DTYPE_F32, hh, (size_t)cases[ci].prefill_t * h_str, &rng, 0.5f);
+            uint64_t rng = cases[ci].seed;
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hq, (size_t)cases[ci].prefill_t * q_str, &rng, 0.25f);
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hk, (size_t)cases[ci].prefill_t * k_str, &rng, 0.25f);
+            if (!cases[ci].shared_prefix) {
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hv, (size_t)cases[ci].prefill_t * v_str, &rng, 0.25f);
+            }
             velri_step_params sp = {.has_seq_len = true, .seq_len_override = cases[ci].prefill_t,
                                     .has_kv_len = true, .kv_len_override = 0U};
             CHECK_OK(velri_slot_run(slot, &sp, nullptr), cases[ci].name);
-            CHECK(velri_slot_last_run_allocs(slot) == 0U, "lat prefill 0 allocs");
-            velri_ref_latent_attention_f32(cases[ci].prefill_t, nh, nkvh, hd, d_lat, 0U, max_ctx,
-                                           0.0f, cases[ci].win, cases[ci].causal,
-                                           hq, q_str, hh, h_str, hwk, wk_str, hwv, wv_str, hbv,
-                                           hhc_ref, ho_ref, o_str);
-            CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, cases[ci].prefill_t, q_dim, o_str) <= 2e-4,
+            CHECK(velri_slot_last_run_allocs(slot) == 0U, "wide prefill 0 allocs");
+            velri_ref_attention_ex_f32(cases[ci].prefill_t, nh, nkvh, dk, dv, 0U, max_ctx,
+                                       cases[ci].scale, cases[ci].win, cases[ci].causal,
+                                       hq, q_str, hk, k_str, hv, v_str,
+                                       hkc_ref, khs, krs, hvc_ref, vhs, vrs, ho_ref, o_str);
+            CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, cases[ci].prefill_t, o_dim, o_str) <= 2e-4,
                   cases[ci].name);
 
-            /* Incremental decode steps */
             for (uint32_t ds = 0U; ds < cases[ci].dec_steps; ++ds) {
                 uint32_t kv_pos = cases[ci].prefill_t + ds;
-                velri_test_fill_dtype(VELRI_DTYPE_F32, hq, q_str, &rng, 0.5f);
-                velri_test_fill_dtype(VELRI_DTYPE_F32, hh, h_str, &rng, 0.5f);
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hq, q_str, &rng, 0.25f);
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hk, k_str, &rng, 0.25f);
+                if (!cases[ci].shared_prefix) {
+                    velri_test_fill_dtype(VELRI_DTYPE_F32, hv, v_str, &rng, 0.25f);
+                }
                 velri_step_params dsp = {.has_seq_len = true, .seq_len_override = 1U,
                                          .has_kv_len = true, .kv_len_override = kv_pos};
                 CHECK_OK(velri_slot_run(slot, &dsp, nullptr), cases[ci].name);
-                CHECK(velri_slot_last_run_allocs(slot) == 0U, "lat decode 0 allocs");
-                velri_ref_latent_attention_f32(1U, nh, nkvh, hd, d_lat, kv_pos, max_ctx,
-                                               0.0f, cases[ci].win, cases[ci].causal,
-                                               hq, q_str, hh, h_str, hwk, wk_str, hwv, wv_str, hbv,
-                                               hhc_ref, ho_ref, o_str);
-                CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, 1U, q_dim, o_str) <= 2e-4,
+                CHECK(velri_slot_last_run_allocs(slot) == 0U, "wide decode 0 allocs");
+                velri_ref_attention_ex_f32(1U, nh, nkvh, dk, dv, kv_pos, max_ctx,
+                                           cases[ci].scale, cases[ci].win, cases[ci].causal,
+                                           hq, q_str, hk, k_str, hv, v_str,
+                                           hkc_ref, khs, krs, hvc_ref, vhs, vrs, ho_ref, o_str);
+                CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, 1U, o_dim, o_str) <= 2e-4,
                       cases[ci].name);
             }
 
             velri_slot_destroy(slot);
             velri_plan_destroy(plan);
             velri_graph_destroy(g);
-            free(hq); free(hh); free(hwk); free(hwv); free(hbv); free(ho); free(ho_ref); free(hhc_ref);
+            free(hq); free(hk);
+            if (!cases[ci].shared_prefix) free(hv);
+            free(ho); free(ho_ref); free(hkc_ref);
+            if (!cases[ci].shared_prefix) free(hvc_ref);
+        }
+
+        /* 17b. Negative test: prefix-aliased shared KV cache with nkvh > 1 and d_v < d_k must fail */
+        {
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "bad prefix g");
+            const uint32_t nh = 4U, nkvh = 2U, dk = 576U, dv = 512U, max_t = 4U, max_ctx = 8U;
+            velri_storage_id sq = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * nh * dk, dev);
+            velri_storage_id sk = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * nkvh * dk, dev);
+            velri_storage_id so = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, (size_t)max_t * nh * dv, dev);
+            velri_storage_id skc = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)nkvh * max_ctx * dk, dev);
+
+            velri_tensor_view vkc, vvc;
+            const size_t kc_dims[3] = {nkvh, max_ctx, dk};
+            const size_t vc_dims[3] = {nkvh, max_ctx, dv};
+            const size_t vc_strides[3] = {(size_t)max_ctx * dk, dk, 1U};
+            CHECK_OK(velri_tensor_view_contiguous(skc, VELRI_DTYPE_F32, 3U, kc_dims, 0U, &vkc), "vkc");
+            CHECK_OK(velri_tensor_view_subview(&vkc, 3U, vc_dims, vc_strides, 0U, &vvc), "vvc");
+            velri_view_id id_kc = VELRI_INVALID_ID, id_vc = VELRI_INVALID_ID;
+            CHECK_OK(velri_graph_add_view(g, &vkc, &id_kc), "id_kc");
+            CHECK_OK(velri_graph_add_view(g, &vvc, &id_vc), "id_vc");
+
+            velri_op_desc bad_op = {
+                .kind = VELRI_OP_ATTENTION,
+                .num_inputs = 3U,
+                .num_outputs = 3U,
+                .inputs = {
+                    add_view_2d_strided(g, sq, VELRI_DTYPE_F32, max_t, (size_t)nh * dk, (size_t)nh * dk),
+                    add_view_2d_strided(g, sk, VELRI_DTYPE_F32, max_t, (size_t)nkvh * dk, (size_t)nkvh * dk),
+                    add_view_2d_strided(g, sk, VELRI_DTYPE_F32, max_t, (size_t)nkvh * dv, (size_t)nkvh * dk),
+                },
+                .outputs = {
+                    add_view_2d_strided(g, so, VELRI_DTYPE_F32, max_t, (size_t)nh * dv, (size_t)nh * dv),
+                    id_kc,
+                    id_vc,
+                },
+                .dynamic_seq = true,
+                .attr.attention = {
+                    .n_heads = nh, .n_kv_heads = nkvh, .head_dim = dk, .v_head_dim = dv,
+                    .causal = true,
+                },
+            };
+            CHECK(velri_graph_add_op(g, &bad_op, dev, nullptr) == VELRI_ERR_INVALID,
+                  "shared prefix KV cache with nkvh > 1 and dv < dk must be rejected");
+            velri_graph_destroy(g);
+        }
+    }
+
+    /* 18. Grouped Batched Linear (X @ W^T + b and X @ W + b, GQA groups, dynamic seq) */
+    {
+        struct {
+            const char *name;
+            uint32_t max_t, active_t, nh, ng, in_d, out_d;
+            bool transposed, has_bias;
+            uint64_t seed;
+        } cases[4] = {
+            {"blin_nn_gqa_nobias", 8U, 5U, 6U, 2U, 64U, 300U, true, false, 0xB1000001ULL},
+            {"blin_nt_gqa_bias", 8U, 5U, 6U, 2U, 300U, 64U, false, true, 0xB1000002ULL},
+            {"blin_nn_mha_bias", 4U, 1U, 4U, 4U, 33U, 129U, true, true, 0xB1000003ULL},
+            {"blin_nt_shared_nobias", 6U, 4U, 4U, 1U, 131U, 49U, false, false, 0xB1000004ULL},
+        };
+        for (int ci = 0; ci < 4; ++ci) {
+            uint32_t max_t = cases[ci].max_t, act_t = cases[ci].active_t;
+            uint32_t nh = cases[ci].nh, ng = cases[ci].ng;
+            uint32_t in_d = cases[ci].in_d, out_d = cases[ci].out_d;
+            size_t x_cols = (size_t)nh * in_d, y_cols = (size_t)nh * out_d;
+            size_t w_rows = cases[ci].transposed ? ((size_t)ng * in_d) : ((size_t)ng * out_d);
+            size_t w_cols = cases[ci].transposed ? (size_t)out_d : (size_t)in_d;
+            size_t xs = x_cols + 3U, ws = w_cols + 5U, ys = y_cols + 1U;
+            size_t b_len = (size_t)ng * out_d;
+
+            float *hx = (float *)xcalloc((size_t)max_t * xs, sizeof(float));
+            float *hw = (float *)xcalloc(w_rows * ws, sizeof(float));
+            float *hb = cases[ci].has_bias ? (float *)xcalloc(b_len, sizeof(float)) : nullptr;
+            float *hy = (float *)xcalloc((size_t)max_t * ys, sizeof(float));
+            float *hy_ref = (float *)xcalloc((size_t)max_t * ys, sizeof(float));
+            uint64_t rng = cases[ci].seed;
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hx, (size_t)max_t * xs, &rng, 0.5f);
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hw, w_rows * ws, &rng, 0.2f);
+            if (hb) velri_test_fill_dtype(VELRI_DTYPE_F32, hb, b_len, &rng, 0.3f);
+
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "blin g");
+            velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * xs, dev);
+            velri_storage_id sw = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, w_rows * ws, dev);
+            velri_storage_id sb = cases[ci].has_bias ? add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, b_len, dev) : 0U;
+            velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, (size_t)max_t * ys, dev);
+
+            velri_op_desc op = {
+                .kind = VELRI_OP_BATCHED_LINEAR,
+                .num_inputs = cases[ci].has_bias ? 3U : 2U,
+                .num_outputs = 1U,
+                .inputs = {
+                    add_view_2d_strided(g, sx, VELRI_DTYPE_F32, max_t, x_cols, xs),
+                    add_view_2d_strided(g, sw, VELRI_DTYPE_F32, w_rows, w_cols, ws),
+                    cases[ci].has_bias ? add_view_1d(g, sb, VELRI_DTYPE_F32, b_len, 0U) : VELRI_INVALID_ID,
+                },
+                .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, max_t, y_cols, ys)},
+                .dynamic_seq = true,
+                .attr.batched_linear = {
+                    .n_heads = nh, .n_groups = ng, .in_dim = in_d, .out_dim = out_d,
+                    .weight_transposed = cases[ci].transposed,
+                },
+            };
+            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), cases[ci].name);
+            velri_plan *plan = nullptr;
+            velri_slot *slot = nullptr;
+            CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep blin");
+            CHECK_OK(velri_plan_bind_weight_host(plan, sw, hw, w_rows * ws * sizeof(float)), "bw");
+            if (hb) CHECK_OK(velri_plan_bind_weight_host(plan, sb, hb, b_len * sizeof(float)), "bb");
+            CHECK_OK(velri_slot_create(plan, &slot), "slot blin");
+            CHECK_OK(velri_slot_bind_host(slot, sx, hx, (size_t)max_t * xs * sizeof(float)), "bx");
+            CHECK_OK(velri_slot_bind_host(slot, sy, hy, (size_t)max_t * ys * sizeof(float)), "by");
+
+            velri_step_params sp = {.has_seq_len = true, .seq_len_override = act_t};
+            CHECK_OK(velri_slot_run(slot, &sp, nullptr), cases[ci].name);
+            CHECK(velri_slot_last_run_allocs(slot) == 0U, "blin 0 allocs");
+            velri_ref_batched_linear_f32(act_t, nh, ng, in_d, out_d, cases[ci].transposed,
+                                         hx, xs, hw, ws, hb, hy_ref, ys);
+            CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ref, hy, act_t, y_cols, ys) <= 1e-4,
+                  cases[ci].name);
+
+            velri_slot_destroy(slot);
+            velri_plan_destroy(plan);
+            velri_graph_destroy(g);
+            free(hx); free(hw); free(hb); free(hy); free(hy_ref);
         }
     }
 

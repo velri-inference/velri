@@ -23,8 +23,7 @@ enum {
     VELRI_INVALID_ID = 0xFFFFFFFFU,
     VELRI_OP_MAX_INPUTS = 6,
     VELRI_OP_MAX_OUTPUTS = 3,
-    VELRI_ATTN_MAX_HEAD_DIM = 256,
-    VELRI_LATENT_ATTN_MAX_DLAT = 2048
+    VELRI_ATTN_MAX_HEAD_DIM = 2048
 };
 
 typedef uint32_t velri_storage_id;
@@ -92,7 +91,7 @@ typedef enum {
     VELRI_OP_EMBEDDING = 12,
     VELRI_OP_ATTENTION = 13,
     VELRI_OP_COPY_LAST_ROW = 14,
-    VELRI_OP_LATENT_ATTENTION = 15
+    VELRI_OP_BATCHED_LINEAR = 15
 } velri_op_kind;
 
 typedef struct {
@@ -139,11 +138,19 @@ typedef struct {
         struct {
             uint32_t n_heads;
             uint32_t n_kv_heads;
-            uint32_t head_dim;
+            uint32_t head_dim;       /* Key/query dim d_k (1..VELRI_ATTN_MAX_HEAD_DIM) */
+            uint32_t v_head_dim;     /* Value/output dim d_v (0 => head_dim; 1..VELRI_ATTN_MAX_HEAD_DIM) */
             float scale;             /* 0.0f => 1.0f / sqrtf((float)head_dim) */
             uint32_t sliding_window; /* 0 => full causal history */
             bool causal;
         } attention;
+        struct {
+            uint32_t n_heads;       /* Batch count per token row (B >= 1) */
+            uint32_t n_groups;      /* Weight groups (G >= 1, B % G == 0) */
+            uint32_t in_dim;        /* Input features per head (K >= 1) */
+            uint32_t out_dim;       /* Output features per head (M >= 1) */
+            bool weight_transposed; /* false: W [G*M, K] (Y = X @ W^T + b); true: W [G*K, M] (Y = X @ W + b) */
+        } batched_linear;
     } attr;
 } velri_op_desc;
 
