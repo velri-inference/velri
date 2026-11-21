@@ -1,4 +1,4 @@
-// Shared Rotary Position Embedding (RoPE) kernel math for CPU and Vulkan.
+// Shared Rotary Position Embedding (RoPE) kernel math for CPU.
 // Supports HALF (NeoX/Llama/Qwen) and INTERLEAVED (GPT-J) modes and partial rotary_dim.
 module rope;
 
@@ -15,7 +15,6 @@ public void rope_apply_head<T : IElement>(
 {
     uint half_rot = rotary_dim >> 1u;
     if (mode == 0u) {
-        // VELRI_ROPE_HALF: pairs (i, i + half_rot)
         for (uint i = 0u; i < half_rot; ++i) {
             float x0 = T::toF32(xh[i]);
             float x1 = T::toF32(xh[i + half_rot]);
@@ -25,7 +24,6 @@ public void rope_apply_head<T : IElement>(
             yh[i + half_rot] = T::fromF32(x1 * c + x0 * s);
         }
     } else {
-        // VELRI_ROPE_INTERLEAVED: pairs (2*i, 2*i + 1)
         for (uint i = 0u; i < half_rot; ++i) {
             uint idx = i << 1u;
             float x0 = T::toF32(xh[idx]);
@@ -48,15 +46,17 @@ public void rope_tokens_cpu<T : IElement>(
     uint t0, uint t1, uint n_heads, uint head_dim, uint rotary_dim,
     uint pos_offset, uint mode)
 {
-    uint half_rot = rotary_dim >> 1u;
+    uint64_t half_rot = uint64_t(rotary_dim >> 1u);
     for (uint t = t0; t < t1; ++t) {
-        uint cs_off = (pos_offset + t) * half_rot;
+        uint64_t cs_off = (uint64_t(pos_offset) + uint64_t(t)) * half_rot;
         Ptr<float, Access.Read> cr = cos_tbl + cs_off;
         Ptr<float, Access.Read> sr = sin_tbl + cs_off;
+        uint64_t x_tok = uint64_t(t) * uint64_t(tok_sx);
+        uint64_t y_tok = uint64_t(t) * uint64_t(tok_sy);
         for (uint h = 0u; h < n_heads; ++h) {
             rope_apply_head<T>(
-                x + t * tok_sx + h * head_sx,
-                y + t * tok_sy + h * head_sy,
+                x + x_tok + uint64_t(h) * uint64_t(head_sx),
+                y + y_tok + uint64_t(h) * uint64_t(head_sy),
                 cr, sr, head_dim, rotary_dim, mode);
         }
     }

@@ -36,7 +36,6 @@ set(VELRI_SLANG_CPU_DEPS
 set(VELRI_SLANG_VK_DEPS
     ${VELRI_SLANG_COMMON_DEPS}
     "${VELRI_SLANG_DIR}/common/reductions.slang"
-    "${VELRI_SLANG_DIR}/ops/norm.slang"
 )
 
 set(_velri_obj_ext "${CMAKE_C_OUTPUT_EXTENSION}")
@@ -342,50 +341,53 @@ if(VELRI_ENABLE_VULKAN)
     endif()
     find_program(VELRI_SPIRV_VAL NAMES spirv-val NO_CMAKE_FIND_ROOT_PATH)
 
-    set(VELRI_SLANG_VK_ENTRY "${VELRI_SLANG_DIR}/entry_vulkan.slang")
     set(VELRI_VK_SPV_DIR "${VELRI_SLANG_GEN_DIR}/spv")
     file(MAKE_DIRECTORY "${VELRI_VK_SPV_DIR}")
 
-    set(VELRI_VK_ENTRIES
-        vk_rmsnorm_f32
-        vk_rmsnorm_bf16
-        vk_rmsnorm_f16
-        vk_fused_add_rmsnorm_f32
-        vk_layernorm_f32
-        vk_rope_f32
-        vk_rope_bf16
-        vk_activation_silu_f32
-        vk_activation_gelu_f32
-        vk_activation_relu2_f32
-        vk_gated_silu_f32
-        vk_gated_gelu_f32
-        vk_vec_axpby_f32
-        vk_vec_mul_f32
-        vk_softmax_f32
-        vk_fwht_f32
-        vk_quantize_row_f32_i8
-        vk_gemv_f32
-        vk_gemv_f16
-        vk_gemv_bf16
-        vk_gemv_w8a8
-        vk_gemm_f32
-        vk_splitk_reduce
-        vk_gemm_coopmat_f16
-        vk_gemm_coopmat_bf16
-        vk_gemm_coopmat_w8a8
-        vk_gemm_coopmat_f16_64
-        vk_gemm_coopmat_bf16_64
-        vk_gemm_coopmat_w8a8_64
-        vk_ceiling_bw_f32x4
-        vk_ceiling_bw_read_f32x4
-        vk_ceiling_fma_f32
-        vk_ceiling_coopmat_f16
-        vk_ceiling_coopmat_bf16
-        vk_ceiling_coopmat_i8
+    set(VELRI_VK_SHADER_SPECS
+        "norm.slang:vk_rmsnorm_f32"
+        "norm.slang:vk_rmsnorm_bf16"
+        "norm.slang:vk_rmsnorm_f16"
+        "norm.slang:vk_fused_add_rmsnorm_f32"
+        "norm.slang:vk_layernorm_f32"
+        "rope.slang:vk_rope_f32"
+        "rope.slang:vk_rope_bf16"
+        "elementwise.slang:vk_activation_silu_f32"
+        "elementwise.slang:vk_activation_gelu_f32"
+        "elementwise.slang:vk_activation_relu2_f32"
+        "elementwise.slang:vk_gated_silu_f32"
+        "elementwise.slang:vk_gated_gelu_f32"
+        "elementwise.slang:vk_vec_axpby_f32"
+        "elementwise.slang:vk_vec_mul_f32"
+        "elementwise.slang:vk_softmax_f32"
+        "elementwise.slang:vk_fwht_f32"
+        "elementwise.slang:vk_quantize_row_f32_i8"
+        "gemv.slang:vk_gemv_f32"
+        "gemv.slang:vk_gemv_f16"
+        "gemv.slang:vk_gemv_bf16"
+        "gemv.slang:vk_gemv_w8a8"
+        "gemm_f32.slang:vk_gemm_f32"
+        "gemm_f32.slang:vk_splitk_reduce"
+        "gemm_coopmat.slang:vk_gemm_coopmat_f16"
+        "gemm_coopmat.slang:vk_gemm_coopmat_bf16"
+        "gemm_coopmat.slang:vk_gemm_coopmat_w8a8"
+        "gemm_coopmat.slang:vk_gemm_coopmat_f16_64"
+        "gemm_coopmat.slang:vk_gemm_coopmat_bf16_64"
+        "gemm_coopmat.slang:vk_gemm_coopmat_w8a8_64"
+        "ceilings.slang:vk_ceiling_bw_f32x4"
+        "ceilings.slang:vk_ceiling_bw_read_f32x4"
+        "ceilings.slang:vk_ceiling_fma_f32"
+        "ceilings.slang:vk_ceiling_coopmat_f16"
+        "ceilings.slang:vk_ceiling_coopmat_bf16"
+        "ceilings.slang:vk_ceiling_coopmat_i8"
     )
 
+    set(VELRI_VK_ENTRIES)
     set(VELRI_VK_SPV_FILES)
-    foreach(_entry IN LISTS VELRI_VK_ENTRIES)
+    foreach(_spec IN LISTS VELRI_VK_SHADER_SPECS)
+        string(REGEX REPLACE ":.*$" "" _src_name "${_spec}")
+        string(REGEX REPLACE "^[^:]+:" "" _entry "${_spec}")
+        set(_src_file "${VELRI_SLANG_DIR}/vk/${_src_name}")
         set(_spv "${VELRI_VK_SPV_DIR}/${_entry}.spv")
         set(_extra_caps)
         if(_entry STREQUAL "vk_gemm_coopmat_bf16" OR _entry STREQUAL "vk_gemm_coopmat_bf16_64" OR _entry STREQUAL "vk_ceiling_coopmat_bf16")
@@ -400,16 +402,17 @@ if(VELRI_ENABLE_VULKAN)
         endif()
         add_custom_command(
             OUTPUT "${_spv}"
-            COMMAND "${VELRI_SLANGC}" "${VELRI_SLANG_VK_ENTRY}"
-                -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
+            COMMAND "${VELRI_SLANGC}" "${_src_file}"
+                -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/vk"
                 -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
                 ${_extra_caps}
                 -entry "${_entry}" -stage compute -o "${_spv}"
             ${_val_cmd}
-            DEPENDS "${VELRI_SLANG_VK_ENTRY}" ${VELRI_SLANG_VK_DEPS}
+            DEPENDS "${_src_file}" "${VELRI_SLANG_DIR}/vk/vk_common.slang" ${VELRI_SLANG_VK_DEPS}
             COMMENT "${_spv_comment}"
             VERBATIM
         )
+        list(APPEND VELRI_VK_ENTRIES "${_entry}")
         list(APPEND VELRI_VK_SPV_FILES "${_spv}")
     endforeach()
 

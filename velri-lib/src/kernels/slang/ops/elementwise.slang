@@ -1,5 +1,4 @@
-// Shared elementwise, gated MLP, and softmax operations for CPU.
-// Reuses common/activations.slang so SiLU, GELU_tanh, ReLU2, and fast_expf are defined once.
+// Shared elementwise, gated MLP, softmax, FWHT, and row-quantization operations for CPU.
 module elementwise;
 
 import numeric;
@@ -34,7 +33,7 @@ public void gated_mlp_cpu<A : IActivation>(
 }
 
 float row_max_f32_cpu(Ptr<float, Access.Read> xr, uint cols) {
-    float m = -3.402823466e+38f;
+    float m = asfloat(0xFF800000u); // -INF
     for (uint c = 0u; c < cols; ++c) {
         float v = xr[c];
         m = select(v > m, v, m);
@@ -47,20 +46,25 @@ public void softmax_rows_cpu(
     Ptr<float> y, uint y_stride,
     uint r0, uint r1, uint cols)
 {
+    float neg_inf = asfloat(0xFF800000u);
     if (cols <= 4096u) {
-        // L1-resident scratch eliminates extra round-trips to y and avoids xr/yr aliasing.
         float tmp[4096];
         for (uint r = r0; r < r1; ++r) {
-            Ptr<float, Access.Read> xr = x + r * x_stride;
-            Ptr<float> yr = y + r * y_stride;
+            Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
+            Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
             float m = row_max_f32_cpu(xr, cols);
+            if (!(m > neg_inf)) {
+                for (uint c = 0u; c < cols; ++c) yr[c] = 0.0f;
+                continue;
+            }
             float sum = 0.0f;
             for (uint c = 0u; c < cols; ++c) {
-                float e = fast_expf(xr[c] - m);
+                float v = xr[c];
+                float e = select(v > neg_inf, fast_expf(v - m), 0.0f);
                 tmp[c] = e;
                 sum += e;
             }
-            float inv_sum = 1.0f / sum;
+            float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
             for (uint c = 0u; c < cols; ++c) {
                 yr[c] = tmp[c] * inv_sum;
             }
@@ -68,16 +72,21 @@ public void softmax_rows_cpu(
         return;
     }
     for (uint r = r0; r < r1; ++r) {
-        Ptr<float, Access.Read> xr = x + r * x_stride;
-        Ptr<float> yr = y + r * y_stride;
+        Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
+        Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
         float m = row_max_f32_cpu(xr, cols);
+        if (!(m > neg_inf)) {
+            for (uint c = 0u; c < cols; ++c) yr[c] = 0.0f;
+            continue;
+        }
         float sum = 0.0f;
         for (uint c = 0u; c < cols; ++c) {
-            float e = fast_expf(xr[c] - m);
+            float v = xr[c];
+            float e = select(v > neg_inf, fast_expf(v - m), 0.0f);
             yr[c] = e;
             sum += e;
         }
-        float inv_sum = 1.0f / sum;
+        float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
         for (uint c = 0u; c < cols; ++c) {
             yr[c] *= inv_sum;
         }
@@ -106,9 +115,6 @@ public void mul_cpu(
     }
 }
 
-// Radix-4 self-sorting Stockham FWHT stage (src[B] -> dst[B]):
-// Equivalent to two consecutive radix-2 stages; LLVM lowers stride-4 loads to
-// full-width 512-bit ZMM / 256-bit YMM vpermt2ps + vaddps/vsubps with zero gathers!
 void stockham_r4_cpu<let B : int>(Ptr<float> src, Ptr<float> dst) {
     static const uint kQ = uint(B) >> 2u;
     for (uint k = 0u; k < kQ; ++k) {
@@ -135,9 +141,6 @@ void stockham_r2_cpu<let B : int>(Ptr<float> src, Ptr<float> dst) {
     }
 }
 
-// Unified Radix-4/Radix-2 Stockham Normalized FWHT for B in {16, 32, 64, 128, 256}.
-// Fuses load + optional suh scale + 1/sqrt(B) + first radix-4 stage; streams final
-// stage directly into y! Compiles to 100% full-width ZMM/YMM across all ISAs.
 void fwht_rows_b_cpu<let B : int, TSuh : IElement, let HAS_SUH : bool>(
     Ptr<float, Access.Read> x, uint x_stride,
     Ptr<TSuh.Storage, Access.Read> suh,
@@ -146,7 +149,6 @@ void fwht_rows_b_cpu<let B : int, TSuh : IElement, let HAS_SUH : bool>(
 {
     static const uint kB = uint(B);
     static const uint kQ = kB >> 2u;
-    static const uint kH = kB >> 1u;
     float norm = 1.0f / sqrt(float(B));
     float bufA[B];
     float bufB[B];
@@ -155,10 +157,9 @@ void fwht_rows_b_cpu<let B : int, TSuh : IElement, let HAS_SUH : bool>(
     Ptr<float> pb = &bufB[0];
 
     for (uint r = r0; r < r1; ++r) {
-        Ptr<float, Access.Read> xr = x + r * x_stride;
-        Ptr<float> yr = y + r * y_stride;
+        Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
+        Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
         for (uint c0 = 0u; c0 < cols; c0 += kB) {
-            // Fused Load + Scale + Radix-4 Stage (stages 1 & 2) -> pa
             for (uint k = 0u; k < kQ; ++k) {
                 uint base = c0 + k * 4u;
                 float a0 = xr[base + 0u] * norm;
@@ -190,7 +191,7 @@ void fwht_rows_b_cpu<let B : int, TSuh : IElement, let HAS_SUH : bool>(
                 stockham_r4_cpu<128>(pa, pb);
                 stockham_r4_cpu<128>(pb, pa);
                 stockham_r2_cpu<128>(pa, yr + c0);
-            } else { // B == 256
+            } else {
                 stockham_r4_cpu<256>(pa, pb);
                 stockham_r4_cpu<256>(pb, pa);
                 stockham_r4_cpu<256>(pa, yr + c0);
@@ -228,15 +229,30 @@ public void quantize_rows_f32_i8_cpu(
     uint r0, uint r1, uint cols)
 {
     for (uint r = r0; r < r1; ++r) {
-        Ptr<float, Access.Read> xr = x + r * x_stride;
-        Ptr<int8_t> qr = x_i8 + r * xi8_stride;
+        Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
+        Ptr<int8_t> qr = x_i8 + uint64_t(r) * uint64_t(xi8_stride);
         float amax = row_max_abs_f32_cpu(xr, cols);
-        float scale = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
-        float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
-        scale_out[r] = scale;
-        for (uint c = 0u; c < cols; ++c) {
-            float v = fast_clampf(round(xr[c] * inv_scale), -127.0f, 127.0f);
-            qr[c] = int8_t(int(v));
+        if (amax >= 1.0e-35f) {
+            float scale = amax / 127.0f;
+            float inv_scale = 127.0f / amax;
+            scale_out[r] = scale;
+            for (uint c = 0u; c < cols; ++c) {
+                float v = fast_clampf(round(xr[c] * inv_scale), -127.0f, 127.0f);
+                qr[c] = int8_t(int(v));
+            }
+        } else if (amax > 0.0f) {
+            // Tiny positive row where 127.0f / amax would overflow to +inf: divide safely by scale.
+            float scale = max(amax / 127.0f, 1.17549435e-38f);
+            scale_out[r] = scale;
+            for (uint c = 0u; c < cols; ++c) {
+                float v = fast_clampf(round(xr[c] / scale), -127.0f, 127.0f);
+                qr[c] = int8_t(int(v));
+            }
+        } else {
+            scale_out[r] = 1.0f;
+            for (uint c = 0u; c < cols; ++c) {
+                qr[c] = int8_t(0);
+            }
         }
     }
 }

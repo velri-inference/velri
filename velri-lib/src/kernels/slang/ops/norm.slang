@@ -22,8 +22,8 @@ public void rmsnorm_rows_cpu<TIO : IElement, TW : IElement>(
 {
     float inv_dim = 1.0f / float(dim);
     for (uint r = r0; r < r1; ++r) {
-        Ptr<TIO.Storage, Access.Read> xr = x + r * x_stride;
-        Ptr<TIO.Storage> yr = y + r * y_stride;
+        Ptr<TIO.Storage, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
+        Ptr<TIO.Storage> yr = y + uint64_t(r) * uint64_t(y_stride);
         float sum_sq = 0.0f;
         for (uint d = 0u; d < dim; ++d) {
             float v = TIO::toF32(xr[d]);
@@ -59,9 +59,9 @@ public void fused_add_rmsnorm_rows_cpu(
 {
     float inv_dim = 1.0f / float(dim);
     for (uint r = r0; r < r1; ++r) {
-        Ptr<float> rr = residual_inout + r * r_stride;
-        Ptr<float, Access.Read> xr = x + r * x_stride;
-        Ptr<float> yr = y + r * y_stride;
+        Ptr<float> rr = residual_inout + uint64_t(r) * uint64_t(r_stride);
+        Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
+        Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
         float sum_sq = 0.0f;
         for (uint d = 0u; d < dim; ++d) {
             float s = rr[d] + xr[d];
@@ -90,8 +90,8 @@ public void layernorm_rows_cpu(
 {
     float inv_dim = 1.0f / float(dim);
     for (uint r = r0; r < r1; ++r) {
-        Ptr<float, Access.Read> xr = x + r * x_stride;
-        Ptr<float> yr = y + r * y_stride;
+        Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
+        Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
         float sum = 0.0f;
         for (uint d = 0u; d < dim; ++d) sum += xr[d];
         float mean = sum * inv_dim;

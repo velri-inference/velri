@@ -27,23 +27,14 @@ public float fast_expf(float x) {
     return fast_exp2f(x * 1.4426950408889634f);
 }
 
-public float fast_tanhf(float x) {
-    float xc = fast_clampf(x, -9.0f, 9.0f);
-    float e2 = fast_exp2f(xc * 2.8853900817779268f);
-    return (e2 - 1.0f) / (e2 + 1.0f);
-}
-
 public interface IActivation {
     static float apply(float x);
 }
 
-public struct ActIdentity : IActivation {
-    public static float apply(float x) { return x; }
-}
-
 public struct ActSiLU : IActivation {
     public static float apply(float x) {
-        return x / (1.0f + fast_exp2f(x * -1.4426950408889634f));
+        float y = x / (1.0f + fast_exp2f(x * -1.4426950408889634f));
+        return select(x < -87.0f, 0.0f, y);
     }
 }
 
@@ -51,7 +42,8 @@ public struct ActGeluTanh : IActivation {
     public static float apply(float x) {
         // -2 * sqrt(2 / pi) * log2(e) = -2.30220780998f
         float a = (x * -2.30220781f) * fma(0.044715f * x, x, 1.0f);
-        return x / (1.0f + fast_exp2f(a));
+        float y = x / (1.0f + fast_exp2f(a));
+        return select(x < -10.5f, 0.0f, y);
     }
 }
 

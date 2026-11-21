@@ -1,8 +1,5 @@
 // Shared output epilogue components for Linear (GEMV & GEMM) across CPU and Vulkan.
-// Composes bias addition, per-row/per-column quantization scales, and activations.
 module epilogue;
-
-import activations;
 
 public struct EpilogueParams {
     public Ptr<float, Access.Read> bias;
@@ -36,12 +33,5 @@ public struct EpQuantScale : IEpilogue {
         acc *= s;
         if (ep.has_bias != 0u) acc += ep.bias[col];
         return acc;
-    }
-}
-
-// Composable fused epilogue: any base epilogue followed by any IActivation.
-public struct EpFusedAct<Base : IEpilogue, Act : IActivation> : IEpilogue {
-    public static float apply(float acc, uint row, uint col, EpilogueParams ep) {
-        return Act::apply(Base::apply(acc, row, col, ep));
     }
 }

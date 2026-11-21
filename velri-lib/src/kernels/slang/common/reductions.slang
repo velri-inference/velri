@@ -1,5 +1,5 @@
-// Shared GPU subgroup + workgroup reduction primitives (no hardcoded subgroup size).
-// Reused by Vulkan RMSNorm, LayerNorm, Softmax, and GEMV kernels.
+// Shared GPU subgroup + workgroup reduction primitives (subgroup-size agnostic: 4..128).
+// Reused by Vulkan RMSNorm, LayerNorm, Softmax, and QuantizeRow kernels.
 module reductions;
 
 // Maximum supported subgroups per workgroup (256 threads / min subgroup 4 = 64).
@@ -21,10 +21,12 @@ public float wg_reduce_sum(float val, uint tid, uint wg_size) {
     }
     GroupMemoryBarrierWithGroupSync();
 
-    float total = 0.0f;
     if (wave_id == 0u) {
-        float v = (lane_id < num_waves) ? g_reduce_buf[lane_id] : 0.0f;
-        total = WaveActiveSum(v);
+        float acc = 0.0f;
+        for (uint i = lane_id; i < num_waves; i += lane_count) {
+            acc += g_reduce_buf[i];
+        }
+        float total = WaveActiveSum(acc);
         if (lane_id == 0u) {
             g_reduce_buf[0] = total;
         }
@@ -49,8 +51,11 @@ public float wg_reduce_max(float val, uint tid, uint wg_size) {
     GroupMemoryBarrierWithGroupSync();
 
     if (wave_id == 0u) {
-        float v = (lane_id < num_waves) ? g_reduce_buf[lane_id] : -3.402823466e+38f;
-        float total = WaveActiveMax(v);
+        float acc = asfloat(0xFF800000u); // -INF
+        for (uint i = lane_id; i < num_waves; i += lane_count) {
+            acc = max(acc, g_reduce_buf[i]);
+        }
+        float total = WaveActiveMax(acc);
         if (lane_id == 0u) {
             g_reduce_buf[0] = total;
         }
