@@ -45,11 +45,9 @@ typedef enum {
 
 typedef struct {
     int hardware_threads;
-    int num_l3_domains;
     bool has_avx2;
     bool has_fma;
     bool has_f16c;
-    bool has_avx_vnni;
     bool has_avx512f;
     bool has_avx512bw;
     bool has_avx512dq;

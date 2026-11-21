@@ -63,7 +63,7 @@ static void detect_x86_features(velri_cpu_info *info) {
     int r0[4] = {0};
     __cpuid(r0, 0);
     max_leaf = (unsigned int)r0[0];
-    if (max_leaf < 1) {
+    if (max_leaf < 1U) {
         return;
     }
     int r1[4] = {0};
@@ -72,44 +72,50 @@ static void detect_x86_features(velri_cpu_info *info) {
     (void)eax; (void)ebx; (void)edx;
 #else
     max_leaf = __get_cpuid_max(0, nullptr);
-    if (max_leaf < 1 || !__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+    if (max_leaf < 1U || !__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
         return;
     }
 #endif
-    bool osxsave = (ecx & (1U << 27)) != 0;
-    uint64_t xcr0 = osxsave ? read_xcr0() : 0;
+    bool osxsave = (ecx & (1U << 27)) != 0U;
+    uint64_t xcr0 = osxsave ? read_xcr0() : 0U;
     bool ymm_os = (xcr0 & 0x6ULL) == 0x6ULL;
     bool zmm_os = (xcr0 & 0xE6ULL) == 0xE6ULL;
 
     if (ymm_os) {
-        info->has_fma = (ecx & (1U << 12)) != 0;
-        info->has_f16c = (ecx & (1U << 29)) != 0;
+        info->has_fma = (ecx & (1U << 12)) != 0U;
+        info->has_f16c = (ecx & (1U << 29)) != 0U;
     }
-    if (max_leaf < 7) {
+    if (max_leaf < 7U) {
         return;
     }
 
+    unsigned int max_subleaf = 0;
 #if defined(_MSC_VER)
     int r7[4] = {0};
     __cpuidex(r7, 7, 0);
+    max_subleaf = (unsigned int)r7[0];
     ebx = (unsigned int)r7[1];
     ecx = (unsigned int)r7[2];
 #else
     if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
         return;
     }
+    max_subleaf = eax;
 #endif
     if (ymm_os) {
-        info->has_avx2 = (ebx & (1U << 5)) != 0;
+        info->has_avx2 = (ebx & (1U << 5)) != 0U;
     }
     if (zmm_os) {
-        info->has_avx512f = (ebx & (1U << 16)) != 0;
-        info->has_avx512dq = (ebx & (1U << 17)) != 0;
-        info->has_avx512bw = (ebx & (1U << 30)) != 0;
-        info->has_avx512vl = (ebx & (1U << 31)) != 0;
-        info->has_avx512_vnni = (ecx & (1U << 11)) != 0;
+        info->has_avx512f = (ebx & (1U << 16)) != 0U;
+        info->has_avx512dq = (ebx & (1U << 17)) != 0U;
+        info->has_avx512bw = (ebx & (1U << 30)) != 0U;
+        info->has_avx512vl = (ebx & (1U << 31)) != 0U;
+        info->has_avx512_vnni = (ecx & (1U << 11)) != 0U;
     }
 
+    if (max_subleaf < 1U) {
+        return;
+    }
     unsigned int a1 = 0, b1 = 0, c1 = 0, d1 = 0;
 #if defined(_MSC_VER)
     int r71[4] = {0};
@@ -121,17 +127,13 @@ static void detect_x86_features(velri_cpu_info *info) {
         return;
     }
 #endif
-    if (ymm_os) {
-        info->has_avx_vnni = (a1 & (1U << 4)) != 0;
-    }
     if (zmm_os && info->has_avx512f && info->has_avx512bw && info->has_avx512vl) {
-        info->has_avx512_bf16 = (a1 & (1U << 5)) != 0;
+        info->has_avx512_bf16 = (a1 & (1U << 5)) != 0U;
     }
 }
 #endif
 
 static velri_cpu_info g_info;
-static size_t g_l3_domain_bytes = 16ULL * 1024ULL * 1024ULL;
 static atomic_int g_init_state = 0; /* 0 = uninit, 1 = busy, 2 = ready */
 
 static void init_cpu_info_once(void) {
@@ -149,7 +151,6 @@ static void init_cpu_info_once(void) {
 
     velri_cpu_info info = {0};
     info.hardware_threads = velri_os_hardware_threads();
-    velri_os_detect_l3(info.hardware_threads, &info.num_l3_domains, &g_l3_domain_bytes);
 #if defined(__x86_64__) || defined(_M_X64)
     detect_x86_features(&info);
 #endif
@@ -161,19 +162,6 @@ static void init_cpu_info_once(void) {
 const velri_cpu_info *velri_get_cpu_info(void) {
     init_cpu_info_once();
     return &g_info;
-}
-
-int velri_current_l3_domain(void) {
-    init_cpu_info_once();
-    if (g_info.num_l3_domains <= 1) {
-        return 0;
-    }
-    return velri_os_current_l3_domain();
-}
-
-size_t velri_l3_domain_bytes(void) {
-    init_cpu_info_once();
-    return g_l3_domain_bytes;
 }
 
 bool velri_cpu_variant_supported(velri_cpu_variant variant) {
@@ -188,8 +176,8 @@ bool velri_cpu_variant_supported(velri_cpu_variant variant) {
     case VELRI_CPU_AVX2:
         return c->has_avx2 && c->has_fma && c->has_f16c;
     case VELRI_CPU_AVX512:
-        return c->has_avx512f && c->has_avx512bw && c->has_avx512dq && c->has_avx512vl &&
-               c->has_fma && c->has_f16c;
+        return c->has_avx2 && c->has_avx512f && c->has_avx512bw && c->has_avx512dq &&
+               c->has_avx512vl && c->has_fma && c->has_f16c;
 #endif
     default:
         return false;

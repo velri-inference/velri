@@ -1,25 +1,8 @@
-#include "os.h"
 #include "reference.h"
 #include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-
-velri_guard_buf velri_guard_alloc(size_t bytes, size_t align) {
-    velri_os_guard_buf g = velri_os_guard_alloc(bytes, align);
-    return (velri_guard_buf){.raw_map = g.raw_map, .map_bytes = g.map_bytes, .ptr = g.ptr};
-}
-
-void velri_guard_free(velri_guard_buf *gb) {
-    if (!gb) {
-        return;
-    }
-    velri_os_guard_buf g = {.raw_map = gb->raw_map, .map_bytes = gb->map_bytes, .ptr = gb->ptr};
-    velri_os_guard_free(&g);
-    gb->raw_map = nullptr;
-    gb->ptr = nullptr;
-    gb->map_bytes = 0;
-}
 
 uint32_t velri_test_rng(uint64_t *state) {
     uint64_t x = *state;

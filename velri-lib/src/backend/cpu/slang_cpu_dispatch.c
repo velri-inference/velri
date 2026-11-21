@@ -179,9 +179,7 @@ typedef struct {
     int mode; /* 0=f32, 1=f16_f32, 2=bf16_f32, 3=f32x_bf16w, 4=f64, 5=w8a8_f32 */
 } slang_lin_ctx;
 
-static void slang_lin_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc;
-    (void)scb;
+static void slang_lin_worker(void *vctx, size_t wid, size_t nw) {
     const slang_lin_ctx *c = (const slang_lin_ctx *)vctx;
     uint32_t r0 = 0u, r1 = c->rows;
     uint32_t c0 = 0u, c1 = c->m;
@@ -283,7 +281,7 @@ velri_status velri_slang_cpu_linear(
     if (pool && active_workers > 1) {
         velri_pool_parallel(pool, active_workers, slang_lin_worker, &ctx);
     } else {
-        slang_lin_worker(&ctx, 0, 1, nullptr, 0);
+        slang_lin_worker(&ctx, 0, 1);
     }
     return VELRI_OK;
 }
@@ -297,8 +295,7 @@ typedef struct {
     void *y;
 } slang_norm_ctx;
 
-static void slang_norm_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_norm_worker(void *vctx, size_t wid, size_t nw) {
     const slang_norm_ctx *c = (const slang_norm_ctx *)vctx;
     uint32_t r0 = (uint32_t)((c->rows * wid) / nw);
     uint32_t r1 = (uint32_t)((c->rows * (wid + 1u)) / nw);
@@ -333,7 +330,7 @@ velri_status velri_slang_cpu_rmsnorm(
     if (pool && active_workers > 1 && rows > 1)
         velri_pool_parallel(pool, active_workers, slang_norm_worker, &ctx);
     else
-        slang_norm_worker(&ctx, 0, 1, nullptr, 0);
+        slang_norm_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -346,8 +343,7 @@ typedef struct {
     void *y;
 } slang_rope_ctx;
 
-static void slang_rope_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_rope_worker(void *vctx, size_t wid, size_t nw) {
     const slang_rope_ctx *c = (const slang_rope_ctx *)vctx;
     uint32_t t0 = (uint32_t)((c->n_tokens * wid) / nw);
     uint32_t t1 = (uint32_t)((c->n_tokens * (wid + 1u)) / nw);
@@ -386,7 +382,7 @@ velri_status velri_slang_cpu_rope(
     if (pool && active_workers > 1 && n_tokens > 1)
         velri_pool_parallel(pool, active_workers, slang_rope_worker, &ctx);
     else
-        slang_rope_worker(&ctx, 0, 1, nullptr, 0);
+        slang_rope_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -399,8 +395,7 @@ typedef struct {
     float *y;
 } slang_gated_ctx;
 
-static void slang_gated_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_gated_worker(void *vctx, size_t wid, size_t nw) {
     const slang_gated_ctx *c = (const slang_gated_ctx *)vctx;
     uint32_t i0 = (uint32_t)((c->count * wid) / nw);
     uint32_t i1 = (uint32_t)((c->count * (wid + 1u)) / nw);
@@ -426,7 +421,7 @@ velri_status velri_slang_cpu_gated_mlp_f32(
     if (pool && active_workers > 1)
         velri_pool_parallel(pool, active_workers, slang_gated_worker, &ctx);
     else
-        slang_gated_worker(&ctx, 0, 1, nullptr, 0);
+        slang_gated_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -437,8 +432,7 @@ typedef struct {
     float *y;
 } slang_sm_ctx;
 
-static void slang_sm_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_sm_worker(void *vctx, size_t wid, size_t nw) {
     const slang_sm_ctx *c = (const slang_sm_ctx *)vctx;
     uint32_t r0 = (uint32_t)((c->rows * wid) / nw);
     uint32_t r1 = (uint32_t)((c->rows * (wid + 1u)) / nw);
@@ -460,7 +454,7 @@ velri_status velri_slang_cpu_softmax_f32(
     if (pool && active_workers > 1 && rows > 1)
         velri_pool_parallel(pool, active_workers, slang_sm_worker, &ctx);
     else
-        slang_sm_worker(&ctx, 0, 1, nullptr, 0);
+        slang_sm_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -474,8 +468,7 @@ typedef struct {
     float *y;
 } slang_far_ctx;
 
-static void slang_far_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_far_worker(void *vctx, size_t wid, size_t nw) {
     const slang_far_ctx *c = (const slang_far_ctx *)vctx;
     uint32_t r0 = (uint32_t)((c->rows * wid) / nw);
     uint32_t r1 = (uint32_t)((c->rows * (wid + 1u)) / nw);
@@ -503,7 +496,7 @@ velri_status velri_slang_cpu_fused_add_rmsnorm_f32(
     if (pool && active_workers > 1 && rows > 1)
         velri_pool_parallel(pool, active_workers, slang_far_worker, &ctx);
     else
-        slang_far_worker(&ctx, 0, 1, nullptr, 0);
+        slang_far_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -516,8 +509,7 @@ typedef struct {
     float *y;
 } slang_ln_ctx;
 
-static void slang_ln_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_ln_worker(void *vctx, size_t wid, size_t nw) {
     const slang_ln_ctx *c = (const slang_ln_ctx *)vctx;
     uint32_t r0 = (uint32_t)((c->rows * wid) / nw);
     uint32_t r1 = (uint32_t)((c->rows * (wid + 1u)) / nw);
@@ -545,7 +537,7 @@ velri_status velri_slang_cpu_layernorm_f32(
     if (pool && active_workers > 1 && rows > 1)
         velri_pool_parallel(pool, active_workers, slang_ln_worker, &ctx);
     else
-        slang_ln_worker(&ctx, 0, 1, nullptr, 0);
+        slang_ln_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -558,8 +550,7 @@ typedef struct {
     float *y;
 } slang_act_ctx;
 
-static void slang_act_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_act_worker(void *vctx, size_t wid, size_t nw) {
     const slang_act_ctx *c = (const slang_act_ctx *)vctx;
     uint32_t i0 = (uint32_t)((c->count * wid) / nw);
     uint32_t i1 = (uint32_t)((c->count * (wid + 1u)) / nw);
@@ -583,7 +574,7 @@ velri_status velri_slang_cpu_activation_f32(
     if (pool && active_workers > 1)
         velri_pool_parallel(pool, active_workers, slang_act_worker, &ctx);
     else
-        slang_act_worker(&ctx, 0, 1, nullptr, 0);
+        slang_act_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -597,8 +588,7 @@ typedef struct {
     int is_mul;
 } slang_vec_ctx;
 
-static void slang_vec_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_vec_worker(void *vctx, size_t wid, size_t nw) {
     const slang_vec_ctx *c = (const slang_vec_ctx *)vctx;
     uint32_t i0 = (uint32_t)((c->count * wid) / nw);
     uint32_t i1 = (uint32_t)((c->count * (wid + 1u)) / nw);
@@ -622,7 +612,7 @@ velri_status velri_slang_cpu_vec_axpby_f32(
     if (pool && active_workers > 1)
         velri_pool_parallel(pool, active_workers, slang_vec_worker, &ctx);
     else
-        slang_vec_worker(&ctx, 0, 1, nullptr, 0);
+        slang_vec_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -640,7 +630,7 @@ velri_status velri_slang_cpu_vec_mul_f32(
     if (pool && active_workers > 1)
         velri_pool_parallel(pool, active_workers, slang_vec_worker, &ctx);
     else
-        slang_vec_worker(&ctx, 0, 1, nullptr, 0);
+        slang_vec_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -653,8 +643,7 @@ typedef struct {
     float *y;
 } slang_fwht_ctx;
 
-static void slang_fwht_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_fwht_worker(void *vctx, size_t wid, size_t nw) {
     const slang_fwht_ctx *c = (const slang_fwht_ctx *)vctx;
     uint32_t r0 = (uint32_t)((c->rows * wid) / nw);
     uint32_t r1 = (uint32_t)((c->rows * (wid + 1u)) / nw);
@@ -689,7 +678,7 @@ velri_status velri_slang_cpu_fwht_f32(
     if (pool && active_workers > 1 && rows > 1)
         velri_pool_parallel(pool, active_workers, slang_fwht_worker, &ctx);
     else
-        slang_fwht_worker(&ctx, 0, 1, nullptr, 0);
+        slang_fwht_worker(&ctx, 0, 1);
     return VELRI_OK;
 }
 
@@ -702,8 +691,7 @@ typedef struct {
     float *scale_out;
 } slang_qrow_ctx;
 
-static void slang_qrow_worker(void *vctx, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void slang_qrow_worker(void *vctx, size_t wid, size_t nw) {
     const slang_qrow_ctx *c = (const slang_qrow_ctx *)vctx;
     uint32_t r0 = (uint32_t)((c->rows * wid) / nw);
     uint32_t r1 = (uint32_t)((c->rows * (wid + 1u)) / nw);
@@ -728,6 +716,6 @@ velri_status velri_slang_cpu_quantize_row_f32_i8(
     if (pool && active_workers > 1 && rows > 1)
         velri_pool_parallel(pool, active_workers, slang_qrow_worker, &ctx);
     else
-        slang_qrow_worker(&ctx, 0, 1, nullptr, 0);
+        slang_qrow_worker(&ctx, 0, 1);
     return VELRI_OK;
 }

@@ -6,13 +6,12 @@
 
 /*
  * Persistent low-latency worker pool (100% OS-agnostic C23; all OS primitives
- * live in `velri_platform` via `os.h`).
+ * live in `os.h`).
  */
 
 typedef struct {
     alignas(64) _Atomic uint64_t done_gen;
     size_t worker_id;
-    void *scratch;
     velri_pool *pool;
     velri_os_thread *thread;
     velri_os_mutex *mtx;
@@ -21,7 +20,6 @@ typedef struct {
 
 struct velri_pool {
     size_t num_workers;
-    size_t scratch_bytes;
     atomic_bool stopping;
     velri_parallel_fn fn;
     void *fn_ctx;
@@ -47,9 +45,6 @@ static void worker_loop(void *arg) {
     const size_t mask_idx = wid >> 6;
     const uint64_t mask_bit = UINT64_C(1) << (wid & 63U);
 
-    if (slot->scratch && pool->scratch_bytes > 0) {
-        memset(slot->scratch, 0, pool->scratch_bytes);
-    }
     atomic_store_explicit(&slot->done_gen, UINT64_C(1), memory_order_release);
 
     uint64_t g = UINT64_C(1);
@@ -100,7 +95,7 @@ static void worker_loop(void *arg) {
             return;
         }
 
-        pool->fn(pool->fn_ctx, wid, cnw, slot->scratch, pool->scratch_bytes);
+        pool->fn(pool->fn_ctx, wid, cnw);
 
         atomic_store_explicit(&slot->done_gen, cg, memory_order_release);
         g = cg;
@@ -111,21 +106,16 @@ static void free_pool_slots(velri_pool *pool, size_t count) {
     for (size_t j = 0; j < count; ++j) {
         velri_os_cond_destroy(pool->slots[j].cv);
         velri_os_mutex_destroy(pool->slots[j].mtx);
-        velri_os_aligned_free(pool->slots[j].scratch);
     }
     velri_os_aligned_free(pool->slots);
     velri_os_aligned_free(pool);
 }
 
-velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
-                               velri_pool **out_pool) {
+velri_status velri_pool_create(size_t num_workers, velri_pool **out_pool) {
     if (!out_pool || num_workers == 0 || num_workers > 256) {
         return VELRI_ERR_INVALID;
     }
     *out_pool = nullptr;
-    if (scratch_per_worker > SIZE_MAX - 63) {
-        return VELRI_ERR_OVERFLOW;
-    }
 
     velri_pool *pool = (velri_pool *)velri_os_aligned_alloc(64, sizeof(velri_pool));
     if (!pool) {
@@ -133,7 +123,6 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
     }
     memset(pool, 0, sizeof(*pool));
     pool->num_workers = num_workers;
-    pool->scratch_bytes = (scratch_per_worker + 63ULL) & ~63ULL;
     pool->last_nw = 1ULL;
     pool->host_gen = UINT64_C(1);
     atomic_init(&pool->stopping, false);
@@ -161,18 +150,8 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
                 return VELRI_ERR_NOMEM;
             }
         }
-        if (pool->scratch_bytes > 0) {
-            pool->slots[i].scratch = velri_os_aligned_alloc(64, pool->scratch_bytes);
-            if (!pool->slots[i].scratch) {
-                free_pool_slots(pool, i + 1);
-                return VELRI_ERR_NOMEM;
-            }
-        }
     }
 
-    if (pool->slots[0].scratch && pool->scratch_bytes > 0) {
-        memset(pool->slots[0].scratch, 0, pool->scratch_bytes);
-    }
     atomic_store_explicit(&pool->slots[0].done_gen, UINT64_C(1), memory_order_release);
 
     for (size_t i = 1; i < num_workers; ++i) {
@@ -222,14 +201,6 @@ void velri_pool_destroy(velri_pool *pool) {
     free_pool_slots(pool, pool->num_workers);
 }
 
-size_t velri_pool_num_workers(const velri_pool *pool) { return pool ? pool->num_workers : 0; }
-
-size_t velri_pool_scratch_bytes(const velri_pool *pool) { return pool ? pool->scratch_bytes : 0; }
-
-void *velri_pool_worker0_scratch(velri_pool *pool) {
-    return (pool && pool->num_workers > 0) ? pool->slots[0].scratch : nullptr;
-}
-
 void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel_fn fn, void *ctx) {
     if (!fn) {
         return;
@@ -241,9 +212,7 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
             atomic_store_explicit(&pool->dispatch_word, (next_gen << 16) | UINT64_C(1),
                                   memory_order_release);
         }
-        void *s0 = pool ? pool->slots[0].scratch : nullptr;
-        size_t sb = pool ? pool->scratch_bytes : 0;
-        fn(ctx, 0, 1, s0, sb);
+        fn(ctx, 0, 1);
         return;
     }
 
@@ -275,7 +244,7 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
         }
     }
 
-    fn(ctx, 0, nw, pool->slots[0].scratch, pool->scratch_bytes);
+    fn(ctx, 0, nw);
 
     for (size_t i = 1; i < nw; ++i) {
         while (atomic_load_explicit(&pool->slots[i].done_gen, memory_order_acquire) != next_gen) {

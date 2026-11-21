@@ -5,26 +5,15 @@
 #include <stdint.h>
 
 /*
- * Single OS abstraction boundary for Velri-lib (`velri_platform`).
+ * Single OS abstraction boundary for Velri-lib.
  *
- * All OS-specific headers (<pthread.h>, <windows.h>, <dlfcn.h>, <sys/mman.h>,
- * <unistd.h>, <time.h>, <sched.h>) live strictly in `os_posix.c` and `os_win32.c`.
- * Core runtime, backends, tests, and tools include only this OS-agnostic header.
+ * All OS-specific headers (<pthread.h>, <windows.h>, <dlfcn.h>, <unistd.h>,
+ * <time.h>) live strictly in `os_posix.c` and `os_win32.c`.
  */
 
 /* ---- Aligned Memory ---- */
 void *velri_os_aligned_alloc(size_t align, size_t bytes);
 void velri_os_aligned_free(void *ptr);
-
-/* ---- Guard-Page Memory (no-access page placed immediately after payload) ---- */
-typedef struct {
-    void *raw_map;
-    size_t map_bytes;
-    void *ptr;
-} velri_os_guard_buf;
-
-velri_os_guard_buf velri_os_guard_alloc(size_t bytes, size_t align);
-void velri_os_guard_free(velri_os_guard_buf *gb);
 
 /* ---- Monotonic Time & Sleep ---- */
 uint64_t velri_os_monotonic_ns(void);
@@ -56,10 +45,8 @@ void velri_os_cond_destroy(velri_os_cond *cv);
 void velri_os_cond_wait(velri_os_cond *cv, velri_os_mutex *mtx);
 void velri_os_cond_signal(velri_os_cond *cv);
 
-/* ---- CPU & Cache Topology Hints ---- */
+/* ---- CPU Hints ---- */
 int velri_os_hardware_threads(void);
-void velri_os_detect_l3(int hardware_threads, int *out_num_domains, size_t *out_domain_bytes);
-int velri_os_current_l3_domain(void);
 void velri_os_cpu_relax(void);
 size_t velri_os_ctz64(uint64_t x);
 

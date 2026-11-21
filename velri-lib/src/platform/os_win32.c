@@ -21,52 +21,14 @@ void *velri_os_aligned_alloc(size_t align, size_t bytes) {
     if ((eff_align & (eff_align - 1U)) != 0U) {
         return nullptr;
     }
+    if (bytes > SIZE_MAX - (eff_align - 1U)) {
+        return nullptr;
+    }
     size_t sz = bytes ? ((bytes + eff_align - 1U) & ~(eff_align - 1U)) : eff_align;
     return _aligned_malloc(sz, eff_align);
 }
 
 void velri_os_aligned_free(void *ptr) { _aligned_free(ptr); }
-
-/* ---- Guard-Page Memory (real VirtualAlloc + PAGE_NOACCESS page on Windows) ---- */
-
-velri_os_guard_buf velri_os_guard_alloc(size_t bytes, size_t align) {
-    velri_os_guard_buf gb = {0};
-    if (align == 0U) {
-        align = 1U;
-    }
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    size_t page = si.dwPageSize ? (size_t)si.dwPageSize : 4096U;
-    size_t need = ((bytes + align + page - 1U) / page) * page;
-    if (need == 0U) {
-        need = page;
-    }
-    size_t total = need + page;
-    uint8_t *base = (uint8_t *)VirtualAlloc(nullptr, total, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!base) {
-        abort();
-    }
-    DWORD old_prot = 0;
-    if (!VirtualProtect(base + need, page, PAGE_NOACCESS, &old_prot)) {
-        abort();
-    }
-    uintptr_t end_addr = (uintptr_t)(base + need);
-    uintptr_t start_addr = (end_addr - bytes) & ~(uintptr_t)(align - 1U);
-    gb.raw_map = base;
-    gb.map_bytes = total;
-    gb.ptr = (void *)start_addr;
-    return gb;
-}
-
-void velri_os_guard_free(velri_os_guard_buf *gb) {
-    if (!gb || !gb->raw_map) {
-        return;
-    }
-    VirtualFree(gb->raw_map, 0, MEM_RELEASE);
-    gb->raw_map = nullptr;
-    gb->ptr = nullptr;
-    gb->map_bytes = 0U;
-}
 
 /* ---- Monotonic Time & Sleep ---- */
 
@@ -212,7 +174,7 @@ void velri_os_cond_wait(velri_os_cond *cv, velri_os_mutex *mtx) {
 
 void velri_os_cond_signal(velri_os_cond *cv) { WakeConditionVariable(&cv->handle); }
 
-/* ---- CPU & Cache Topology Hints ---- */
+/* ---- CPU Hints ---- */
 
 int velri_os_hardware_threads(void) {
     DWORD nproc = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
@@ -224,25 +186,26 @@ int velri_os_hardware_threads(void) {
     return (nproc > 0 && nproc < 65536) ? (int)nproc : 1;
 }
 
-void velri_os_detect_l3(int hardware_threads, int *out_num_domains, size_t *out_domain_bytes) {
-    (void)hardware_threads;
-    if (out_num_domains) {
-        *out_num_domains = 1;
-    }
-    if (out_domain_bytes) {
-        *out_domain_bytes = 16ULL * 1024ULL * 1024ULL;
-    }
-}
-
-int velri_os_current_l3_domain(void) { return -1; }
-
 void velri_os_cpu_relax(void) { YieldProcessor(); }
 
 size_t velri_os_ctz64(uint64_t x) {
+    if (x == 0U) {
+        return 64U;
+    }
 #if defined(_MSC_VER)
     unsigned long idx = 0;
+#if defined(_WIN64)
     _BitScanForward64(&idx, x);
     return (size_t)idx;
+#else
+    uint32_t lo = (uint32_t)x;
+    if (lo != 0U) {
+        _BitScanForward(&idx, lo);
+        return (size_t)idx;
+    }
+    _BitScanForward(&idx, (uint32_t)(x >> 32));
+    return 32U + (size_t)idx;
+#endif
 #else
     return (size_t)__builtin_ctzll(x);
 #endif

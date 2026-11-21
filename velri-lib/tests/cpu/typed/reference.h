@@ -3,16 +3,6 @@
 
 #include "velri_lib/kernels.h"
 
-/* Exact-end POSIX guard-page allocation (`PROT_NONE` page immediately after buffer) */
-typedef struct {
-    void *raw_map;
-    size_t map_bytes;
-    void *ptr;
-} velri_guard_buf;
-
-velri_guard_buf velri_guard_alloc(size_t bytes, size_t align);
-void velri_guard_free(velri_guard_buf *gb);
-
 /* Deterministic PRNG for reproducible tests */
 uint32_t velri_test_rng(uint64_t *state);
 float velri_test_rand_f32(uint64_t *state, float lo, float hi);

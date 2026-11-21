@@ -25,11 +25,18 @@ set(VELRI_SLANG_COMMON_DEPS
     "${VELRI_SLANG_DIR}/common/numeric.slang"
     "${VELRI_SLANG_DIR}/common/activations.slang"
     "${VELRI_SLANG_DIR}/common/epilogue.slang"
-    "${VELRI_SLANG_DIR}/common/reductions.slang"
+)
+set(VELRI_SLANG_CPU_DEPS
+    ${VELRI_SLANG_COMMON_DEPS}
     "${VELRI_SLANG_DIR}/ops/norm.slang"
     "${VELRI_SLANG_DIR}/ops/rope.slang"
     "${VELRI_SLANG_DIR}/ops/elementwise.slang"
     "${VELRI_SLANG_DIR}/ops/linear_cpu.slang"
+)
+set(VELRI_SLANG_VK_DEPS
+    ${VELRI_SLANG_COMMON_DEPS}
+    "${VELRI_SLANG_DIR}/common/reductions.slang"
+    "${VELRI_SLANG_DIR}/ops/norm.slang"
 )
 
 set(_velri_obj_ext "${CMAKE_C_OUTPUT_EXTENSION}")
@@ -43,6 +50,8 @@ endif()
 
 # Collect target/ABI flags from CMake so Clang `.ll -> .o` inherits the exact
 # cross-compilation toolchain target without hardcoding OS or CPU architecture.
+# When x86-64 fat-binary multiversioning is enabled, never leak host `-march=`/`-mcpu=`
+# from CMAKE_C_FLAGS into per-ISA variants (each variant explicitly sets its own ISA).
 set(_velri_clang_target_flags)
 if(CMAKE_C_COMPILER_TARGET)
     list(APPEND _velri_clang_target_flags "--target=${CMAKE_C_COMPILER_TARGET}")
@@ -63,7 +72,9 @@ foreach(_f IN LISTS _velri_c_flag_list)
     elseif(_f STREQUAL "-target")
         list(APPEND _velri_clang_target_flags "${_f}")
         set(_velri_next_is_target ON)
-    elseif(_f MATCHES "^(--target=|--sysroot=|-march=|-mcpu=|-mtune=|-mabi=|-mfpu=|-mfloat-abi=)")
+    elseif(_f MATCHES "^(--target=|--sysroot=|-mabi=|-mfpu=|-mfloat-abi=)")
+        list(APPEND _velri_clang_target_flags "${_f}")
+    elseif(NOT VELRI_X86_VARIANTS AND _f MATCHES "^(-march=|-mcpu=|-mtune=)")
         list(APPEND _velri_clang_target_flags "${_f}")
     endif()
 endforeach()
@@ -75,7 +86,7 @@ set_property(CACHE VELRI_SLANG_CPU_MODE PROPERTY STRINGS AUTO LLVM_IR OBJECT)
 
 set(_velri_use_llvm_ir OFF)
 if(VELRI_SLANG_CPU_MODE STREQUAL "LLVM_IR" OR
-   (VELRI_SLANG_CPU_MODE STREQUAL "AUTO" AND CMAKE_C_COMPILER_ID STREQUAL "Clang"))
+   (VELRI_SLANG_CPU_MODE STREQUAL "AUTO" AND CMAKE_C_COMPILER_ID MATCHES "Clang"))
     # Probe whether this Clang parses LLVM IR emitted by this `slangc` version
     # and targets the active toolchain architecture cleanly.
     set(_probe_dir "${VELRI_SLANG_GEN_DIR}/probe")
@@ -207,7 +218,7 @@ function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_is
                 "-DOUTPUT_LL=${_clean_ll}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/strip_ll_target.cmake"
             COMMAND ${_cc_cmd}
-            DEPENDS "${VELRI_SLANG_CPU_ENTRY}" ${VELRI_SLANG_COMMON_DEPS}
+            DEPENDS "${VELRI_SLANG_CPU_ENTRY}" ${VELRI_SLANG_CPU_DEPS}
                     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/strip_ll_target.cmake"
             COMMENT "Slang AOT CPU (${isa}, LLVM IR -> Clang): entry_cpu.slang -> slang_cpu_${isa}${_velri_obj_ext}"
             VERBATIM
@@ -230,7 +241,7 @@ function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_is
         add_custom_command(
             OUTPUT "${_obj}"
             COMMAND ${_cmd}
-            DEPENDS "${VELRI_SLANG_CPU_ENTRY}" ${VELRI_SLANG_COMMON_DEPS}
+            DEPENDS "${VELRI_SLANG_CPU_ENTRY}" ${VELRI_SLANG_CPU_DEPS}
             COMMENT "Slang AOT CPU (${isa}, ${_velri_triple}): entry_cpu.slang -> slang_cpu_${isa}${_velri_obj_ext}"
             VERBATIM
         )
@@ -258,14 +269,14 @@ if(VELRI_X86_VARIANTS)
         set(_avx2_cc_flags /arch:AVX2)
         set(_avx512_cc_flags /arch:AVX512)
     else()
-        set(_avx2_cc_flags -mavx2 -mfma -mf16c)
-        set(_avx512_cc_flags -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni -mfma -mf16c)
+        set(_avx2_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mfma -mf16c)
+        set(_avx512_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -mf16c)
     endif()
     velri_add_slang_cpu_variant(avx2 3 32 16
         "+avx2,+fma,+f16c"
         "${_avx2_cc_flags}" "")
     velri_add_slang_cpu_variant(avx512 6 64 32
-        "+avx512f,+avx512bw,+avx512dq,+avx512vl,+avx512vnni,+fma,+f16c"
+        "+avx2,+avx512f,+avx512bw,+avx512dq,+avx512vl,+fma,+f16c"
         "${_avx512_cc_flags}" "")
 endif()
 
@@ -274,7 +285,6 @@ add_library(velri_cpu STATIC
     ${VELRI_SLANG_CPU_OBJS}
 )
 add_library(VelriLib::cpu ALIAS velri_cpu)
-add_library(VelriLib::slang_cpu ALIAS velri_cpu)
 set_target_properties(velri_cpu PROPERTIES
     EXPORT_NAME cpu
     POSITION_INDEPENDENT_CODE ON
@@ -291,7 +301,7 @@ if(UNIX)
     target_link_libraries(velri_cpu PRIVATE m)
 endif()
 
-if(VELRI_LIB_BUILD_TESTS OR VELRI_ENABLE_VULKAN)
+if(VELRI_LIB_BUILD_TESTS)
     add_library(velri_typed_reference STATIC tests/cpu/typed/reference.c)
     target_include_directories(velri_typed_reference PUBLIC tests/cpu/typed
         PRIVATE include)
@@ -301,13 +311,10 @@ if(VELRI_LIB_BUILD_TESTS OR VELRI_ENABLE_VULKAN)
         target_compile_options(velri_typed_reference PRIVATE ${VELRI_BASE_FLAGS} -ffp-contract=off)
     endif()
     velri_strict_target(velri_typed_reference)
-    target_link_libraries(velri_typed_reference PRIVATE velri_platform)
     if(UNIX)
         target_link_libraries(velri_typed_reference PUBLIC m)
     endif()
-endif()
 
-if(VELRI_LIB_BUILD_TESTS)
     add_executable(bench_slang_cpu tools/bench_slang_cpu.c)
     target_compile_definitions(bench_slang_cpu PRIVATE VELRI_X86_VARIANTS=${VELRI_X86_VARIANTS})
     target_compile_options(bench_slang_cpu PRIVATE ${VELRI_BASE_FLAGS})
@@ -385,32 +392,24 @@ if(VELRI_ENABLE_VULKAN)
             list(APPEND _extra_caps -capability spvBFloat16KHR)
         endif()
 
+        set(_val_cmd)
+        set(_spv_comment "Slang AOT SPIR-V: ${_entry}.spv")
         if(VELRI_SPIRV_VAL)
-            add_custom_command(
-                OUTPUT "${_spv}"
-                COMMAND "${VELRI_SLANGC}" "${VELRI_SLANG_VK_ENTRY}"
-                    -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
-                    -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
-                    ${_extra_caps}
-                    -entry "${_entry}" -stage compute -o "${_spv}"
-                COMMAND "${VELRI_SPIRV_VAL}" --target-env vulkan1.3 "${_spv}"
-                DEPENDS "${VELRI_SLANG_VK_ENTRY}" ${VELRI_SLANG_COMMON_DEPS}
-                COMMENT "Slang AOT SPIR-V + spirv-val: ${_entry}.spv"
-                VERBATIM
-            )
-        else()
-            add_custom_command(
-                OUTPUT "${_spv}"
-                COMMAND "${VELRI_SLANGC}" "${VELRI_SLANG_VK_ENTRY}"
-                    -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
-                    -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
-                    ${_extra_caps}
-                    -entry "${_entry}" -stage compute -o "${_spv}"
-                DEPENDS "${VELRI_SLANG_VK_ENTRY}" ${VELRI_SLANG_COMMON_DEPS}
-                COMMENT "Slang AOT SPIR-V: ${_entry}.spv"
-                VERBATIM
-            )
+            set(_val_cmd COMMAND "${VELRI_SPIRV_VAL}" --target-env vulkan1.3 "${_spv}")
+            set(_spv_comment "Slang AOT SPIR-V + spirv-val: ${_entry}.spv")
         endif()
+        add_custom_command(
+            OUTPUT "${_spv}"
+            COMMAND "${VELRI_SLANGC}" "${VELRI_SLANG_VK_ENTRY}"
+                -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
+                -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
+                ${_extra_caps}
+                -entry "${_entry}" -stage compute -o "${_spv}"
+            ${_val_cmd}
+            DEPENDS "${VELRI_SLANG_VK_ENTRY}" ${VELRI_SLANG_VK_DEPS}
+            COMMENT "${_spv_comment}"
+            VERBATIM
+        )
         list(APPEND VELRI_VK_SPV_FILES "${_spv}")
     endforeach()
 
@@ -447,7 +446,7 @@ if(VELRI_ENABLE_VULKAN)
     )
     target_compile_options(velri_vulkan PRIVATE ${VELRI_BASE_FLAGS})
     velri_strict_target(velri_vulkan)
-    target_link_libraries(velri_vulkan PUBLIC velri_cpu)
+    target_link_libraries(velri_vulkan PUBLIC velri_platform)
 
     if(VELRI_LIB_BUILD_TESTS)
         add_executable(bench_vulkan tools/bench_vulkan.c)

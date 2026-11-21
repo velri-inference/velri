@@ -99,7 +99,7 @@ static velri_status cpu_open_device(uint32_t local_index, velri_backend_device *
     atomic_flag_clear(&dev->pool_busy);
 
     if (nw > 1U) {
-        velri_status st = velri_pool_create(nw, 0U, &dev->pool);
+        velri_status st = velri_pool_create(nw, &dev->pool);
         if (st != VELRI_OK) {
             free(dev);
             return st;

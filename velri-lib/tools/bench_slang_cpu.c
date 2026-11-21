@@ -480,8 +480,7 @@ typedef struct {
     volatile double sink;
 } cpu_bw_ctx;
 
-static void bw_read_worker(void *v, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void bw_read_worker(void *v, size_t wid, size_t nw) {
     cpu_bw_ctx *c = (cpu_bw_ctx *)v;
     size_t i0 = ((c->n / 16u) * wid / nw) * 16u;
     size_t i1 = ((c->n / 16u) * (wid + 1u) / nw) * 16u;
@@ -498,8 +497,7 @@ static void bw_read_worker(void *v, size_t wid, size_t nw, void *sc, size_t scb)
 
 #if defined(__x86_64__) && VELRI_X86_VARIANTS && !defined(_MSC_VER)
 __attribute__((target("avx512f")))
-static void bw_copy_nt_worker(void *v, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void bw_copy_nt_worker(void *v, size_t wid, size_t nw) {
     cpu_bw_ctx *c = (cpu_bw_ctx *)v;
     size_t i0 = ((c->n / 64u) * wid / nw) * 64u;
     size_t i1 = ((c->n / 64u) * (wid + 1u) / nw) * 64u;
@@ -519,8 +517,7 @@ static void bw_copy_nt_worker(void *v, size_t wid, size_t nw, void *sc, size_t s
 }
 #endif
 
-static void bw_copy_worker(void *v, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)sc; (void)scb;
+static void bw_copy_worker(void *v, size_t wid, size_t nw) {
     cpu_bw_ctx *c = (cpu_bw_ctx *)v;
     size_t i0 = ((c->n / 16u) * wid / nw) * 16u;
     size_t i1 = ((c->n / 16u) * (wid + 1u) / nw) * 16u;
@@ -531,8 +528,8 @@ static void bw_copy_worker(void *v, size_t wid, size_t nw, void *sc, size_t scb)
 typedef struct { size_t iters; volatile double sink; } cpu_fma_ctx;
 
 __attribute__((target("avx512f,fma")))
-static void ceil_fma_f32_worker(void *v, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)nw; (void)sc; (void)scb;
+static void ceil_fma_f32_worker(void *v, size_t wid, size_t nw) {
+    (void)nw;
     cpu_fma_ctx *c = (cpu_fma_ctx *)v;
     __m512 a = _mm512_set1_ps(1.000001f + (float)wid * 1e-6f);
     __m512 b = _mm512_set1_ps(0.999999f);
@@ -554,8 +551,8 @@ static void ceil_fma_f32_worker(void *v, size_t wid, size_t nw, void *sc, size_t
 }
 
 __attribute__((target("avx512f,fma")))
-static void ceil_fma_f64_worker(void *v, size_t wid, size_t nw, void *sc, size_t scb) {
-    (void)nw; (void)sc; (void)scb;
+static void ceil_fma_f64_worker(void *v, size_t wid, size_t nw) {
+    (void)nw;
     cpu_fma_ctx *c = (cpu_fma_ctx *)v;
     __m512d a = _mm512_set1_pd(1.000001 + (double)wid * 1e-6);
     __m512d b = _mm512_set1_pd(0.999999);
@@ -598,7 +595,7 @@ static cpu_ceilings measure_cpu_ceilings(velri_pool *pool, size_t nw) {
     out.bw_read_gbps = best_rd;
 
     bctx.n = n_rd / 2u;
-    void (*cp_fn)(void *, size_t, size_t, void *, size_t) = bw_copy_worker;
+    velri_parallel_fn cp_fn = bw_copy_worker;
 #if defined(__x86_64__) && VELRI_X86_VARIANTS && !defined(_MSC_VER)
     if (velri_get_cpu_info()->has_avx512f) cp_fn = bw_copy_nt_worker;
 #endif
@@ -1154,13 +1151,13 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("CPU: %d hw threads, L3 domains=%d, AVX2=%d FMA=%d F16C=%d AVX512F=%d BF16=%d VNNI=%d\n",
-           ci->hardware_threads, ci->num_l3_domains,
+    printf("CPU: %d hw threads, AVX2=%d FMA=%d F16C=%d AVX512F=%d BF16=%d VNNI=%d\n",
+           ci->hardware_threads,
            (int)ci->has_avx2, (int)ci->has_fma, (int)ci->has_f16c,
            (int)ci->has_avx512f, (int)ci->has_avx512_bf16, (int)ci->has_avx512_vnni);
 
     velri_pool *pool = nullptr;
-    check_ok(velri_pool_create(workers, 0u, &pool), "pool_create");
+    check_ok(velri_pool_create(workers, &pool), "pool_create");
 
     run_verification(pool, workers);
 
