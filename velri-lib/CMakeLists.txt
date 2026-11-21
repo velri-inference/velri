@@ -100,9 +100,12 @@ include(cmake/platform.cmake)
 # Slang AOT CPU kernels (required) + optional Vulkan SPIR-V 1.6 backend
 include(cmake/slang.cmake)
 
-# Install CMake package exporting VelriLib::platform, VelriLib::cpu (and VelriLib::vulkan when enabled)
+# Stage 1 Core: TensorView/Storage, Graph, Planner, Backend Contract & Runtime Slots
+include(cmake/core.cmake)
+
+# Install CMake package exporting VelriLib::platform, VelriLib::cpu, VelriLib::core (+ vulkan)
 include(CMakePackageConfigHelpers)
-set(_velri_install_targets velri_platform velri_cpu)
+set(_velri_install_targets velri_platform velri_cpu velri_core)
 if(VELRI_ENABLE_VULKAN)
     list(APPEND _velri_install_targets velri_vulkan)
 endif()

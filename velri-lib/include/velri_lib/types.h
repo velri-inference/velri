@@ -20,7 +20,11 @@ typedef enum {
     VELRI_ERR_INVALID = 1,
     VELRI_ERR_OVERFLOW = 2,
     VELRI_ERR_UNSUPPORTED = 3,
-    VELRI_ERR_NOMEM = 4
+    VELRI_ERR_NOMEM = 4,
+    VELRI_ERR_CANCELLED = 5,
+    VELRI_ERR_EXEC = 6,
+    VELRI_ERR_BUSY = 7,
+    VELRI_ERR_NOT_FOUND = 8
 } velri_status;
 
 typedef enum {

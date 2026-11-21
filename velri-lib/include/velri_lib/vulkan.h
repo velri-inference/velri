@@ -40,6 +40,18 @@ velri_status velri_vk_buf_alloc(velri_vk_ctx *ctx, size_t bytes, velri_vk_buf **
 void velri_vk_buf_free(velri_vk_ctx *ctx, velri_vk_buf *buf);
 velri_status velri_vk_buf_upload(velri_vk_ctx *ctx, velri_vk_buf *dst, const void *src, size_t bytes);
 velri_status velri_vk_buf_download(velri_vk_ctx *ctx, void *dst, const velri_vk_buf *src, size_t bytes);
+velri_status velri_vk_buf_upload_at(velri_vk_ctx *ctx, velri_vk_buf *dst, size_t dst_offset,
+                                    const void *src, size_t bytes);
+velri_status velri_vk_buf_download_at(velri_vk_ctx *ctx, void *dst, const velri_vk_buf *src,
+                                      size_t src_offset, size_t bytes);
+
+/* Stack-allocated zero-copy subview into a velri_vk_buf at `byte_offset` (0 B heap alloc). */
+typedef struct {
+    uint64_t opaque[4];
+} velri_vk_buf_view;
+
+velri_vk_buf *velri_vk_buf_subview(const velri_vk_buf *base, size_t byte_offset,
+                                   velri_vk_buf_view *storage);
 
 /* Timed compute kernels (repeat `iters` times inside one command buffer for accurate GPU timestamps). */
 velri_status velri_vk_linear(

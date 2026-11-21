@@ -929,8 +929,12 @@ void velri_vk_buf_free(velri_vk_ctx *ctx, velri_vk_buf *buf) {
     free(buf);
 }
 
-velri_status velri_vk_buf_upload(velri_vk_ctx *ctx, velri_vk_buf *dst, const void *src, size_t bytes) {
-    if (!ctx || !dst || (!src && bytes > 0) || bytes > dst->size) return VELRI_ERR_INVALID;
+velri_status velri_vk_buf_upload_at(velri_vk_ctx *ctx, velri_vk_buf *dst, size_t dst_offset,
+                                    const void *src, size_t bytes) {
+    if (!ctx || !dst || (!src && bytes > 0) || dst_offset > dst->size ||
+        bytes > dst->size - dst_offset) {
+        return VELRI_ERR_INVALID;
+    }
     if (bytes == 0) return VELRI_OK;
     velri_status st = ensure_staging(ctx, bytes);
     if (st != VELRI_OK) return st;
@@ -942,14 +946,22 @@ velri_status velri_vk_buf_upload(velri_vk_ctx *ctx, velri_vk_buf *dst, const voi
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     ctx->vkBeginCommandBuffer(ctx->cmd, &bi);
-    VkBufferCopy region = {.srcOffset = 0, .dstOffset = 0, .size = (VkDeviceSize)bytes};
+    VkBufferCopy region = {
+        .srcOffset = 0,
+        .dstOffset = (VkDeviceSize)dst_offset,
+        .size = (VkDeviceSize)bytes,
+    };
     ctx->vkCmdCopyBuffer(ctx->cmd, ctx->stage_buf, dst->buffer, 1, &region);
     ctx->vkEndCommandBuffer(ctx->cmd);
     return submit_and_wait(ctx);
 }
 
-velri_status velri_vk_buf_download(velri_vk_ctx *ctx, void *dst, const velri_vk_buf *src, size_t bytes) {
-    if (!ctx || !src || (!dst && bytes > 0) || bytes > src->size) return VELRI_ERR_INVALID;
+velri_status velri_vk_buf_download_at(velri_vk_ctx *ctx, void *dst, const velri_vk_buf *src,
+                                      size_t src_offset, size_t bytes) {
+    if (!ctx || !src || (!dst && bytes > 0) || src_offset > src->size ||
+        bytes > src->size - src_offset) {
+        return VELRI_ERR_INVALID;
+    }
     if (bytes == 0) return VELRI_OK;
     velri_status st = ensure_staging(ctx, bytes);
     if (st != VELRI_OK) return st;
@@ -960,13 +972,43 @@ velri_status velri_vk_buf_download(velri_vk_ctx *ctx, void *dst, const velri_vk_
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     ctx->vkBeginCommandBuffer(ctx->cmd, &bi);
-    VkBufferCopy region = {.srcOffset = 0, .dstOffset = 0, .size = (VkDeviceSize)bytes};
+    VkBufferCopy region = {
+        .srcOffset = (VkDeviceSize)src_offset,
+        .dstOffset = 0,
+        .size = (VkDeviceSize)bytes,
+    };
     ctx->vkCmdCopyBuffer(ctx->cmd, src->buffer, ctx->stage_buf, 1, &region);
     ctx->vkEndCommandBuffer(ctx->cmd);
     st = submit_and_wait(ctx);
     if (st != VELRI_OK) return st;
     memcpy(dst, ctx->stage_map, bytes);
     return VELRI_OK;
+}
+
+velri_status velri_vk_buf_upload(velri_vk_ctx *ctx, velri_vk_buf *dst, const void *src, size_t bytes) {
+    return velri_vk_buf_upload_at(ctx, dst, 0U, src, bytes);
+}
+
+velri_status velri_vk_buf_download(velri_vk_ctx *ctx, void *dst, const velri_vk_buf *src, size_t bytes) {
+    return velri_vk_buf_download_at(ctx, dst, src, 0U, bytes);
+}
+
+static_assert(sizeof(struct velri_vk_buf) <= sizeof(velri_vk_buf_view),
+              "velri_vk_buf_view too small");
+
+velri_vk_buf *velri_vk_buf_subview(const velri_vk_buf *base, size_t byte_offset,
+                                   velri_vk_buf_view *storage) {
+    if (!base || !storage || byte_offset > base->size) {
+        return nullptr;
+    }
+    velri_vk_buf view = {
+        .buffer = base->buffer,
+        .memory = base->memory,
+        .bda = base->bda + (VkDeviceAddress)byte_offset,
+        .size = base->size - byte_offset,
+    };
+    memcpy(storage, &view, sizeof(view));
+    return (velri_vk_buf *)storage;
 }
 
 static velri_status dispatch_timed_warm(velri_vk_ctx *ctx, VkPipeline pipe, const void *pc_data,
