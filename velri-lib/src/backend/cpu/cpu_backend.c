@@ -1,5 +1,6 @@
 #include "core_internal.h"
 #include "pool.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -59,7 +60,15 @@
     X(fwht_f32, (const float *, uint32_t, const uint8_t *, uint32_t, float *, uint32_t, uint32_t,  \
                  uint32_t, uint32_t, uint32_t))                                                    \
     X(quantize_row_f32_i8, (const float *, uint32_t, int8_t *, uint32_t, float *, uint32_t,        \
-                            uint32_t, uint32_t))
+                            uint32_t, uint32_t))                                                   \
+    X(embedding_f32, (const float *, uint32_t, const int32_t *, uint32_t, uint32_t, uint32_t,      \
+                      float *, uint32_t, uint32_t, uint32_t, uint32_t))                            \
+    X(copy_last_row_f32, (const float *, uint32_t, float *, uint32_t, uint32_t))                   \
+    X(kv_append_f32, (const float *, uint32_t, const float *, uint32_t, float *, float *,          \
+                      uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t))       \
+    X(attention_f32, (const float *, uint32_t, const float *, const float *, float *, uint32_t,    \
+                      uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,        \
+                      uint32_t, float, uint32_t, uint32_t))
 
 #define DECL_BASE(NAME, SIG) extern void velri_slang_base_##NAME SIG;
 SLANG_CPU_KERNELS(DECL_BASE)
@@ -311,10 +320,31 @@ typedef struct {
     const velri_resolved_op *op;
     const velri_buffer_binding *in_b;
     const velri_buffer_binding *out_b;
+    uint32_t active_rows;
     uint32_t pos_offset;
+    uint32_t kv_pos;
     uint32_t elem_count;
+    uint32_t attn_work;
+    uint32_t same_kv_cache;
+    float attn_scale;
     int linear_mode;
 } cpu_dispatch_ctx;
+
+static void cpu_kv_append_worker(void *vctx, size_t wid, size_t nw) {
+    const cpu_dispatch_ctx *c = (const cpu_dispatch_ctx *)vctx;
+    const velri_resolved_op *op = c->op;
+    uint32_t kvh0 = 0U, kvh1 = 0U;
+    split_1d(op->raw.attr.attention.n_kv_heads, wid, nw, &kvh0, &kvh1);
+    if (kvh0 >= kvh1) return;
+    c->vt->kv_append_f32((const float *)binding_cptr(&c->in_b[1]),
+                         (uint32_t)op->inputs[1].strides[0],
+                         (const float *)binding_cptr(&c->in_b[2]),
+                         (uint32_t)op->inputs[2].strides[0],
+                         (float *)binding_ptr(&c->out_b[1]),
+                         (float *)binding_ptr(&c->out_b[2]), c->same_kv_cache, kvh0, kvh1,
+                         c->active_rows, c->kv_pos, (uint32_t)op->outputs[1].dims[1],
+                         op->raw.attr.attention.head_dim);
+}
 
 static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
     const cpu_dispatch_ctx *c = (const cpu_dispatch_ctx *)vctx;
@@ -323,7 +353,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     switch (op->kind) {
     case VELRI_OP_LINEAR: {
-        uint32_t rows = (uint32_t)op->inputs[0].dims[0];
+        uint32_t rows = c->active_rows;
         uint32_t m = (uint32_t)op->inputs[1].dims[0];
         uint32_t k = (uint32_t)op->inputs[0].dims[1];
         uint32_t xs = (uint32_t)op->inputs[0].strides[0];
@@ -397,7 +427,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     case VELRI_OP_RMSNORM: {
         uint32_t r0 = 0U, r1 = 0U;
-        split_1d((uint32_t)op->inputs[0].dims[0], wid, nw, &r0, &r1);
+        split_1d(c->active_rows, wid, nw, &r0, &r1);
         if (r0 >= r1) return;
         uint32_t dim = (uint32_t)op->inputs[0].dims[1];
         uint32_t xs = (uint32_t)op->inputs[0].strides[0];
@@ -423,7 +453,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     case VELRI_OP_FUSED_ADD_RMSNORM: {
         uint32_t r0 = 0U, r1 = 0U;
-        split_1d((uint32_t)op->inputs[0].dims[0], wid, nw, &r0, &r1);
+        split_1d(c->active_rows, wid, nw, &r0, &r1);
         if (r0 >= r1) return;
         const float *w = op->input_present[1] ? (const float *)binding_cptr(&c->in_b[1]) : nullptr;
         vt->fused_add_rmsnorm_f32((float *)binding_ptr(&c->out_b[0]),
@@ -439,7 +469,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     case VELRI_OP_LAYERNORM: {
         uint32_t r0 = 0U, r1 = 0U;
-        split_1d((uint32_t)op->inputs[0].dims[0], wid, nw, &r0, &r1);
+        split_1d(c->active_rows, wid, nw, &r0, &r1);
         if (r0 >= r1) return;
         const float *w = op->input_present[1] ? (const float *)binding_cptr(&c->in_b[1]) : nullptr;
         const float *b = op->input_present[2] ? (const float *)binding_cptr(&c->in_b[2]) : nullptr;
@@ -452,7 +482,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     case VELRI_OP_ROPE: {
         uint32_t t0 = 0U, t1 = 0U;
-        split_1d((uint32_t)op->inputs[0].dims[0], wid, nw, &t0, &t1);
+        split_1d(c->active_rows, wid, nw, &t0, &t1);
         if (t0 >= t1) return;
         const void *x = binding_cptr(&c->in_b[0]);
         const float *ct = (const float *)binding_cptr(&c->in_b[1]);
@@ -506,7 +536,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     case VELRI_OP_SOFTMAX: {
         uint32_t r0 = 0U, r1 = 0U;
-        split_1d((uint32_t)op->inputs[0].dims[0], wid, nw, &r0, &r1);
+        split_1d(c->active_rows, wid, nw, &r0, &r1);
         if (r0 >= r1) return;
         vt->softmax_f32((const float *)binding_cptr(&c->in_b[0]),
                         (uint32_t)op->inputs[0].strides[0], (float *)binding_ptr(&c->out_b[0]),
@@ -538,7 +568,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     case VELRI_OP_FWHT: {
         uint32_t r0 = 0U, r1 = 0U;
-        split_1d((uint32_t)op->inputs[0].dims[0], wid, nw, &r0, &r1);
+        split_1d(c->active_rows, wid, nw, &r0, &r1);
         if (r0 >= r1) return;
         const float *x = (const float *)binding_cptr(&c->in_b[0]);
         const void *suh = op->input_present[1] ? binding_cptr(&c->in_b[1]) : nullptr;
@@ -555,7 +585,7 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
 
     case VELRI_OP_QUANTIZE_ROW: {
         uint32_t r0 = 0U, r1 = 0U;
-        split_1d((uint32_t)op->inputs[0].dims[0], wid, nw, &r0, &r1);
+        split_1d(c->active_rows, wid, nw, &r0, &r1);
         if (r0 >= r1) return;
         vt->quantize_row_f32_i8((const float *)binding_cptr(&c->in_b[0]),
                                 (uint32_t)op->inputs[0].strides[0],
@@ -563,6 +593,48 @@ static void cpu_op_worker(void *vctx, size_t wid, size_t nw) {
                                 (uint32_t)op->outputs[0].strides[0],
                                 (float *)binding_ptr(&c->out_b[1]), r0, r1,
                                 (uint32_t)op->inputs[0].dims[1]);
+        break;
+    }
+
+    case VELRI_OP_EMBEDDING: {
+        uint32_t r0 = 0U, r1 = 0U;
+        split_1d(c->active_rows, wid, nw, &r0, &r1);
+        if (r0 >= r1) return;
+        bool has_ids = (op->num_inputs >= 2U && op->input_present[1]);
+        const int32_t *ids = has_ids ? (const int32_t *)binding_cptr(&c->in_b[1]) : nullptr;
+        vt->embedding_f32((const float *)binding_cptr(&c->in_b[0]),
+                          (uint32_t)op->inputs[0].strides[0], ids, has_ids ? 1U : 0U,
+                          (uint32_t)op->inputs[0].dims[0], c->pos_offset,
+                          (float *)binding_ptr(&c->out_b[0]),
+                          (uint32_t)op->outputs[0].strides[0], r0, r1,
+                          (uint32_t)op->outputs[0].dims[1]);
+        break;
+    }
+
+    case VELRI_OP_ATTENTION: {
+        uint32_t w0 = 0U, w1 = 0U;
+        split_1d(c->attn_work, wid, nw, &w0, &w1);
+        if (w0 >= w1) return;
+        vt->attention_f32((const float *)binding_cptr(&c->in_b[0]),
+                          (uint32_t)op->inputs[0].strides[0],
+                          (const float *)binding_cptr(&c->out_b[1]),
+                          (const float *)binding_cptr(&c->out_b[2]),
+                          (float *)binding_ptr(&c->out_b[0]),
+                          (uint32_t)op->outputs[0].strides[0], w0, w1, c->active_rows,
+                          op->raw.attr.attention.n_heads, op->raw.attr.attention.n_kv_heads,
+                          op->raw.attr.attention.head_dim, c->kv_pos,
+                          (uint32_t)op->outputs[1].dims[1], c->attn_scale,
+                          op->raw.attr.attention.sliding_window,
+                          op->raw.attr.attention.causal ? 1U : 0U);
+        break;
+    }
+
+    case VELRI_OP_COPY_LAST_ROW: {
+        if (wid != 0U) return;
+        vt->copy_last_row_f32((const float *)binding_cptr(&c->in_b[0]),
+                              (uint32_t)op->inputs[0].strides[0],
+                              (float *)binding_ptr(&c->out_b[0]), c->active_rows - 1U,
+                              (uint32_t)op->inputs[0].dims[1]);
         break;
     }
 
@@ -588,8 +660,13 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         .op = op,
         .in_b = item->inputs,
         .out_b = item->outputs,
+        .active_rows = 0U,
         .pos_offset = 0U,
+        .kv_pos = 0U,
         .elem_count = 0U,
+        .attn_work = 0U,
+        .same_kv_cache = 0U,
+        .attn_scale = 0.0f,
         .linear_mode = -1,
     };
 
@@ -600,6 +677,7 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         if (ctx.linear_mode < 0) {
             return VELRI_ERR_UNSUPPORTED;
         }
+        ctx.active_rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         work_units = 2U; /* Always parallelize across M or rows */
         break;
     case VELRI_OP_ROPE: {
@@ -609,21 +687,25 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         if (pos > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
+        ctx.active_rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         ctx.pos_offset = (uint32_t)pos;
-        work_units = op->inputs[0].dims[0];
+        work_units = ctx.active_rows;
         break;
     }
     case VELRI_OP_ACTIVATION:
     case VELRI_OP_GATED_MLP:
     case VELRI_OP_VEC_AXPBY:
     case VELRI_OP_VEC_MUL: {
-        size_t n = 0U;
-        if (velri_tensor_view_num_elements(&op->inputs[0], &n) != VELRI_OK ||
-            n > (size_t)UINT32_MAX) {
+        size_t full_n = 0U;
+        if (velri_tensor_view_num_elements(&op->inputs[0], &full_n) != VELRI_OK) {
+            return VELRI_ERR_OVERFLOW;
+        }
+        size_t n = velri_effective_elemwise_count(op, &op->inputs[0], item->params);
+        if (n > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
         ctx.elem_count = (uint32_t)n;
-        work_units = n;
+        work_units = (n >= 4096U) ? (n / 2048U) : 1U;
         break;
     }
     case VELRI_OP_RMSNORM:
@@ -632,8 +714,77 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
     case VELRI_OP_SOFTMAX:
     case VELRI_OP_FWHT:
     case VELRI_OP_QUANTIZE_ROW:
-        work_units = op->inputs[0].dims[0];
+        ctx.active_rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
+        work_units = ctx.active_rows;
         break;
+    case VELRI_OP_EMBEDDING: {
+        bool has_ids = (op->num_inputs >= 2U && op->input_present[1]);
+        size_t active_t = velri_effective_rows(op, op->outputs[0].dims[0], item->params);
+        if (active_t > (size_t)UINT32_MAX) {
+            return VELRI_ERR_OVERFLOW;
+        }
+        size_t pos = 0U;
+        if (!has_ids) {
+            pos = (item->params && item->params->has_pos_offset)
+                      ? item->params->pos_offset_override
+                      : op->raw.attr.embedding.pos_offset;
+            if (pos > (size_t)UINT32_MAX) {
+                return VELRI_ERR_OVERFLOW;
+            }
+        }
+        ctx.active_rows = (uint32_t)active_t;
+        ctx.pos_offset = (uint32_t)pos;
+        work_units = active_t;
+        break;
+    }
+    case VELRI_OP_ATTENTION: {
+        size_t active_t = velri_effective_rows(op, op->inputs[0].dims[0], item->params);
+        if (active_t == 0U) {
+            return VELRI_ERR_INVALID;
+        }
+        size_t kv_pos = (item->params && item->params->has_kv_len)
+                            ? item->params->kv_len_override
+                            : ((item->params && item->params->has_pos_offset)
+                                   ? item->params->pos_offset_override
+                                   : 0U);
+        size_t kv_end = 0U;
+        if (active_t > (size_t)UINT32_MAX || kv_pos > (size_t)UINT32_MAX ||
+            velri_add_overflow_size(kv_pos, active_t, &kv_end)) {
+            return VELRI_ERR_OVERFLOW;
+        }
+        if (kv_end > op->outputs[1].dims[1]) {
+            return VELRI_ERR_INVALID;
+        }
+        size_t attn_work = 0U;
+        if (velri_mul_overflow_size(active_t, (size_t)op->raw.attr.attention.n_heads, &attn_work) ||
+            attn_work > (size_t)UINT32_MAX) {
+            return VELRI_ERR_OVERFLOW;
+        }
+        uint32_t hd = op->raw.attr.attention.head_dim;
+        ctx.active_rows = (uint32_t)active_t;
+        ctx.kv_pos = (uint32_t)kv_pos;
+        ctx.attn_work = (uint32_t)attn_work;
+        ctx.attn_scale = (op->raw.attr.attention.scale > 0.0f) ? op->raw.attr.attention.scale
+                                                               : (1.0f / sqrtf((float)hd));
+        ctx.same_kv_cache = (item->outputs[1].mem_handle == item->outputs[2].mem_handle &&
+                             item->outputs[1].byte_offset == item->outputs[2].byte_offset)
+                                ? 1U
+                                : 0U;
+        work_units = attn_work;
+        break;
+    }
+    case VELRI_OP_COPY_LAST_ROW: {
+        size_t active_t = velri_effective_rows(op, op->inputs[0].dims[0], item->params);
+        if (active_t == 0U) {
+            return VELRI_ERR_INVALID;
+        }
+        if (active_t > (size_t)UINT32_MAX) {
+            return VELRI_ERR_OVERFLOW;
+        }
+        ctx.active_rows = (uint32_t)active_t;
+        work_units = 1U;
+        break;
+    }
     default:
         return VELRI_ERR_UNSUPPORTED;
     }
@@ -648,7 +799,23 @@ static velri_status cpu_submit(velri_backend_device *dev, const velri_submit_ite
         use_nw = dev->workers;
     }
 
-    if (use_pool && use_nw > 1U) {
+    if (op->kind == VELRI_OP_ATTENTION) {
+        /* Stage 1: append K/V tokens into cache before any worker reads the cache. */
+        uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
+        uint64_t kv_elems = (uint64_t)ctx.active_rows * (uint64_t)nkvh *
+                            (uint64_t)op->raw.attr.attention.head_dim;
+        if (use_pool && use_nw > 1U && nkvh > 1U && kv_elems >= 4096ULL) {
+            velri_pool_parallel(use_pool, use_nw, cpu_kv_append_worker, &ctx);
+        } else {
+            cpu_kv_append_worker(&ctx, 0U, 1U);
+        }
+        /* Stage 2: parallel attention across active_t * n_heads. */
+        if (use_pool && use_nw > 1U) {
+            velri_pool_parallel(use_pool, use_nw, cpu_op_worker, &ctx);
+        } else {
+            cpu_op_worker(&ctx, 0U, 1U);
+        }
+    } else if (use_pool && use_nw > 1U) {
         velri_pool_parallel(use_pool, use_nw, cpu_op_worker, &ctx);
     } else {
         cpu_op_worker(&ctx, 0U, 1U);

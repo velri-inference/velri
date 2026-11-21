@@ -86,7 +86,10 @@ typedef enum {
     VELRI_OP_VEC_AXPBY = 8,
     VELRI_OP_VEC_MUL = 9,
     VELRI_OP_FWHT = 10,
-    VELRI_OP_QUANTIZE_ROW = 11
+    VELRI_OP_QUANTIZE_ROW = 11,
+    VELRI_OP_EMBEDDING = 12,
+    VELRI_OP_ATTENTION = 13,
+    VELRI_OP_COPY_LAST_ROW = 14
 } velri_op_kind;
 
 typedef struct {
@@ -95,6 +98,7 @@ typedef struct {
     uint32_t num_outputs;
     velri_view_id inputs[VELRI_OP_MAX_INPUTS]; /* VELRI_INVALID_ID for optional absent inputs */
     velri_view_id outputs[VELRI_OP_MAX_OUTPUTS];
+    bool dynamic_seq; /* True => axis-0 scales dynamically with velri_step_params.seq_len_override */
     union {
         struct {
             velri_linear_desc desc;
@@ -126,6 +130,17 @@ typedef struct {
             size_t block_size;
             velri_dtype suh_dtype;
         } fwht;
+        struct {
+            size_t pos_offset; /* Used when inputs[1] (`ids`) is absent (positional lookup) */
+        } embedding;
+        struct {
+            uint32_t n_heads;
+            uint32_t n_kv_heads;
+            uint32_t head_dim;
+            float scale;             /* 0.0f => 1.0f / sqrtf((float)head_dim) */
+            uint32_t sliding_window; /* 0 => full causal history */
+            bool causal;
+        } attention;
     } attr;
 } velri_op_desc;
 
@@ -149,6 +164,10 @@ typedef struct {
 typedef struct {
     size_t pos_offset_override;
     bool has_pos_offset;
+    size_t seq_len_override; /* Dynamic active rows 1..max_seq_len (must be >= 1 when has_seq_len) */
+    bool has_seq_len;
+    size_t kv_len_override;  /* Valid KV cache length BEFORE appending this step's tokens */
+    bool has_kv_len;
 } velri_step_params;
 
 typedef struct {

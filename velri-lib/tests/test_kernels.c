@@ -180,6 +180,149 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     free(hx); free(hw); free(hy_ref); free(hy); free(hbias); free(hxs); free(hws);
 }
 
+static void verify_attention_case(velri_context *ctx, velri_device_id dev, const char *dev_tag,
+                                  const char *label, uint32_t nh, uint32_t nkvh, uint32_t hd,
+                                  size_t max_t, size_t max_ctx, size_t prefill_t,
+                                  size_t num_decode_steps, uint32_t sliding_window, bool causal,
+                                  bool same_kv_cache, uint64_t seed) {
+    const size_t q_dim = (size_t)nh * hd;
+    const size_t kv_dim = (size_t)nkvh * hd;
+    const size_t qkv_stride = same_kv_cache ? (q_dim + kv_dim) : (q_dim + 2U * kv_dim);
+
+    float *hqkv = (float *)xcalloc(max_t * qkv_stride, sizeof(float));
+    float *ho = (float *)xcalloc(max_t * q_dim, sizeof(float));
+    float *ho_ref = (float *)xcalloc(max_t * q_dim, sizeof(float));
+    float *hkc_ref = (float *)xcalloc((size_t)nkvh * max_ctx * hd, sizeof(float));
+    float *hvc_ref =
+        same_kv_cache ? hkc_ref : (float *)xcalloc((size_t)nkvh * max_ctx * hd, sizeof(float));
+    uint64_t rng = seed;
+
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "attn g");
+    velri_storage_id sqkv =
+        add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, max_t * qkv_stride, dev);
+    velri_storage_id so = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, max_t * q_dim, dev);
+    velri_storage_id skc =
+        add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)nkvh * max_ctx * hd, dev);
+    velri_storage_id svc =
+        same_kv_cache
+            ? skc
+            : add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)nkvh * max_ctx * hd, dev);
+
+    velri_tensor_view base_qkv, qv, kv, kc_v;
+    size_t base_dims[2] = {max_t, qkv_stride};
+    size_t q_dims[2] = {max_t, q_dim}, q_str[2] = {qkv_stride, 1U};
+    size_t kv_dims[2] = {max_t, kv_dim}, kv_str[2] = {qkv_stride, 1U};
+    size_t cache_dims[3] = {nkvh, max_ctx, hd};
+
+    CHECK_OK(velri_tensor_view_contiguous(sqkv, VELRI_DTYPE_F32, 2U, base_dims, 0U, &base_qkv),
+             "attn base");
+    CHECK_OK(velri_tensor_view_subview(&base_qkv, 2U, q_dims, q_str, 0U, &qv), "attn qv");
+    CHECK_OK(velri_tensor_view_subview(&base_qkv, 2U, kv_dims, kv_str, q_dim * sizeof(float), &kv),
+             "attn kv");
+    CHECK_OK(velri_tensor_view_contiguous(skc, VELRI_DTYPE_F32, 3U, cache_dims, 0U, &kc_v),
+             "attn kcv");
+
+    velri_view_id id_q = 0U, id_k = 0U, id_v = 0U, id_kc = 0U, id_vc = 0U;
+    CHECK_OK(velri_graph_add_view(g, &qv, &id_q), "add qv");
+    CHECK_OK(velri_graph_add_view(g, &kv, &id_k), "add kv");
+    CHECK_OK(velri_graph_add_view(g, &kc_v, &id_kc), "add kcv");
+    if (same_kv_cache) {
+        id_v = id_k;
+        id_vc = id_kc;
+    } else {
+        velri_tensor_view vv, vc_v;
+        CHECK_OK(velri_tensor_view_subview(&base_qkv, 2U, kv_dims, kv_str,
+                                           (q_dim + kv_dim) * sizeof(float), &vv),
+                 "attn vv");
+        CHECK_OK(velri_tensor_view_contiguous(svc, VELRI_DTYPE_F32, 3U, cache_dims, 0U, &vc_v),
+                 "attn vcv");
+        CHECK_OK(velri_graph_add_view(g, &vv, &id_v), "add vv");
+        CHECK_OK(velri_graph_add_view(g, &vc_v, &id_vc), "add vcv");
+    }
+
+    velri_op_desc op = {
+        .kind = VELRI_OP_ATTENTION,
+        .num_inputs = 3U,
+        .num_outputs = 3U,
+        .inputs = {id_q, id_k, id_v},
+        .outputs = {add_view_2d_strided(g, so, VELRI_DTYPE_F32, max_t, q_dim, q_dim), id_kc, id_vc},
+        .attr.attention = {
+            .n_heads = nh,
+            .n_kv_heads = nkvh,
+            .head_dim = hd,
+            .scale = 0.0f,
+            .sliding_window = sliding_window,
+            .causal = causal,
+        },
+    };
+    CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), label);
+
+    velri_plan *plan = nullptr;
+    velri_slot *slot = nullptr;
+    CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), label);
+    CHECK_OK(velri_slot_create(plan, &slot), "attn slot");
+    CHECK_OK(velri_slot_bind_host(slot, sqkv, hqkv, max_t * qkv_stride * sizeof(float)), "qkv");
+    CHECK_OK(velri_slot_bind_host(slot, so, ho, max_t * q_dim * sizeof(float)), "o");
+
+    const float *k_in_ptr = hqkv + q_dim;
+    const float *v_in_ptr = same_kv_cache ? k_in_ptr : (hqkv + q_dim + kv_dim);
+
+    /* Prefill `prefill_t` tokens at kv_pos = 0 */
+    velri_test_fill_dtype(VELRI_DTYPE_F32, hqkv, prefill_t * qkv_stride, &rng, 1.0f);
+    velri_step_params sp_pre = {
+        .has_seq_len = true,
+        .seq_len_override = prefill_t,
+        .has_kv_len = true,
+        .kv_len_override = 0U,
+    };
+    CHECK_OK(velri_slot_run(slot, &sp_pre, nullptr), label);
+    CHECK(velri_slot_last_run_allocs(slot) == 0U, "attn prefill 0 allocs");
+    velri_ref_attention_f32(prefill_t, nh, nkvh, hd, 0U, max_ctx, 0.0f, sliding_window, causal,
+                            hqkv, qkv_stride, k_in_ptr, qkv_stride, v_in_ptr, qkv_stride, hkc_ref,
+                            hvc_ref, ho_ref, q_dim);
+    double err = velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, prefill_t, q_dim, q_dim);
+    if (!(err <= 5e-5)) {
+        fprintf(stderr, "FAIL [%s] %s prefill(t=%zu): err=%.3e > 5e-5\n", dev_tag, label, prefill_t,
+                err);
+        exit(1);
+    }
+
+    /* Subsequent 1-token decode steps reading resident device KV state (0 B shadow RAM) */
+    for (size_t ds = 0U; ds < num_decode_steps; ++ds) {
+        size_t kv_pos = prefill_t + ds;
+        velri_test_fill_dtype(VELRI_DTYPE_F32, hqkv, qkv_stride, &rng, 1.0f);
+        velri_step_params sp_dec = {
+            .has_seq_len = true,
+            .seq_len_override = 1U,
+            .has_kv_len = true,
+            .kv_len_override = kv_pos,
+        };
+        CHECK_OK(velri_slot_run(slot, &sp_dec, nullptr), label);
+        CHECK(velri_slot_last_run_allocs(slot) == 0U, "attn decode 0 allocs");
+        velri_ref_attention_f32(1U, nh, nkvh, hd, kv_pos, max_ctx, 0.0f, sliding_window, causal,
+                                hqkv, qkv_stride, k_in_ptr, qkv_stride, v_in_ptr, qkv_stride,
+                                hkc_ref, hvc_ref, ho_ref, q_dim);
+        err = velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, 1U, q_dim, q_dim);
+        if (!(err <= 5e-5)) {
+            fprintf(stderr, "FAIL [%s] %s decode(kv_pos=%zu): err=%.3e > 5e-5\n", dev_tag, label,
+                    kv_pos, err);
+            exit(1);
+        }
+    }
+
+    velri_slot_destroy(slot);
+    velri_plan_destroy(plan);
+    velri_graph_destroy(g);
+    free(hqkv);
+    free(ho);
+    free(ho_ref);
+    free(hkc_ref);
+    if (!same_kv_cache) {
+        free(hvc_ref);
+    }
+}
+
 static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, const char *tag,
                                      bool is_gpu) {
     /* 1. Linear: all dtypes (incl. FP64 on CPU) + GEMV + GEMM + Split-K + CoopMat 64/128 */
@@ -739,7 +882,320 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
         free(hx); free(hq_ref); free(hq); free(hs_ref); free(hs);
     }
 
-    printf("  [PASS] %-14s — all 12 ops + edge cases verified vs FP64 reference.\n", tag);
+    /* 13. Embedding (token lookup w/ OOB & negative IDs + positional lookup w/ dynamic override) */
+    {
+        size_t vocab = 37U, dim = 69U, max_t = 8U, t_stride = 73U, o_stride = 71U;
+        float *htbl = (float *)xcalloc(vocab * t_stride, sizeof(float));
+        int32_t *hids = (int32_t *)xcalloc(max_t, sizeof(int32_t));
+        float *hy = (float *)xcalloc(max_t * o_stride, sizeof(float));
+        float *hy_ref = (float *)xcalloc(max_t * o_stride, sizeof(float));
+        uint64_t rng = 0xE11B0001ULL;
+        velri_test_fill_dtype(VELRI_DTYPE_F32, htbl, vocab * t_stride, &rng, 2.0f);
+        hids[0] = 0; hids[1] = 36; hids[2] = -5; hids[3] = 999; hids[4] = 17;
+        hids[5] = 3; hids[6] = 12; hids[7] = 1;
+
+        /* 13a. Token embedding with dynamic seq_len_override = 5 */
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "emb g");
+        velri_storage_id st = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, vocab * t_stride, dev);
+        velri_storage_id si = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_I32, max_t, dev);
+        velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, max_t * o_stride, dev);
+        velri_op_desc op = {
+            .kind = VELRI_OP_EMBEDDING, .num_inputs = 2U, .num_outputs = 1U,
+            .inputs = {add_view_2d_strided(g, st, VELRI_DTYPE_F32, vocab, dim, t_stride),
+                       add_view_1d(g, si, VELRI_DTYPE_I32, max_t, 0U)},
+            .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, max_t, dim, o_stride)},
+        };
+        CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add emb");
+        velri_plan *plan = nullptr;
+        velri_slot *slot = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep emb");
+        CHECK_OK(velri_plan_bind_weight_host(plan, st, htbl, vocab * t_stride * sizeof(float)), "wt");
+        CHECK_OK(velri_slot_create(plan, &slot), "slot");
+        CHECK_OK(velri_slot_bind_host(slot, si, hids, max_t * sizeof(int32_t)), "ids");
+        CHECK_OK(velri_slot_bind_host(slot, sy, hy, max_t * o_stride * sizeof(float)), "y");
+        velri_step_params sp = {.has_seq_len = true, .seq_len_override = 5U};
+        CHECK_OK(velri_slot_run(slot, &sp, nullptr), "run emb");
+        CHECK(velri_slot_last_run_allocs(slot) == 0U, "emb 0 allocs");
+        velri_ref_embedding_f32(vocab, dim, 5U, 0U, htbl, t_stride, hids, hy_ref, o_stride);
+        CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ref, hy, 5U, dim, o_stride) <= 1e-6,
+              "token embedding accuracy");
+        velri_slot_destroy(slot);
+        velri_plan_destroy(plan);
+        velri_graph_destroy(g);
+
+        /* 13b. Positional embedding with dynamic pos_offset_override = 11, seq_len_override = 4 */
+        CHECK_OK(velri_graph_create(&g), "pos emb g");
+        st = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, vocab * t_stride, dev);
+        sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, max_t * o_stride, dev);
+        velri_op_desc pop = {
+            .kind = VELRI_OP_EMBEDDING, .num_inputs = 1U, .num_outputs = 1U,
+            .inputs = {add_view_2d_strided(g, st, VELRI_DTYPE_F32, vocab, dim, t_stride)},
+            .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, max_t, dim, o_stride)},
+            .attr.embedding = {.pos_offset = 0U},
+        };
+        CHECK_OK(velri_graph_add_op(g, &pop, dev, nullptr), "add pos emb");
+        CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep pos emb");
+        CHECK_OK(velri_plan_bind_weight_host(plan, st, htbl, vocab * t_stride * sizeof(float)), "wt");
+        CHECK_OK(velri_slot_create(plan, &slot), "slot");
+        CHECK_OK(velri_slot_bind_host(slot, sy, hy, max_t * o_stride * sizeof(float)), "y");
+        velri_step_params psp = {
+            .has_pos_offset = true, .pos_offset_override = 11U,
+            .has_seq_len = true, .seq_len_override = 4U,
+        };
+        CHECK_OK(velri_slot_run(slot, &psp, nullptr), "run pos emb");
+        velri_ref_embedding_f32(vocab, dim, 4U, 11U, htbl, t_stride, nullptr, hy_ref, o_stride);
+        CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ref, hy, 4U, dim, o_stride) <= 1e-6,
+              "positional embedding accuracy");
+        velri_slot_destroy(slot);
+        velri_plan_destroy(plan);
+        velri_graph_destroy(g);
+        free(htbl); free(hids); free(hy); free(hy_ref);
+    }
+
+    /* 14. CopyLastRow with dynamic seq_len_override */
+    {
+        size_t max_t = 9U, dim = 131U, xs = 137U;
+        float *hx = (float *)xcalloc(max_t * xs, sizeof(float));
+        float *hy = (float *)xcalloc(dim, sizeof(float));
+        float *hy_ref = (float *)xcalloc(dim, sizeof(float));
+        uint64_t rng = 0xC0910001ULL;
+        velri_test_fill_dtype(VELRI_DTYPE_F32, hx, max_t * xs, &rng, 3.0f);
+
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "clr g");
+        velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, max_t * xs, dev);
+        velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, dim, dev);
+        velri_op_desc op = {
+            .kind = VELRI_OP_COPY_LAST_ROW, .num_inputs = 1U, .num_outputs = 1U,
+            .inputs = {add_view_2d_strided(g, sx, VELRI_DTYPE_F32, max_t, dim, xs)},
+            .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, 1U, dim, dim)},
+        };
+        CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add clr");
+        velri_plan *plan = nullptr;
+        velri_slot *slot = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep clr");
+        CHECK_OK(velri_slot_create(plan, &slot), "slot");
+        CHECK_OK(velri_slot_bind_host(slot, sx, hx, max_t * xs * sizeof(float)), "x");
+        CHECK_OK(velri_slot_bind_host(slot, sy, hy, dim * sizeof(float)), "y");
+        velri_step_params sp = {.has_seq_len = true, .seq_len_override = 6U};
+        CHECK_OK(velri_slot_run(slot, &sp, nullptr), "run clr");
+        velri_ref_copy_last_row_f32(6U, dim, hx, xs, hy_ref);
+        CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ref, hy, 1U, dim, dim) <= 1e-6,
+              "copy_last_row accuracy");
+        velri_slot_destroy(slot);
+        velri_plan_destroy(plan);
+        velri_graph_destroy(g);
+        free(hx); free(hy); free(hy_ref);
+    }
+
+    /* 15. Attention (GQA + long decode kv=25..26 + sliding window + bidir + same_kv_cache + hd=64/80/128) */
+    {
+        /* 15a. GQA + strided fused-QKV + long decode (kv_len=25,26 > 8 -> 4 Vulkan P=8 iters & 2 CPU B_k=16 tiles) */
+        verify_attention_case(ctx, dev, tag, "attn_gqa_long_decode_hd64", 6U, 2U, 64U, 24U, 40U,
+                              24U, 2U, 0U, true, false, 0xA77E0001ULL);
+
+        /* 15b. Sliding window = 5 (kv_len up to 11 > 5 masks earlier keys) + head_dim = 128 */
+        verify_attention_case(ctx, dev, tag, "attn_sliding_win5_hd128", 4U, 2U, 128U, 12U, 24U,
+                              9U, 2U, 5U, true, false, 0xA77E0002ULL);
+
+        /* 15c. Bidirectional attention (causal = false) + odd head_dim = 80 */
+        verify_attention_case(ctx, dev, tag, "attn_bidir_hd80", 6U, 2U, 80U, 20U, 32U, 18U, 2U,
+                              0U, false, false, 0xA77E0003ULL);
+
+        /* 15d. Shared K/V cache (same_kv_cache = true, K_in == V_in, K_cache == V_cache) + head_dim = 128 */
+        verify_attention_case(ctx, dev, tag, "attn_same_kv_hd128", 4U, 2U, 128U, 18U, 32U, 17U, 2U,
+                              0U, true, true, 0xA77E0004ULL);
+    }
+
+    /* 16. Negative contract & dynamic_seq gating tests (Findings #3 & #10) */
+    {
+        const size_t rows = 4U, m = 8U, k = 16U;
+
+        /* 16a. VELRI_OP_LINEAR rejects unexpected inputs[3]/inputs[4] when has_*_scale == false */
+        {
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "lin neg g");
+            velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows * k, dev);
+            velri_storage_id sw = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m * k, dev);
+            velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, rows * m, dev);
+            velri_storage_id sxs = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows, dev);
+            velri_storage_id sws = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m, dev);
+
+            velri_view_id vx = add_view_2d_strided(g, sx, VELRI_DTYPE_F32, rows, k, k);
+            velri_view_id vw = add_view_2d_strided(g, sw, VELRI_DTYPE_F32, m, k, k);
+            velri_view_id vy = add_view_2d_strided(g, sy, VELRI_DTYPE_F32, rows, m, m);
+            velri_view_id vxs = add_view_1d(g, sxs, VELRI_DTYPE_F32, rows, 0U);
+            velri_view_id vws = add_view_1d(g, sws, VELRI_DTYPE_F32, m, 0U);
+
+            velri_op_desc bad_xsc = {
+                .kind = VELRI_OP_LINEAR,
+                .num_inputs = 4U,
+                .num_outputs = 1U,
+                .inputs = {vx, vw, VELRI_INVALID_ID, vxs},
+                .outputs = {vy},
+                .attr.linear.desc = velri_desc_f32(),
+            };
+            CHECK(velri_graph_add_op(g, &bad_xsc, dev, nullptr) == VELRI_ERR_INVALID,
+                  "linear must reject unexpected inputs[3] when has_x_scale == false");
+
+            velri_op_desc bad_wsc = {
+                .kind = VELRI_OP_LINEAR,
+                .num_inputs = 5U,
+                .num_outputs = 1U,
+                .inputs = {vx, vw, VELRI_INVALID_ID, VELRI_INVALID_ID, vws},
+                .outputs = {vy},
+                .attr.linear.desc = velri_desc_f32(),
+            };
+            CHECK(velri_graph_add_op(g, &bad_wsc, dev, nullptr) == VELRI_ERR_INVALID,
+                  "linear must reject unexpected inputs[4] when has_w_scale == false");
+            velri_graph_destroy(g);
+        }
+
+        /* 16b. dynamic_seq=true rejects seq_len_override > static_rows; dynamic_seq=false is not truncated */
+        {
+            float *hx = (float *)xcalloc(rows * k, sizeof(float));
+            float *hw = (float *)xcalloc(m * k, sizeof(float));
+            float *hy = (float *)xcalloc(rows * m, sizeof(float));
+            float *hy_ref = (float *)xcalloc(rows * m, sizeof(float));
+            for (size_t r = 0U; r < rows; ++r) {
+                for (size_t c = 0U; c < k; ++c) {
+                    hx[r * k + c] = (float)(r + 1U) * 0.5f + (float)c * 0.01f;
+                }
+            }
+            for (size_t r = 0U; r < m; ++r) {
+                for (size_t c = 0U; c < k; ++c) {
+                    hw[r * k + c] = 0.25f + (float)r * 0.05f;
+                }
+            }
+            velri_linear_desc ldesc = velri_desc_f32();
+            ref_linear_run(&ldesc, rows, m, k, hx, k, nullptr, hw, k, nullptr, nullptr, hy_ref, m);
+
+            /* Part 1: dynamic_seq = true LINEAR strictly rejects seq_len_override > static_rows */
+            {
+                velri_graph *g = nullptr;
+                CHECK_OK(velri_graph_create(&g), "dyn lin g");
+                velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows * k, dev);
+                velri_storage_id sw = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m * k, dev);
+                velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, rows * m, dev);
+                velri_op_desc op = {
+                    .kind = VELRI_OP_LINEAR,
+                    .num_inputs = 2U,
+                    .num_outputs = 1U,
+                    .inputs = {add_view_2d_strided(g, sx, VELRI_DTYPE_F32, rows, k, k),
+                               add_view_2d_strided(g, sw, VELRI_DTYPE_F32, m, k, k)},
+                    .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, rows, m, m)},
+                    .dynamic_seq = true,
+                    .attr.linear.desc = ldesc,
+                };
+                CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add dyn lin");
+                velri_plan *plan = nullptr;
+                velri_slot *slot = nullptr;
+                CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep dyn lin");
+                CHECK_OK(velri_plan_bind_weight_host(plan, sw, hw, m * k * sizeof(float)), "bind w");
+                CHECK_OK(velri_slot_create(plan, &slot), "slot");
+                CHECK_OK(velri_slot_bind_host(slot, sx, hx, rows * k * sizeof(float)), "bind x");
+                CHECK_OK(velri_slot_bind_host(slot, sy, hy, rows * m * sizeof(float)), "bind y");
+
+                velri_step_params sp_oob = {.has_seq_len = true, .seq_len_override = rows + 1U};
+                CHECK(velri_slot_run(slot, &sp_oob, nullptr) == VELRI_ERR_INVALID,
+                      "dynamic_seq=true must reject seq_len_override > static_rows");
+                CHECK(!velri_slot_needs_reset(slot), "pre-accept rejection must not dirty slot");
+
+                velri_step_params sp_ok = {.has_seq_len = true, .seq_len_override = 2U};
+                CHECK_OK(velri_slot_run(slot, &sp_ok, nullptr), "dyn lin valid override");
+                CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ref, hy, 2U, m, m) <= 2e-4,
+                      "dyn lin active rows accuracy");
+
+                velri_slot_destroy(slot);
+                velri_plan_destroy(plan);
+                velri_graph_destroy(g);
+            }
+
+            /* Part 2: dynamic_seq = false LINEAR is NOT truncated when has_seq_len = true */
+            {
+                memset(hy, 0, rows * m * sizeof(float));
+                velri_graph *g = nullptr;
+                CHECK_OK(velri_graph_create(&g), "static lin g");
+                velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows * k, dev);
+                velri_storage_id sw = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m * k, dev);
+                velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, rows * m, dev);
+                velri_op_desc op = {
+                    .kind = VELRI_OP_LINEAR,
+                    .num_inputs = 2U,
+                    .num_outputs = 1U,
+                    .inputs = {add_view_2d_strided(g, sx, VELRI_DTYPE_F32, rows, k, k),
+                               add_view_2d_strided(g, sw, VELRI_DTYPE_F32, m, k, k)},
+                    .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, rows, m, m)},
+                    .dynamic_seq = false,
+                    .attr.linear.desc = ldesc,
+                };
+                CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add static lin");
+                velri_plan *plan = nullptr;
+                velri_slot *slot = nullptr;
+                CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep static lin");
+                CHECK_OK(velri_plan_bind_weight_host(plan, sw, hw, m * k * sizeof(float)), "bind w");
+                CHECK_OK(velri_slot_create(plan, &slot), "slot");
+                CHECK_OK(velri_slot_bind_host(slot, sx, hx, rows * k * sizeof(float)), "bind x");
+                CHECK_OK(velri_slot_bind_host(slot, sy, hy, rows * m * sizeof(float)), "bind y");
+
+                velri_step_params sp_small = {.has_seq_len = true, .seq_len_override = 1U};
+                CHECK_OK(velri_slot_run(slot, &sp_small, nullptr), "static lin run");
+                CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ref, hy, rows, m, m) <= 2e-4,
+                      "dynamic_seq=false linear must compute all static rows");
+
+                velri_slot_destroy(slot);
+                velri_plan_destroy(plan);
+                velri_graph_destroy(g);
+            }
+
+            /* Part 3: dynamic_seq = false 2D elementwise op is NOT truncated when has_seq_len = true */
+            {
+                float *hy_ew = (float *)xcalloc(rows * k, sizeof(float));
+                float *hy_ew_ref = (float *)xcalloc(rows * k, sizeof(float));
+                ref_vec_axpby_f32(rows * k, 2.0f, hx, 0.0f, hx, hy_ew_ref);
+
+                velri_graph *g = nullptr;
+                CHECK_OK(velri_graph_create(&g), "static ew g");
+                velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows * k, dev);
+                velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, rows * k, dev);
+                velri_op_desc op = {
+                    .kind = VELRI_OP_VEC_AXPBY,
+                    .num_inputs = 1U,
+                    .num_outputs = 1U,
+                    .inputs = {add_view_2d_strided(g, sx, VELRI_DTYPE_F32, rows, k, k)},
+                    .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, rows, k, k)},
+                    .dynamic_seq = false,
+                    .attr.axpby = {.alpha = 2.0f, .beta = 0.0f},
+                };
+                CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add static ew");
+                velri_plan *plan = nullptr;
+                velri_slot *slot = nullptr;
+                CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep static ew");
+                CHECK_OK(velri_slot_create(plan, &slot), "slot");
+                CHECK_OK(velri_slot_bind_host(slot, sx, hx, rows * k * sizeof(float)), "bind x");
+                CHECK_OK(velri_slot_bind_host(slot, sy, hy_ew, rows * k * sizeof(float)), "bind y");
+
+                velri_step_params sp_small = {.has_seq_len = true, .seq_len_override = 1U};
+                CHECK_OK(velri_slot_run(slot, &sp_small, nullptr), "static ew run");
+                CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, hy_ew_ref, hy_ew, rows, k, k) <= 1e-6,
+                      "dynamic_seq=false elemwise must compute all static rows");
+
+                velri_slot_destroy(slot);
+                velri_plan_destroy(plan);
+                velri_graph_destroy(g);
+                free(hy_ew);
+                free(hy_ew_ref);
+            }
+
+            free(hx);
+            free(hw);
+            free(hy);
+            free(hy_ref);
+        }
+    }
+
+    printf("  [PASS] %-14s — all 15 ops + edge cases verified vs FP64 reference.\n", tag);
 }
 
 int main(void) {

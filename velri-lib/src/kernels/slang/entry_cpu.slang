@@ -8,6 +8,7 @@ import norm;
 import rope;
 import elementwise;
 import linear_cpu;
+import attention;
 
 #define VELRI_CAT2(a, b) a##b
 #define VELRI_CAT(a, b) VELRI_CAT2(a, b)
@@ -230,4 +231,48 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
     Ptr<float> scale_out, uint r0, uint r1, uint cols)
 {
     quantize_rows_f32_i8_cpu(x, xs, xi8, xi8s, scale_out, r0, r1, cols);
+}
+
+// ---- Embedding, CopyLastRow, KV Append, and Scaled Dot-Product Attention ----
+
+[DllExport] export __extern_cpp void VSYM(embedding_f32)(
+    Ptr<float, Access.Read> table, uint table_stride,
+    Ptr<int32_t, Access.Read> ids, uint has_ids,
+    uint vocab, uint pos_offset,
+    Ptr<float> out, uint out_stride,
+    uint r0, uint r1, uint dim)
+{
+    embedding_rows_cpu(table, table_stride, ids, has_ids, vocab, pos_offset,
+                       out, out_stride, r0, r1, dim);
+}
+
+[DllExport] export __extern_cpp void VSYM(copy_last_row_f32)(
+    Ptr<float, Access.Read> x, uint x_stride,
+    Ptr<float> y, uint src_row, uint dim)
+{
+    copy_last_row_cpu(x, x_stride, y, src_row, dim);
+}
+
+[DllExport] export __extern_cpp void VSYM(kv_append_f32)(
+    Ptr<float, Access.Read> k_in, uint k_stride,
+    Ptr<float, Access.Read> v_in, uint v_stride,
+    Ptr<float> k_cache, Ptr<float> v_cache,
+    uint same_kv_cache, uint kvh0, uint kvh1,
+    uint active_t, uint kv_pos, uint max_ctx, uint head_dim)
+{
+    kv_append_cpu(k_in, k_stride, v_in, v_stride, k_cache, v_cache, same_kv_cache,
+                  kvh0, kvh1, active_t, kv_pos, max_ctx, head_dim);
+}
+
+[DllExport] export __extern_cpp void VSYM(attention_f32)(
+    Ptr<float, Access.Read> q, uint q_stride,
+    Ptr<float, Access.Read> k_cache, Ptr<float, Access.Read> v_cache,
+    Ptr<float> out, uint o_stride,
+    uint w0, uint w1, uint active_t, uint n_heads, uint n_kv_heads,
+    uint head_dim, uint kv_pos, uint max_ctx, float scale,
+    uint sliding_window, uint causal)
+{
+    attention_rows_cpu(q, q_stride, k_cache, v_cache, out, o_stride,
+                       w0, w1, active_t, n_heads, n_kv_heads, head_dim,
+                       kv_pos, max_ctx, scale, sliding_window, causal);
 }

@@ -31,6 +31,7 @@ set(VELRI_SLANG_CPU_DEPS
     "${VELRI_SLANG_DIR}/ops/rope.slang"
     "${VELRI_SLANG_DIR}/ops/elementwise.slang"
     "${VELRI_SLANG_DIR}/ops/linear_cpu.slang"
+    "${VELRI_SLANG_DIR}/ops/attention.slang"
 )
 set(VELRI_SLANG_VK_DEPS
     ${VELRI_SLANG_COMMON_DEPS}
@@ -366,6 +367,11 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_f16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16_64"
         "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8_64"
+        "${_vk}/attention.slang|vk_embedding_f32"
+        "${_vk}/attention.slang|vk_copy_last_row_f32"
+        "${_vk}/attention.slang|vk_kv_append_f32"
+        "${_vk}/attention.slang|vk_attention_decode_f32"
+        "${_vk}/attention.slang|vk_attention_prefill_f32"
     )
     velri_compile_vk_shaders(VELRI_VK_SHADER_HEADER
         "${VELRI_SLANG_GEN_DIR}/spv"

@@ -111,6 +111,12 @@ set(VELRI_SOURCES
     src/core/runtime_ctx.c
     src/ops/registry.c
     src/graph/graph.c
+    src/blocks/builder.c
+    src/blocks/embedding.c
+    src/blocks/attention.c
+    src/blocks/mlp.c
+    src/blocks/lm_head.c
+    src/layers/pre_norm.c
     src/plan/planner.c
     src/runtime/executor.c
     src/backend/cpu/cpu_backend.c

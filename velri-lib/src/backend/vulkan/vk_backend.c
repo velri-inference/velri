@@ -113,6 +113,33 @@ typedef struct {
 } vk_splitk_reduce_args;
 static_assert(sizeof(vk_splitk_reduce_args) == 72, "SplitKReduceArgs size mismatch");
 
+typedef struct {
+    uint64_t table, ids, out;
+    uint32_t rows, dim, vocab, table_stride, out_stride, pos_offset, has_ids, pad;
+} vk_embedding_args;
+static_assert(sizeof(vk_embedding_args) == 56, "EmbeddingArgs size mismatch");
+
+typedef struct {
+    uint64_t x, y;
+    uint32_t src_row, dim, x_stride, pad;
+} vk_copy_last_row_args;
+static_assert(sizeof(vk_copy_last_row_args) == 32, "CopyLastRowArgs size mismatch");
+
+typedef struct {
+    uint64_t k_in, v_in, k_cache, v_cache;
+    uint32_t rows, n_kv_heads, head_dim, max_ctx, kv_pos, k_stride, v_stride, same_kv_cache;
+} vk_kv_append_args;
+static_assert(sizeof(vk_kv_append_args) == 64, "KvAppendArgs size mismatch");
+
+typedef struct {
+    uint64_t q, k_cache, v_cache, out;
+    uint32_t rows, n_heads, n_kv_heads, head_dim, max_ctx, kv_pos;
+    uint32_t q_stride, o_stride, sliding_window, causal;
+    float scale;
+    uint32_t pad;
+} vk_attention_args;
+static_assert(sizeof(vk_attention_args) == 80, "AttentionArgs size mismatch");
+
 /* ---- Capability Bitmask & Table-Driven Pipelines ---- */
 
 enum {
@@ -157,6 +184,11 @@ enum {
     PIPE_GEMM_COOPMAT_F16_64,
     PIPE_GEMM_COOPMAT_BF16_64,
     PIPE_GEMM_COOPMAT_W8A8_64,
+    PIPE_EMBEDDING_F32,
+    PIPE_COPY_LAST_ROW_F32,
+    PIPE_KV_APPEND_F32,
+    PIPE_ATTENTION_DECODE_F32,
+    PIPE_ATTENTION_PREFILL_F32,
     PIPE_COUNT
 };
 
@@ -196,6 +228,11 @@ static const vk_pipe_spec k_pipes[PIPE_COUNT] = {
     [PIPE_GEMM_COOPMAT_F16_64]   = {spv_vk_gemm_coopmat_f16_64, spv_vk_gemm_coopmat_f16_64_bytes, VK_CAP_CM_F16},
     [PIPE_GEMM_COOPMAT_BF16_64]  = {spv_vk_gemm_coopmat_bf16_64, spv_vk_gemm_coopmat_bf16_64_bytes, VK_CAP_CM_BF16},
     [PIPE_GEMM_COOPMAT_W8A8_64]  = {spv_vk_gemm_coopmat_w8a8_64, spv_vk_gemm_coopmat_w8a8_64_bytes, VK_CAP_CM_I8},
+    [PIPE_EMBEDDING_F32]         = {spv_vk_embedding_f32, spv_vk_embedding_f32_bytes, VK_CAP_NONE},
+    [PIPE_COPY_LAST_ROW_F32]     = {spv_vk_copy_last_row_f32, spv_vk_copy_last_row_f32_bytes, VK_CAP_NONE},
+    [PIPE_KV_APPEND_F32]         = {spv_vk_kv_append_f32, spv_vk_kv_append_f32_bytes, VK_CAP_NONE},
+    [PIPE_ATTENTION_DECODE_F32]  = {spv_vk_attention_decode_f32, spv_vk_attention_decode_f32_bytes, VK_CAP_NONE},
+    [PIPE_ATTENTION_PREFILL_F32] = {spv_vk_attention_prefill_f32, spv_vk_attention_prefill_f32_bytes, VK_CAP_NONE},
 };
 
 /* ---- X-Macro Vulkan Loader Tables ---- */
@@ -282,7 +319,10 @@ struct velri_completion {
 
 struct velri_prepared_op {
     int pipe_id;
-    int reduce_pipe_id;
+    int alt_pipe_id;            /* LINEAR: GEMV pipeline for dynamic active_rows <= 2 */
+    int reduce_pipe_id;         /* LINEAR Split-K: PIPE_SPLITK_REDUCE */
+    int stage2_decode_pipe_id;  /* ATTENTION: PIPE_ATTENTION_DECODE_F32 */
+    int stage2_prefill_pipe_id; /* ATTENTION: PIPE_ATTENTION_PREFILL_F32 */
     uint32_t split_k;
     size_t splitk_bytes;
 };
@@ -1355,7 +1395,7 @@ static velri_status vk_zero_mem(velri_backend_device *dev, void *mem_handle, siz
 static uint32_t choose_split_k(uint32_t rows, uint32_t m, uint32_t k, uint32_t tile_m,
                                uint32_t tile_n, uint32_t target_wgs, uint32_t bk_elems) {
     uint64_t wgs = (uint64_t)div_ceil_u32(m, tile_n) * (uint64_t)div_ceil_u32(rows, tile_m);
-    if (rows < 16U || wgs == 0ULL || wgs >= target_wgs) {
+    if (rows < 16U || wgs == 0ULL || wgs >= target_wgs || m > UINT32_MAX - 3U) {
         return 1U;
     }
     uint32_t k_tiles = div_ceil_u32(k, bk_elems);
@@ -1386,7 +1426,10 @@ static int select_coopmat_pipe(const velri_backend_device *dev, uint32_t rows, u
 static velri_status resolve_op_pipes(const velri_backend_device *dev, const velri_resolved_op *op,
                                      struct velri_prepared_op *out_plan) {
     out_plan->pipe_id = -1;
+    out_plan->alt_pipe_id = -1;
     out_plan->reduce_pipe_id = -1;
+    out_plan->stage2_decode_pipe_id = -1;
+    out_plan->stage2_prefill_pipe_id = -1;
     out_plan->split_k = 1U;
     out_plan->splitk_bytes = 0U;
 
@@ -1402,6 +1445,7 @@ static velri_status resolve_op_pipes(const velri_backend_device *dev, const velr
                 out_plan->pipe_id = PIPE_GEMV_F32;
             } else {
                 out_plan->pipe_id = PIPE_GEMM_F32;
+                out_plan->alt_pipe_id = PIPE_GEMV_F32;
                 uint32_t sk = choose_split_k(rows, m, k, 128U, 128U, 140U, 8U);
                 if (sk > 1U) {
                     out_plan->split_k = sk;
@@ -1416,16 +1460,28 @@ static velri_status resolve_op_pipes(const velri_backend_device *dev, const velr
             out_plan->pipe_id = select_coopmat_pipe(dev, rows, m, PIPE_GEMV_F16,
                                                     PIPE_GEMM_COOPMAT_F16_64,
                                                     PIPE_GEMM_COOPMAT_F16);
+            if (out_plan->pipe_id >= 0 && out_plan->pipe_id != PIPE_GEMV_F16 &&
+                has_pipe_caps(dev, PIPE_GEMV_F16)) {
+                out_plan->alt_pipe_id = PIPE_GEMV_F16;
+            }
         } else if (d->x_dtype == VELRI_DTYPE_BF16 && d->w_dtype == VELRI_DTYPE_BF16 &&
                    d->y_dtype == VELRI_DTYPE_F32) {
             out_plan->pipe_id = select_coopmat_pipe(dev, rows, m, PIPE_GEMV_BF16,
                                                     PIPE_GEMM_COOPMAT_BF16_64,
                                                     PIPE_GEMM_COOPMAT_BF16);
+            if (out_plan->pipe_id >= 0 && out_plan->pipe_id != PIPE_GEMV_BF16 &&
+                has_pipe_caps(dev, PIPE_GEMV_BF16)) {
+                out_plan->alt_pipe_id = PIPE_GEMV_BF16;
+            }
         } else if (d->x_dtype == VELRI_DTYPE_I8 && d->w_dtype == VELRI_DTYPE_I8 &&
                    d->y_dtype == VELRI_DTYPE_F32) {
             out_plan->pipe_id = select_coopmat_pipe(dev, rows, m, PIPE_GEMV_W8A8,
                                                     PIPE_GEMM_COOPMAT_W8A8_64,
                                                     PIPE_GEMM_COOPMAT_W8A8);
+            if (out_plan->pipe_id >= 0 && out_plan->pipe_id != PIPE_GEMV_W8A8 &&
+                has_pipe_caps(dev, PIPE_GEMV_W8A8)) {
+                out_plan->alt_pipe_id = PIPE_GEMV_W8A8;
+            }
         }
         break;
     }
@@ -1471,6 +1527,17 @@ static velri_status resolve_op_pipes(const velri_backend_device *dev, const velr
     case VELRI_OP_QUANTIZE_ROW:
         out_plan->pipe_id = PIPE_QUANTIZE_ROW_F32_I8;
         break;
+    case VELRI_OP_EMBEDDING:
+        out_plan->pipe_id = PIPE_EMBEDDING_F32;
+        break;
+    case VELRI_OP_ATTENTION:
+        out_plan->pipe_id = PIPE_KV_APPEND_F32;
+        out_plan->stage2_decode_pipe_id = PIPE_ATTENTION_DECODE_F32;
+        out_plan->stage2_prefill_pipe_id = PIPE_ATTENTION_PREFILL_F32;
+        break;
+    case VELRI_OP_COPY_LAST_ROW:
+        out_plan->pipe_id = PIPE_COPY_LAST_ROW_F32;
+        break;
     default:
         break;
     }
@@ -1478,7 +1545,18 @@ static velri_status resolve_op_pipes(const velri_backend_device *dev, const velr
     if (!has_pipe_caps(dev, out_plan->pipe_id)) {
         return VELRI_ERR_UNSUPPORTED;
     }
+    if (out_plan->alt_pipe_id >= 0 && !has_pipe_caps(dev, out_plan->alt_pipe_id)) {
+        return VELRI_ERR_UNSUPPORTED;
+    }
     if (out_plan->reduce_pipe_id >= 0 && !has_pipe_caps(dev, out_plan->reduce_pipe_id)) {
+        return VELRI_ERR_UNSUPPORTED;
+    }
+    if (out_plan->stage2_decode_pipe_id >= 0 &&
+        !has_pipe_caps(dev, out_plan->stage2_decode_pipe_id)) {
+        return VELRI_ERR_UNSUPPORTED;
+    }
+    if (out_plan->stage2_prefill_pipe_id >= 0 &&
+        !has_pipe_caps(dev, out_plan->stage2_prefill_pipe_id)) {
         return VELRI_ERR_UNSUPPORTED;
     }
     return VELRI_OK;
@@ -1513,27 +1591,38 @@ static velri_status vk_prepare_op(velri_backend_device *dev, const velri_resolve
         return st;
     }
 
+    const int req_pipes[5] = {
+        plan.pipe_id,
+        plan.alt_pipe_id,
+        plan.reduce_pipe_id,
+        plan.stage2_decode_pipe_id,
+        plan.stage2_prefill_pipe_id,
+    };
+
     velri_os_mutex_lock(dev->mtx);
-    VkPipeline p = get_pipe_locked(dev, plan.pipe_id);
-    VkPipeline rp =
-        (plan.reduce_pipe_id >= 0) ? get_pipe_locked(dev, plan.reduce_pipe_id) : VK_NULL_HANDLE;
-    if (!p || (plan.reduce_pipe_id >= 0 && !rp)) {
-        velri_os_mutex_unlock(dev->mtx);
-        return VELRI_ERR_UNSUPPORTED;
+    for (size_t i = 0U; i < 5U; ++i) {
+        if (req_pipes[i] >= 0 && !get_pipe_locked(dev, req_pipes[i])) {
+            velri_os_mutex_unlock(dev->mtx);
+            return VELRI_ERR_UNSUPPORTED;
+        }
     }
     if (plan.splitk_bytes > 0U && (!dev->splitk_buf || dev->splitk_buf->size < plan.splitk_bytes)) {
         /* Wait for any in-flight split-K user before resizing shared partial buffer. */
         while (dev->splitk_busy) {
             velri_os_cond_wait(dev->slot_cv, dev->mtx);
         }
-        vk_buf *nb = nullptr;
-        st = alloc_buf_locked(dev, plan.splitk_bytes, 256U, &nb);
-        if (st != VELRI_OK) {
-            velri_os_mutex_unlock(dev->mtx);
-            return st;
+        if (!dev->splitk_buf || dev->splitk_buf->size < plan.splitk_bytes) {
+            vk_buf *nb = nullptr;
+            st = alloc_buf_locked(dev, plan.splitk_bytes, 256U, &nb);
+            if (st != VELRI_OK) {
+                velri_os_cond_broadcast(dev->slot_cv);
+                velri_os_mutex_unlock(dev->mtx);
+                return st;
+            }
+            free_buf_locked(dev, dev->splitk_buf);
+            dev->splitk_buf = nb;
+            velri_os_cond_broadcast(dev->slot_cv);
         }
-        free_buf_locked(dev, dev->splitk_buf);
-        dev->splitk_buf = nb;
     }
     velri_os_mutex_unlock(dev->mtx);
 
@@ -1555,14 +1644,18 @@ static void vk_destroy_prepared_op(velri_backend_device *dev, velri_prepared_op 
 
 typedef struct {
     VkPipeline pipe;
-    VkPipeline red_pipe;
     uint32_t gx, gy, gz;
-    uint32_t red_gx;
     uint32_t pc_size;
-    uint32_t red_pc_size;
     alignas(8) uint8_t pc[128];
-    vk_splitk_reduce_args red_pc;
+
+    bool has_stage2;
+    VkPipeline pipe2;
+    uint32_t gx2, gy2, gz2;
+    uint32_t pc2_size;
+    alignas(8) uint8_t pc2[128];
+
     bool uses_splitk;
+    size_t splitk_bytes;
 } vk_encoded_dispatch;
 
 static bool binding_bda(const velri_buffer_binding *b, uint64_t *out_bda) {
@@ -1614,15 +1707,17 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         }
     }
 
-    out->pipe = get_pipe_locked(dev, plan.pipe_id);
-    if (!out->pipe) {
-        return VELRI_ERR_UNSUPPORTED;
+    if (op->kind != VELRI_OP_LINEAR) {
+        out->pipe = get_pipe_locked(dev, plan.pipe_id);
+        if (!out->pipe) {
+            return VELRI_ERR_UNSUPPORTED;
+        }
     }
 
     uint32_t warps_per_wg = 128U / dev->subgroup_size;
     switch (op->kind) {
     case VELRI_OP_LINEAR: {
-        uint32_t rows = (uint32_t)op->inputs[0].dims[0];
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         uint32_t m = (uint32_t)op->inputs[1].dims[0];
         uint32_t k = (uint32_t)op->inputs[0].dims[1];
         uint32_t xs = (uint32_t)op->inputs[0].strides[0];
@@ -1630,6 +1725,16 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         uint32_t ys = (uint32_t)op->outputs[0].strides[0];
         uint32_t flags = (op->input_present[2] ? 1U : 0U) | (op->input_present[3] ? 2U : 0U) |
                          (op->input_present[4] ? 4U : 0U);
+
+        int active_pipe_id = plan.pipe_id;
+        if (rows <= 2U && plan.alt_pipe_id >= 0) {
+            active_pipe_id = plan.alt_pipe_id;
+        }
+        out->pipe = get_pipe_locked(dev, active_pipe_id);
+        if (!out->pipe) {
+            return VELRI_ERR_UNSUPPORTED;
+        }
+
         vk_linear_args args = {
             .x = ib[0],
             .w = ib[1],
@@ -1647,14 +1752,14 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .split_k = 1U,
         };
 
-        if (plan.pipe_id == PIPE_GEMV_F32 || plan.pipe_id == PIPE_GEMV_F16 ||
-            plan.pipe_id == PIPE_GEMV_BF16 || plan.pipe_id == PIPE_GEMV_W8A8) {
+        if (active_pipe_id == PIPE_GEMV_F32 || active_pipe_id == PIPE_GEMV_F16 ||
+            active_pipe_id == PIPE_GEMV_BF16 || active_pipe_id == PIPE_GEMV_W8A8) {
             out->gx = div_ceil_u32(m, warps_per_wg);
             out->gy = rows;
             out->gz = 1U;
-        } else if (plan.pipe_id == PIPE_GEMM_COOPMAT_F16_64 ||
-                   plan.pipe_id == PIPE_GEMM_COOPMAT_BF16_64 ||
-                   plan.pipe_id == PIPE_GEMM_COOPMAT_W8A8_64) {
+        } else if (active_pipe_id == PIPE_GEMM_COOPMAT_F16_64 ||
+                   active_pipe_id == PIPE_GEMM_COOPMAT_BF16_64 ||
+                   active_pipe_id == PIPE_GEMM_COOPMAT_W8A8_64) {
             out->gx = div_ceil_u32(m, 64U);
             out->gy = div_ceil_u32(rows, 64U);
             out->gz = 1U;
@@ -1664,40 +1769,55 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             out->gz = 1U;
         }
 
-        if (plan.split_k > 1U && plan.reduce_pipe_id >= 0) {
-            out->red_pipe = get_pipe_locked(dev, plan.reduce_pipe_id);
-            if (!out->red_pipe || !dev->splitk_buf || dev->splitk_buf->size < plan.splitk_bytes) {
-                return VELRI_ERR_EXEC;
+        if (active_pipe_id == PIPE_GEMM_F32 && plan.split_k > 1U && plan.reduce_pipe_id >= 0) {
+            uint32_t sk = choose_split_k(rows, m, k, 128U, 128U, 140U, 8U);
+            if (sk > plan.split_k) {
+                sk = plan.split_k;
             }
-            uint32_t part_stride = (m + 3U) & ~3U;
-            args.y = (uint64_t)dev->splitk_buf->bda;
-            args.y_stride = part_stride;
-            args.split_k = plan.split_k;
-            out->gz = plan.split_k;
+            if (sk > 1U) {
+                uint32_t part_stride = (m + 3U) & ~3U;
+                size_t need_bytes = (size_t)sk * (size_t)rows * (size_t)part_stride * sizeof(float);
+                VkPipeline reduce_pipe =
+                    (dev->splitk_buf && dev->splitk_buf->size >= need_bytes)
+                        ? get_pipe_locked(dev, plan.reduce_pipe_id)
+                        : VK_NULL_HANDLE;
+                if (reduce_pipe != VK_NULL_HANDLE) {
+                    uint64_t total_u4 = (uint64_t)rows * (uint64_t)(part_stride >> 2U);
+                    uint64_t rgx = (total_u4 + 255ULL) / 256ULL;
+                    if (rgx == 0ULL || rgx > dev->max_wg_count[0]) {
+                        return VELRI_ERR_OVERFLOW;
+                    }
+                    args.y = (uint64_t)dev->splitk_buf->bda;
+                    args.y_stride = part_stride;
+                    args.split_k = sk;
+                    out->gz = sk;
 
-            out->red_pc = (vk_splitk_reduce_args){
-                .partials = (uint64_t)dev->splitk_buf->bda,
-                .bias = args.bias,
-                .x_scale = args.x_scale,
-                .w_scale = args.w_scale,
-                .y = ob[0],
-                .rows = rows,
-                .m = m,
-                .part_stride_u4 = part_stride >> 2U,
-                .y_stride = ys,
-                .split_k = plan.split_k,
-                .flags = flags,
-                .is_int32 = 0U,
-                .pad = 0U,
-            };
-            uint64_t total_u4 = (uint64_t)rows * (uint64_t)(part_stride >> 2U);
-            uint64_t rgx = (total_u4 + 255ULL) / 256ULL;
-            if (rgx == 0ULL || rgx > dev->max_wg_count[0]) {
-                return VELRI_ERR_OVERFLOW;
+                    vk_splitk_reduce_args red = {
+                        .partials = (uint64_t)dev->splitk_buf->bda,
+                        .bias = args.bias,
+                        .x_scale = args.x_scale,
+                        .w_scale = args.w_scale,
+                        .y = ob[0],
+                        .rows = rows,
+                        .m = m,
+                        .part_stride_u4 = part_stride >> 2U,
+                        .y_stride = ys,
+                        .split_k = sk,
+                        .flags = flags,
+                        .is_int32 = 0U,
+                        .pad = 0U,
+                    };
+                    out->pipe2 = reduce_pipe;
+                    memcpy(out->pc2, &red, sizeof(red));
+                    out->pc2_size = (uint32_t)sizeof(red);
+                    out->gx2 = (uint32_t)rgx;
+                    out->gy2 = 1U;
+                    out->gz2 = 1U;
+                    out->has_stage2 = true;
+                    out->uses_splitk = true;
+                    out->splitk_bytes = need_bytes;
+                }
             }
-            out->red_gx = (uint32_t)rgx;
-            out->red_pc_size = (uint32_t)sizeof(out->red_pc);
-            out->uses_splitk = true;
         }
         memcpy(out->pc, &args, sizeof(args));
         out->pc_size = (uint32_t)sizeof(args);
@@ -1705,11 +1825,12 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_RMSNORM: {
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         vk_rmsnorm_args args = {
             .x = ib[0],
             .w = op->input_present[1] ? ib[1] : 0ULL,
             .y = ob[0],
-            .rows = (uint32_t)op->inputs[0].dims[0],
+            .rows = rows,
             .dim = (uint32_t)op->inputs[0].dims[1],
             .x_stride = (uint32_t)op->inputs[0].strides[0],
             .y_stride = (uint32_t)op->outputs[0].strides[0],
@@ -1727,12 +1848,13 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_FUSED_ADD_RMSNORM: {
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         vk_fused_add_rmsnorm_args args = {
             .residual_inout = ob[0],
             .x = ib[0],
             .w = op->input_present[1] ? ib[1] : 0ULL,
             .y = ob[1],
-            .rows = (uint32_t)op->inputs[0].dims[0],
+            .rows = rows,
             .dim = (uint32_t)op->inputs[0].dims[1],
             .r_stride = (uint32_t)op->outputs[0].strides[0],
             .x_stride = (uint32_t)op->inputs[0].strides[0],
@@ -1750,12 +1872,13 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_LAYERNORM: {
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         vk_layernorm_args args = {
             .x = ib[0],
             .w = op->input_present[1] ? ib[1] : 0ULL,
             .b = op->input_present[2] ? ib[2] : 0ULL,
             .y = ob[0],
-            .rows = (uint32_t)op->inputs[0].dims[0],
+            .rows = rows,
             .dim = (uint32_t)op->inputs[0].dims[1],
             .x_stride = (uint32_t)op->inputs[0].strides[0],
             .y_stride = (uint32_t)op->outputs[0].strides[0],
@@ -1779,7 +1902,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         if (pos > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
-        uint32_t nt = (uint32_t)op->inputs[0].dims[0];
+        uint32_t nt = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         uint32_t nh = (uint32_t)op->inputs[0].dims[1];
         uint32_t hd = (uint32_t)op->inputs[0].dims[2];
         uint32_t rd = (uint32_t)op->raw.attr.rope.rotary_dim;
@@ -1835,9 +1958,8 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_ACTIVATION: {
-        size_t n = 0U;
-        if (velri_tensor_view_num_elements(&op->inputs[0], &n) != VELRI_OK ||
-            n > (size_t)UINT32_MAX) {
+        size_t n = velri_effective_elemwise_count(op, &op->inputs[0], item->params);
+        if (n == 0U || n > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
         vk_activation_args args = {.x = ib[0], .y = ob[0], .count = (uint32_t)n, .pad = 0U};
@@ -1850,9 +1972,8 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_GATED_MLP: {
-        size_t n = 0U;
-        if (velri_tensor_view_num_elements(&op->inputs[0], &n) != VELRI_OK ||
-            n > (size_t)UINT32_MAX) {
+        size_t n = velri_effective_elemwise_count(op, &op->inputs[0], item->params);
+        if (n == 0U || n > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
         vk_gated_mlp_args args = {
@@ -1871,9 +1992,8 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_VEC_AXPBY: {
-        size_t n = 0U;
-        if (velri_tensor_view_num_elements(&op->inputs[0], &n) != VELRI_OK ||
-            n > (size_t)UINT32_MAX) {
+        size_t n = velri_effective_elemwise_count(op, &op->inputs[0], item->params);
+        if (n == 0U || n > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
         bool has_b = op->input_present[1] && (op->raw.attr.axpby.beta != 0.0f);
@@ -1896,9 +2016,8 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_VEC_MUL: {
-        size_t n = 0U;
-        if (velri_tensor_view_num_elements(&op->inputs[0], &n) != VELRI_OK ||
-            n > (size_t)UINT32_MAX) {
+        size_t n = velri_effective_elemwise_count(op, &op->inputs[0], item->params);
+        if (n == 0U || n > (size_t)UINT32_MAX) {
             return VELRI_ERR_OVERFLOW;
         }
         vk_vec_mul_args args = {
@@ -1913,10 +2032,11 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_SOFTMAX: {
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         vk_softmax_args args = {
             .x = ib[0],
             .y = ob[0],
-            .rows = (uint32_t)op->inputs[0].dims[0],
+            .rows = rows,
             .cols = (uint32_t)op->inputs[0].dims[1],
             .x_stride = (uint32_t)op->inputs[0].strides[0],
             .y_stride = (uint32_t)op->outputs[0].strides[0],
@@ -1935,11 +2055,12 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             suh_mode = (op->raw.attr.fwht.suh_dtype == VELRI_DTYPE_F32) ? 1U : 2U;
         }
         uint32_t bs = (uint32_t)op->raw.attr.fwht.block_size;
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         vk_fwht_args args = {
             .x = ib[0],
             .suh = op->input_present[1] ? ib[1] : 0ULL,
             .y = ob[0],
-            .rows = (uint32_t)op->inputs[0].dims[0],
+            .rows = rows,
             .cols = (uint32_t)op->inputs[0].dims[1],
             .block_size = bs,
             .x_stride = (uint32_t)op->inputs[0].strides[0],
@@ -1957,11 +2078,12 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
     }
 
     case VELRI_OP_QUANTIZE_ROW: {
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
         vk_quantize_row_args args = {
             .x = ib[0],
             .x_i8 = ob[0],
             .scale_out = ob[1],
-            .rows = (uint32_t)op->inputs[0].dims[0],
+            .rows = rows,
             .k = (uint32_t)op->inputs[0].dims[1],
             .x_stride = (uint32_t)op->inputs[0].strides[0],
             .xi8_stride = (uint32_t)op->outputs[0].strides[0],
@@ -1974,11 +2096,152 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         break;
     }
 
+    case VELRI_OP_EMBEDDING: {
+        bool has_ids = (op->num_inputs == 2U && op->input_present[1]);
+        size_t pos_off = 0U;
+        if (!has_ids) {
+            pos_off = (item->params && item->params->has_pos_offset)
+                          ? item->params->pos_offset_override
+                          : op->raw.attr.embedding.pos_offset;
+            if (pos_off > (size_t)UINT32_MAX) {
+                return VELRI_ERR_OVERFLOW;
+            }
+        }
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->outputs[0].dims[0], item->params);
+        uint32_t dim = (uint32_t)op->outputs[0].dims[1];
+        vk_embedding_args args = {
+            .table = ib[0],
+            .ids = has_ids ? ib[1] : 0ULL,
+            .out = ob[0],
+            .rows = rows,
+            .dim = dim,
+            .vocab = (uint32_t)op->inputs[0].dims[0],
+            .table_stride = (uint32_t)op->inputs[0].strides[0],
+            .out_stride = (uint32_t)op->outputs[0].strides[0],
+            .pos_offset = (uint32_t)pos_off,
+            .has_ids = has_ids ? 1U : 0U,
+            .pad = 0U,
+        };
+        memcpy(out->pc, &args, sizeof(args));
+        out->pc_size = (uint32_t)sizeof(args);
+        out->gx = div_ceil_u32(div_ceil_u32(dim, 4U), 256U);
+        out->gy = rows;
+        out->gz = 1U;
+        break;
+    }
+
+    case VELRI_OP_ATTENTION: {
+        size_t kv_pos = 0U;
+        if (item->params) {
+            if (item->params->has_kv_len) {
+                kv_pos = item->params->kv_len_override;
+            } else if (item->params->has_pos_offset) {
+                kv_pos = item->params->pos_offset_override;
+            }
+        }
+        size_t active_rows_sz = velri_effective_rows(op, op->inputs[0].dims[0], item->params);
+        size_t max_ctx_sz = op->outputs[1].dims[1];
+        size_t end_kv = 0U;
+        if (velri_add_overflow_size(kv_pos, active_rows_sz, &end_kv)) {
+            return VELRI_ERR_OVERFLOW;
+        }
+        if (end_kv > max_ctx_sz) {
+            return VELRI_ERR_INVALID;
+        }
+
+        uint32_t rows = (uint32_t)active_rows_sz;
+        uint32_t nh = op->raw.attr.attention.n_heads;
+        uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
+        uint32_t hd = op->raw.attr.attention.head_dim;
+        uint32_t max_ctx = (uint32_t)max_ctx_sz;
+        float scale = (op->raw.attr.attention.scale > 0.0f) ? op->raw.attr.attention.scale
+                                                            : (1.0f / sqrtf((float)hd));
+
+        vk_kv_append_args s1 = {
+            .k_in = ib[1],
+            .v_in = ib[2],
+            .k_cache = ob[1],
+            .v_cache = ob[2],
+            .rows = rows,
+            .n_kv_heads = nkvh,
+            .head_dim = hd,
+            .max_ctx = max_ctx,
+            .kv_pos = (uint32_t)kv_pos,
+            .k_stride = (uint32_t)op->inputs[1].strides[0],
+            .v_stride = (uint32_t)op->inputs[2].strides[0],
+            .same_kv_cache = (ob[1] == ob[2]) ? 1U : 0U,
+        };
+        memcpy(out->pc, &s1, sizeof(s1));
+        out->pc_size = (uint32_t)sizeof(s1);
+        out->gx = div_ceil_u32(nkvh * hd, 256U);
+        out->gy = rows;
+        out->gz = 1U;
+
+        int s2_pipe_id = (rows == 1U) ? plan.stage2_decode_pipe_id : plan.stage2_prefill_pipe_id;
+        out->pipe2 = get_pipe_locked(dev, s2_pipe_id);
+        if (!out->pipe2) {
+            return VELRI_ERR_UNSUPPORTED;
+        }
+        vk_attention_args s2 = {
+            .q = ib[0],
+            .k_cache = ob[1],
+            .v_cache = ob[2],
+            .out = ob[0],
+            .rows = rows,
+            .n_heads = nh,
+            .n_kv_heads = nkvh,
+            .head_dim = hd,
+            .max_ctx = max_ctx,
+            .kv_pos = (uint32_t)kv_pos,
+            .q_stride = (uint32_t)op->inputs[0].strides[0],
+            .o_stride = (uint32_t)op->outputs[0].strides[0],
+            .sliding_window = op->raw.attr.attention.sliding_window,
+            .causal = op->raw.attr.attention.causal ? 1U : 0U,
+            .scale = scale,
+            .pad = 0U,
+        };
+        memcpy(out->pc2, &s2, sizeof(s2));
+        out->pc2_size = (uint32_t)sizeof(s2);
+        if (rows == 1U) {
+            out->gx2 = nh;
+            out->gy2 = 1U;
+            out->gz2 = 1U;
+        } else {
+            out->gx2 = rows;
+            out->gy2 = nh;
+            out->gz2 = 1U;
+        }
+        out->has_stage2 = true;
+        break;
+    }
+
+    case VELRI_OP_COPY_LAST_ROW: {
+        uint32_t rows = (uint32_t)velri_effective_rows(op, op->inputs[0].dims[0], item->params);
+        uint32_t dim = (uint32_t)op->inputs[0].dims[1];
+        vk_copy_last_row_args args = {
+            .x = ib[0],
+            .y = ob[0],
+            .src_row = rows - 1U,
+            .dim = dim,
+            .x_stride = (uint32_t)op->inputs[0].strides[0],
+            .pad = 0U,
+        };
+        memcpy(out->pc, &args, sizeof(args));
+        out->pc_size = (uint32_t)sizeof(args);
+        out->gx = div_ceil_u32(div_ceil_u32(dim, 4U), 256U);
+        out->gy = 1U;
+        out->gz = 1U;
+        break;
+    }
+
     default:
         return VELRI_ERR_UNSUPPORTED;
     }
 
     if (!grid_fits(dev, out->gx, out->gy, out->gz)) {
+        return VELRI_ERR_OVERFLOW;
+    }
+    if (out->has_stage2 && !grid_fits(dev, out->gx2, out->gy2, out->gz2)) {
         return VELRI_ERR_OVERFLOW;
     }
     return VELRI_OK;
@@ -2031,6 +2294,34 @@ static velri_status vk_submit_batch(velri_backend_device *dev, const velri_submi
     slot->uses_splitk = batch_uses_splitk;
     if (batch_uses_splitk) {
         dev->splitk_busy = true;
+        /*
+         * Re-verify and re-patch Split-K BDAs after `cond_wait` and acquiring
+         * `dev->splitk_busy`: another thread's `vk_prepare_op` may have resized
+         * (and freed the previous) `dev->splitk_buf` while we were waiting.
+         */
+        for (uint32_t i = 0U; i < count; ++i) {
+            if (!enc[i].uses_splitk) {
+                continue;
+            }
+            if (!dev->splitk_buf || dev->splitk_buf->size < enc[i].splitk_bytes) {
+                dev->splitk_busy = false;
+                slot->uses_splitk = false;
+                slot->in_use = false;
+                velri_os_cond_broadcast(dev->slot_cv);
+                velri_os_mutex_unlock(dev->mtx);
+                return VELRI_ERR_EXEC;
+            }
+            uint64_t splitk_bda = (uint64_t)dev->splitk_buf->bda;
+            vk_linear_args lin_args;
+            memcpy(&lin_args, enc[i].pc, sizeof(lin_args));
+            lin_args.y = splitk_bda;
+            memcpy(enc[i].pc, &lin_args, sizeof(lin_args));
+
+            vk_splitk_reduce_args red_args;
+            memcpy(&red_args, enc[i].pc2, sizeof(red_args));
+            red_args.partials = splitk_bda;
+            memcpy(enc[i].pc2, &red_args, sizeof(red_args));
+        }
     }
 
     VkMemoryBarrier mbar = {
@@ -2059,14 +2350,14 @@ static velri_status vk_submit_batch(velri_backend_device *dev, const velri_submi
                                     enc[i].pc_size, enc[i].pc);
             dev->vkCmdDispatch(slot->cmd, enc[i].gx, enc[i].gy, enc[i].gz);
 
-            if (enc[i].uses_splitk) {
+            if (enc[i].has_stage2) {
                 dev->vkCmdPipelineBarrier(slot->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0U, 1U, &mbar, 0U,
                                           nullptr, 0U, nullptr);
-                dev->vkCmdBindPipeline(slot->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, enc[i].red_pipe);
+                dev->vkCmdBindPipeline(slot->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, enc[i].pipe2);
                 dev->vkCmdPushConstants(slot->cmd, dev->pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                                        0U, enc[i].red_pc_size, &enc[i].red_pc);
-                dev->vkCmdDispatch(slot->cmd, enc[i].red_gx, 1U, 1U);
+                                        0U, enc[i].pc2_size, enc[i].pc2);
+                dev->vkCmdDispatch(slot->cmd, enc[i].gx2, enc[i].gy2, enc[i].gz2);
             }
         }
         if (dev->vkEndCommandBuffer(slot->cmd) != VK_SUCCESS ||
@@ -2090,7 +2381,7 @@ static velri_status vk_submit_batch(velri_backend_device *dev, const velri_submi
             slot->uses_splitk = false;
         }
         slot->in_use = false;
-        velri_os_cond_signal(dev->slot_cv);
+        velri_os_cond_broadcast(dev->slot_cv);
         velri_os_mutex_unlock(dev->mtx);
         return st;
     }
@@ -2126,7 +2417,7 @@ static void vk_destroy_completion(velri_backend_device *dev, velri_completion *c
         comp->uses_splitk = false;
     }
     comp->in_use = false;
-    velri_os_cond_signal(dev->slot_cv);
+    velri_os_cond_broadcast(dev->slot_cv);
     velri_os_mutex_unlock(dev->mtx);
 }
 

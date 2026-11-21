@@ -4,12 +4,14 @@
 /*
  * Memory/Placement Planner & Launch-Graph Preparation (`velri-lib/docs/EN/architecture.md §4`).
  *
- * - Verifies every op against target device (`query_operation`; no silent CPU fallback).
- * - Maintains a per-(storage, device) residence cache so read-only copies transfer once,
- *   cross-device RMW / partial-view writes preserve untouched bytes, and multi-output
- *   writes into distinct views of the same storage share one target shadow cleanly.
- * - Packs non-overlapping `VELRI_STORAGE_SCRATCH` storages into one arena per device.
- * - Pre-allocates shared `VELRI_STORAGE_WEIGHT` device buffers once on the plan.
+ * Memory-efficiency guarantees:
+ *   - Packs all non-host `VELRI_STORAGE_WEIGHT` storages into contiguous per-device weight slabs
+ *     (up to VELRI_WEIGHT_SLAB_LIMIT each), eliminating per-tensor VkDeviceMemory allocations.
+ *   - Packs all `VELRI_STORAGE_STATE` storages into one contiguous arena per device per slot.
+ *   - Packs all non-host `VELRI_STORAGE_INPUT`/`OUTPUT` storages into one IO arena per device per slot.
+ *   - Packs non-overlapping `VELRI_STORAGE_SCRATCH` storages (sorted descending by size, then
+ *     lifetime span) into one liveness-packed arena per device per slot.
+ *   - Eliminates `ram_staging` allocation whenever either transfer endpoint is host memory.
  */
 
 typedef struct {
@@ -53,7 +55,11 @@ static velri_status emit_ram_transfer(plan_builder *pb, velri_device_id src_dev,
     step->u.transfer.src_plan_storage_idx = src_idx;
     step->u.transfer.dst_plan_storage_idx = dst_idx;
     step->u.transfer.byte_size = byte_size;
-    if (byte_size > pb->plan->ram_staging_bytes) {
+
+    const velri_context *ctx = pb->plan->ctx;
+    bool src_host = ctx->devices[src_dev].caps.is_host_memory;
+    bool dst_host = ctx->devices[dst_dev].caps.is_host_memory;
+    if (!src_host && !dst_host && byte_size > pb->plan->ram_staging_bytes) {
         pb->plan->ram_staging_bytes = byte_size;
     }
     return VELRI_OK;
@@ -94,6 +100,130 @@ static bool view_covers_full_storage(const velri_tensor_view *v, size_t storage_
     return velri_tensor_view_is_contiguous(v) && s0 == 0U && s1 == storage_bytes;
 }
 
+static size_t effective_align(const velri_context *ctx, velri_device_id d, size_t req_align) {
+    size_t min_a = ctx->devices[d].caps.min_align_bytes;
+    if (min_a < 64U) {
+        min_a = 64U;
+    }
+    return req_align < min_a ? min_a : req_align;
+}
+
+static velri_status pack_weight_slabs(velri_plan *plan) {
+    velri_context *ctx = plan->ctx;
+    for (uint32_t d = 0U; d < ctx->num_devices; ++d) {
+        if (ctx->devices[d].caps.is_host_memory) {
+            continue;
+        }
+        size_t slab_align[VELRI_MAX_WEIGHT_SLABS];
+        memset(slab_align, 0, sizeof(slab_align));
+        uint32_t cur_slab = 0U;
+        size_t cur_off = 0U;
+        size_t cur_align = effective_align(ctx, d, 0U);
+
+        for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
+            velri_plan_storage *ps = &plan->storages[i];
+            if (ps->kind != VELRI_STORAGE_WEIGHT || ps->device_id != d) {
+                continue;
+            }
+            size_t align = effective_align(ctx, d, ps->align);
+            size_t aligned_off = velri_align_up(cur_off, align);
+            if (aligned_off == SIZE_MAX || aligned_off > SIZE_MAX - ps->byte_size) {
+                return VELRI_ERR_OVERFLOW;
+            }
+            if (cur_off > 0U && aligned_off + ps->byte_size > VELRI_WEIGHT_SLAB_LIMIT) {
+                plan->weight_slab_bytes[d][cur_slab] = cur_off;
+                slab_align[cur_slab] = cur_align;
+                cur_slab++;
+                if (cur_slab >= VELRI_MAX_WEIGHT_SLABS) {
+                    return VELRI_ERR_NOMEM;
+                }
+                cur_off = 0U;
+                cur_align = effective_align(ctx, d, 0U);
+                aligned_off = 0U;
+            }
+            if (align > cur_align) {
+                cur_align = align;
+            }
+            ps->arena_kind = VELRI_ARENA_WEIGHT;
+            ps->slab_idx = cur_slab;
+            ps->arena_offset = aligned_off;
+            cur_off = aligned_off + ps->byte_size;
+        }
+
+        if (cur_off > 0U) {
+            plan->weight_slab_bytes[d][cur_slab] = cur_off;
+            slab_align[cur_slab] = cur_align;
+            plan->num_weight_slabs[d] = cur_slab + 1U;
+        }
+
+        for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+            size_t sz = velri_align_up(plan->weight_slab_bytes[d][s], slab_align[s]);
+            if (sz == SIZE_MAX) {
+                return VELRI_ERR_OVERFLOW;
+            }
+            plan->weight_slab_bytes[d][s] = sz;
+            velri_status st = velri_device_alloc_tracked(ctx, d, sz, slab_align[s],
+                                                         &plan->weight_slabs[d][s]);
+            if (st != VELRI_OK) {
+                return st;
+            }
+        }
+    }
+    return VELRI_OK;
+}
+
+static velri_status pack_state_and_io_arenas(velri_plan *plan) {
+    velri_context *ctx = plan->ctx;
+    for (uint32_t d = 0U; d < ctx->num_devices; ++d) {
+        bool is_host = ctx->devices[d].caps.is_host_memory;
+        size_t st_off = 0U, st_align = effective_align(ctx, d, 0U);
+        size_t io_off = 0U, io_align = effective_align(ctx, d, 0U);
+
+        for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
+            velri_plan_storage *ps = &plan->storages[i];
+            if (ps->device_id != d) {
+                continue;
+            }
+            if (ps->kind == VELRI_STORAGE_STATE) {
+                size_t a = effective_align(ctx, d, ps->align);
+                if (a > st_align) st_align = a;
+                size_t off = velri_align_up(st_off, a);
+                if (off == SIZE_MAX || off > SIZE_MAX - ps->byte_size) {
+                    return VELRI_ERR_OVERFLOW;
+                }
+                ps->arena_kind = VELRI_ARENA_STATE;
+                ps->arena_offset = off;
+                st_off = off + ps->byte_size;
+            } else if (!is_host &&
+                       (ps->kind == VELRI_STORAGE_INPUT || ps->kind == VELRI_STORAGE_OUTPUT)) {
+                size_t a = effective_align(ctx, d, ps->align);
+                if (a > io_align) io_align = a;
+                size_t off = velri_align_up(io_off, a);
+                if (off == SIZE_MAX || off > SIZE_MAX - ps->byte_size) {
+                    return VELRI_ERR_OVERFLOW;
+                }
+                ps->arena_kind = VELRI_ARENA_IO;
+                ps->arena_offset = off;
+                io_off = off + ps->byte_size;
+            }
+        }
+
+        if (st_off > 0U) {
+            st_off = velri_align_up(st_off, st_align);
+            if (st_off == SIZE_MAX) return VELRI_ERR_OVERFLOW;
+        }
+        if (io_off > 0U) {
+            io_off = velri_align_up(io_off, io_align);
+            if (io_off == SIZE_MAX) return VELRI_ERR_OVERFLOW;
+        }
+        plan->state_arena_bytes[d] = st_off;
+        plan->state_arena_align[d] = st_align;
+        plan->io_arena_bytes[d] = io_off;
+        plan->io_arena_align[d] = io_align;
+    }
+    return VELRI_OK;
+}
+
 typedef struct {
     size_t start;
     size_t end;
@@ -109,10 +239,12 @@ static velri_status pack_scratch_arenas(velri_plan *plan) {
 
     uint32_t *first_use = (uint32_t *)malloc((size_t)ns * sizeof(uint32_t));
     uint32_t *last_use = (uint32_t *)malloc((size_t)ns * sizeof(uint32_t));
+    uint32_t *order = (uint32_t *)malloc((size_t)ns * sizeof(uint32_t));
     placed_interval *placed = (placed_interval *)malloc((size_t)ns * sizeof(placed_interval));
-    if (!first_use || !last_use || !placed) {
+    if (!first_use || !last_use || !order || !placed) {
         free(first_use);
         free(last_use);
+        free(order);
         free(placed);
         return VELRI_ERR_NOMEM;
     }
@@ -148,21 +280,44 @@ static velri_status pack_scratch_arenas(velri_plan *plan) {
 
     velri_status st = VELRI_OK;
     for (uint32_t d = 0U; d < plan->ctx->num_devices && st == VELRI_OK; ++d) {
-        uint32_t n_placed = 0U;
-        size_t max_align = plan->ctx->devices[d].caps.min_align_bytes;
-        if (max_align < 64U) {
-            max_align = 64U;
+        uint32_t n_cand = 0U;
+        for (uint32_t i = 0U; i < ns; ++i) {
+            const velri_plan_storage *ps = &plan->storages[i];
+            if (ps->kind == VELRI_STORAGE_SCRATCH && ps->device_id == d &&
+                first_use[i] != UINT32_MAX) {
+                order[n_cand++] = i;
+            }
         }
+
+        /* Sort descending by byte_size, then descending by lifetime span for tighter packing. */
+        for (uint32_t a = 1U; a < n_cand; ++a) {
+            uint32_t key = order[a];
+            size_t key_sz = plan->storages[key].byte_size;
+            uint32_t key_span = last_use[key] - first_use[key];
+            uint32_t b = a;
+            while (b > 0U) {
+                uint32_t prev = order[b - 1U];
+                size_t prev_sz = plan->storages[prev].byte_size;
+                uint32_t prev_span = last_use[prev] - first_use[prev];
+                if (prev_sz > key_sz || (prev_sz == key_sz && prev_span >= key_span)) {
+                    break;
+                }
+                order[b] = prev;
+                b--;
+            }
+            order[b] = key;
+        }
+
+        uint32_t n_placed = 0U;
+        size_t base_align = effective_align(plan->ctx, d, 0U);
+        size_t max_align = base_align;
         size_t arena_size = 0U;
 
-        for (uint32_t i = 0U; i < ns; ++i) {
+        for (uint32_t c = 0U; c < n_cand; ++c) {
+            uint32_t i = order[c];
             velri_plan_storage *ps = &plan->storages[i];
-            if (ps->kind != VELRI_STORAGE_SCRATCH || ps->device_id != d ||
-                first_use[i] == UINT32_MAX) {
-                continue;
-            }
 
-            size_t align = ps->align < max_align ? max_align : ps->align;
+            size_t align = ps->align < base_align ? base_align : ps->align;
             if (align > max_align) {
                 max_align = align;
             }
@@ -195,7 +350,7 @@ static velri_status pack_scratch_arenas(velri_plan *plan) {
                 break;
             }
 
-            ps->in_scratch_arena = true;
+            ps->arena_kind = VELRI_ARENA_SCRATCH;
             ps->arena_offset = cand;
             placed[n_placed++] = (placed_interval){
                 .start = cand,
@@ -208,12 +363,20 @@ static velri_status pack_scratch_arenas(velri_plan *plan) {
             }
         }
 
+        if (arena_size > 0U) {
+            arena_size = velri_align_up(arena_size, max_align);
+            if (arena_size == SIZE_MAX) {
+                st = VELRI_ERR_OVERFLOW;
+                break;
+            }
+        }
         plan->scratch_arena_bytes[d] = arena_size;
         plan->scratch_arena_align[d] = max_align;
     }
 
     free(first_use);
     free(last_use);
+    free(order);
     free(placed);
     return st;
 }
@@ -235,15 +398,6 @@ static void compute_memory_report(velri_plan *plan) {
     for (uint32_t i = 0U; i < plan->num_storages; ++i) {
         const velri_plan_storage *ps = &plan->storages[i];
         velri_device_memory_report *dr = &rep->devices[ps->device_id];
-        size_t min_a = plan->ctx->devices[ps->device_id].caps.min_align_bytes;
-        size_t eff_a = ps->align < min_a ? min_a : ps->align;
-        if (eff_a < 64U) eff_a = 64U;
-        size_t padded = velri_align_up(ps->byte_size, eff_a);
-        size_t ovh = (padded != SIZE_MAX) ? (padded - ps->byte_size) : 0U;
-
-        if (ps->kind != VELRI_STORAGE_SCRATCH) {
-            dr->allocator_overhead_bytes = sat_add(dr->allocator_overhead_bytes, ovh);
-        }
         switch (ps->kind) {
         case VELRI_STORAGE_WEIGHT:
             dr->weight_bytes = sat_add(dr->weight_bytes, ps->byte_size);
@@ -259,6 +413,27 @@ static void compute_memory_report(velri_plan *plan) {
             dr->scratch_unpacked_bytes = sat_add(dr->scratch_unpacked_bytes, ps->byte_size);
             break;
         }
+    }
+
+    for (uint32_t d = 0U; d < rep->num_devices; ++d) {
+        velri_device_memory_report *dr = &rep->devices[d];
+        size_t ovh = 0U;
+        if (!plan->ctx->devices[d].caps.is_host_memory) {
+            size_t packed_w = 0U;
+            for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+                packed_w = sat_add(packed_w, plan->weight_slab_bytes[d][s]);
+            }
+            if (packed_w > dr->weight_bytes) {
+                ovh = sat_add(ovh, packed_w - dr->weight_bytes);
+            }
+            if (plan->io_arena_bytes[d] > dr->input_output_bytes) {
+                ovh = sat_add(ovh, plan->io_arena_bytes[d] - dr->input_output_bytes);
+            }
+        }
+        if (plan->state_arena_bytes[d] > dr->state_bytes) {
+            ovh = sat_add(ovh, plan->state_arena_bytes[d] - dr->state_bytes);
+        }
+        dr->allocator_overhead_bytes = ovh;
     }
 
     for (uint32_t s = 0U; s < plan->num_steps; ++s) {
@@ -349,21 +524,13 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
     }
     plan->num_storages = graph->num_storages;
 
-    /* Pre-allocate shared non-host device buffers for immutable VELRI_STORAGE_WEIGHT storages. */
-    velri_status st = VELRI_OK;
-    for (uint32_t i = 0U; i < graph->num_storages; ++i) {
-        const velri_plan_storage *ps = &plan->storages[i];
-        if (ps->kind != VELRI_STORAGE_WEIGHT || ctx->devices[ps->device_id].caps.is_host_memory) {
-            continue;
-        }
-        st = velri_device_alloc_tracked(ctx, ps->device_id, ps->byte_size, ps->align,
-                                        &plan->weight_bindings[i].device_handle);
-        if (st != VELRI_OK) {
-            break;
-        }
+    /* Pack & allocate shared non-host WEIGHT slabs, plus STATE/IO arena layouts. */
+    velri_status st = pack_weight_slabs(plan);
+    if (st == VELRI_OK) {
+        st = pack_state_and_io_arenas(plan);
     }
 
-    /* Lower each operation node into device-verified steps + cached explicit RAM transfers. */
+    /* Lower each operation node into device-verified steps + cached explicit transfers. */
     for (uint32_t n = 0U; n < graph->num_nodes && st == VELRI_OK; ++n) {
         const velri_graph_node *node = &graph->nodes[n];
         velri_resolved_op resolved;
@@ -395,7 +562,12 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
                 st = emit_ram_transfer(&pb, owner_dev[sid], owner_idx[sid], chosen_dev, use_idx,
                                        plan->storages[sid].byte_size);
                 if (st != VELRI_OK) break;
-                valid_copy[(size_t)sid * VELRI_MAX_DEVICES + chosen_dev] = use_idx;
+                /* For cross-device offloaded WEIGHTs, keep shadow lifetime local to this op so
+                 * non-adjacent reuses (e.g. tied wte/lm_head) do not pin a huge scratch slot
+                 * across the entire graph. */
+                if (plan->storages[sid].kind != VELRI_STORAGE_WEIGHT) {
+                    valid_copy[(size_t)sid * VELRI_MAX_DEVICES + chosen_dev] = use_idx;
+                }
             }
             in_args[i].present = true;
             in_args[i].plan_storage_idx = use_idx;
@@ -411,7 +583,6 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
             velri_storage_id sid = resolved.outputs[o].storage_id;
             out_sids[o] = sid;
 
-            /* Deduplicate if an earlier output of the SAME op already picked a target for `sid`. */
             uint32_t dst_idx = UINT32_MAX;
             for (uint32_t prev = 0U; prev < o; ++prev) {
                 if (out_sids[prev] == sid) {
@@ -421,7 +592,8 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
             }
 
             if (dst_idx == UINT32_MAX) {
-                bool is_rmw = (resolved.kind == VELRI_OP_FUSED_ADD_RMSNORM && o == 0U);
+                bool is_rmw = (resolved.kind == VELRI_OP_FUSED_ADD_RMSNORM && o == 0U) ||
+                              (resolved.kind == VELRI_OP_ATTENTION && (o == 1U || o == 2U));
                 bool need_preserve =
                     is_rmw || !view_covers_full_storage(&resolved.outputs[o],
                                                         plan->storages[sid].byte_size);
@@ -554,11 +726,11 @@ void velri_plan_release(velri_plan *plan) {
                 }
             }
         }
-        if (plan->weight_bindings && plan->storages) {
-            for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
-                if (plan->weight_bindings[i].device_handle) {
-                    velri_device_entry *de = &plan->ctx->devices[plan->storages[i].device_id];
-                    de->vt->free(de->dev, plan->weight_bindings[i].device_handle);
+        for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
+            velri_device_entry *de = &plan->ctx->devices[d];
+            for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+                if (plan->weight_slabs[d][s]) {
+                    de->vt->free(de->dev, plan->weight_slabs[d][s]);
                 }
             }
         }

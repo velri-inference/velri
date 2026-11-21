@@ -25,9 +25,38 @@ else()
     find_package(VelriLib 0.1.0 EXACT CONFIG REQUIRED)
 endif()
 
-# Integration check against VelriLib's public C23 API (`VelriLib::velri`).
+# Velri engine model architectures (thin metadata-driven graphs composed from VelriLib blocks).
+add_library(velri_engine STATIC
+    src/model/arch/gpt2.c
+)
+target_include_directories(velri_engine PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_link_libraries(velri_engine PUBLIC VelriLib::velri)
+if(MSVC OR CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(velri_engine PRIVATE /W4 /fp:precise /std:clatest)
+else()
+    target_compile_options(velri_engine PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math)
+endif()
+if(UNIX)
+    target_link_libraries(velri_engine PRIVATE m)
+endif()
+
+# Integration & End-to-End Model Tests
 if(BUILD_TESTING)
     add_executable(test_velri_lib tests/integration/velri_lib.c)
     target_link_libraries(test_velri_lib PRIVATE VelriLib::velri)
     add_test(NAME velri_lib_integration COMMAND test_velri_lib)
+
+    add_executable(test_gpt2_blocks tests/test_gpt2_blocks.c)
+    target_link_libraries(test_gpt2_blocks PRIVATE velri_engine VelriLib::velri)
+    if(MSVC OR CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(test_gpt2_blocks PRIVATE /W4 /fp:precise /std:clatest)
+    else()
+        target_compile_options(test_gpt2_blocks PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math)
+    endif()
+    if(UNIX)
+        target_link_libraries(test_gpt2_blocks PRIVATE m)
+    endif()
+    add_test(NAME gpt2_blocks COMMAND test_gpt2_blocks)
 endif()

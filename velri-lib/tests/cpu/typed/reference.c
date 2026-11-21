@@ -352,3 +352,130 @@ void ref_quantize_row_f32_i8(size_t rows, size_t k, const float *x, size_t x_str
         }
     }
 }
+
+void velri_ref_embedding_f32(size_t vocab, size_t dim, size_t active_t, size_t pos_offset,
+                             const float *table, size_t table_stride, const int32_t *ids,
+                             float *out, size_t out_stride) {
+    for (size_t r = 0U; r < active_t; ++r) {
+        float *dst = out + r * out_stride;
+        bool valid = false;
+        size_t idx = 0U;
+        if (ids) {
+            int32_t id = ids[r];
+            if (id >= 0 && (size_t)id < vocab) {
+                idx = (size_t)id;
+                valid = true;
+            }
+        } else if (pos_offset <= SIZE_MAX - r && pos_offset + r < vocab) {
+            idx = pos_offset + r;
+            valid = true;
+        }
+        if (valid) {
+            memcpy(dst, table + idx * table_stride, dim * sizeof(float));
+        } else {
+            memset(dst, 0, dim * sizeof(float));
+        }
+    }
+}
+
+void velri_ref_copy_last_row_f32(size_t active_t, size_t dim, const float *x, size_t x_stride,
+                                 float *y) {
+    if (active_t == 0U || dim == 0U) {
+        return;
+    }
+    memcpy(y, x + (active_t - 1U) * x_stride, dim * sizeof(float));
+}
+
+void velri_ref_attention_f32(size_t active_t, size_t n_heads, size_t n_kv_heads, size_t head_dim,
+                             size_t kv_pos, size_t max_ctx, float scale, size_t sliding_window,
+                             bool causal, const float *q, size_t q_stride, const float *k_in,
+                             size_t k_stride, const float *v_in, size_t v_stride, float *k_cache,
+                             float *v_cache, float *out, size_t o_stride) {
+    if (active_t == 0U || n_heads == 0U || n_kv_heads == 0U || head_dim == 0U ||
+        (n_heads % n_kv_heads) != 0U) {
+        return;
+    }
+
+    /* Stage 1: append new K/V rows into [n_kv_heads, max_ctx, head_dim] caches. */
+    bool same_kv = (k_cache == v_cache);
+    for (size_t kvh = 0U; kvh < n_kv_heads; ++kvh) {
+        for (size_t t = 0U; t < active_t; ++t) {
+            size_t dst_off = (kvh * max_ctx + kv_pos + t) * head_dim;
+            memcpy(k_cache + dst_off, k_in + t * k_stride + kvh * head_dim,
+                   head_dim * sizeof(float));
+            if (!same_kv) {
+                memcpy(v_cache + dst_off, v_in + t * v_stride + kvh * head_dim,
+                       head_dim * sizeof(float));
+            }
+        }
+    }
+
+    /* Stage 2: exact two-pass FP64 scaled dot-product attention. */
+    double acc_stack[256];
+    double *acc = acc_stack;
+    double *acc_heap = nullptr;
+    if (head_dim > 256U) {
+        acc_heap = (double *)malloc(head_dim * sizeof(double));
+        if (!acc_heap) {
+            return;
+        }
+        acc = acc_heap;
+    }
+
+    double sc = (scale > 0.0f) ? (double)scale : (1.0 / sqrt((double)head_dim));
+    size_t heads_per_kv = n_heads / n_kv_heads;
+
+    for (size_t t = 0U; t < active_t; ++t) {
+        size_t kv_end = causal ? (kv_pos + t + 1U) : (kv_pos + active_t);
+        size_t kv_start =
+            (sliding_window > 0U && kv_end > sliding_window) ? (kv_end - sliding_window) : 0U;
+        for (size_t h = 0U; h < n_heads; ++h) {
+            size_t kvh = h / heads_per_kv;
+            const float *q_row = q + t * q_stride + h * head_dim;
+            float *o_row = out + t * o_stride + h * head_dim;
+            if (kv_start >= kv_end) {
+                memset(o_row, 0, head_dim * sizeof(float));
+                continue;
+            }
+
+            double m = -INFINITY;
+            for (size_t k_idx = kv_start; k_idx < kv_end; ++k_idx) {
+                const float *k_row = k_cache + (kvh * max_ctx + k_idx) * head_dim;
+                double dot = 0.0;
+                for (size_t d = 0U; d < head_dim; ++d) {
+                    dot += (double)q_row[d] * (double)k_row[d];
+                }
+                double s = dot * sc;
+                if (s > m) {
+                    m = s;
+                }
+            }
+
+            for (size_t d = 0U; d < head_dim; ++d) {
+                acc[d] = 0.0;
+            }
+            double sum_w = 0.0;
+            for (size_t k_idx = kv_start; k_idx < kv_end; ++k_idx) {
+                size_t kv_off = (kvh * max_ctx + k_idx) * head_dim;
+                const float *k_row = k_cache + kv_off;
+                const float *v_row = v_cache + kv_off;
+                double dot = 0.0;
+                for (size_t d = 0U; d < head_dim; ++d) {
+                    dot += (double)q_row[d] * (double)k_row[d];
+                }
+                double w = exp(dot * sc - m);
+                sum_w += w;
+                for (size_t d = 0U; d < head_dim; ++d) {
+                    acc[d] += w * (double)v_row[d];
+                }
+            }
+
+            double inv_sum = (sum_w > 0.0) ? (1.0 / sum_w) : 0.0;
+            for (size_t d = 0U; d < head_dim; ++d) {
+                o_row[d] = (float)(acc[d] * inv_sum);
+            }
+        }
+    }
+
+    free(acc_heap);
+}

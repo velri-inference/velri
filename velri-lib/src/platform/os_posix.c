@@ -214,6 +214,8 @@ void velri_os_cond_wait(velri_os_cond *cv, velri_os_mutex *mtx) {
 
 void velri_os_cond_signal(velri_os_cond *cv) { pthread_cond_signal(&cv->handle); }
 
+void velri_os_cond_broadcast(velri_os_cond *cv) { pthread_cond_broadcast(&cv->handle); }
+
 /* ---- CPU Hints ---- */
 
 int velri_os_hardware_threads(void) {

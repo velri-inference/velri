@@ -174,6 +174,8 @@ void velri_os_cond_wait(velri_os_cond *cv, velri_os_mutex *mtx) {
 
 void velri_os_cond_signal(velri_os_cond *cv) { WakeConditionVariable(&cv->handle); }
 
+void velri_os_cond_broadcast(velri_os_cond *cv) { WakeAllConditionVariable(&cv->handle); }
+
 /* ---- CPU Hints ---- */
 
 int velri_os_hardware_threads(void) {

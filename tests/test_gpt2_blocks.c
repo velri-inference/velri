@@ -1,0 +1,621 @@
+#include "model/arch/gpt2.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*
+ * End-to-End Synthetic GPT-2 Verification:
+ *   - Composes GPT-2 purely from metadata (`velri_model_params`) and reusable VelriLib blocks
+ *     (`velri_block_embedding`, `velri_layer_pre_norm`, `velri_block_lm_head`).
+ *   - Verifies automatic `velri_manifest` recording (`token_ids_in`, `logits_out`, zero
+ *     `lm_head.weight` duplication when `tie_word_embeddings` is true) and binds ALL weights
+ *     generically by iterating `manifest.weights` and matching tensor names.
+ *   - Runs on BOTH CPU and Vulkan (when available).
+ *   - Verifies exact numerical agreement against an independent FP64 GPT-2 reference.
+ *   - Verifies exact equivalence between chunked prefill+decode (Slot 0) and
+ *     token-by-token decode (Slot 1) sharing ONE plan & ONE packed weight arena.
+ *   - Verifies `velri_slot_last_run_allocs() == 0`, `velri_slot_reset()`, zero host
+ *     RAM shadow for KV cache, and tight memory-report accounting.
+ */
+
+#define CHECK(cond, msg)                                                                           \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            fprintf(stderr, "FAIL [%s:%d]: %s\n", __FILE__, __LINE__, (msg));                      \
+            exit(1);                                                                               \
+        }                                                                                          \
+    } while (0)
+
+#define CHECK_OK(expr, msg)                                                                        \
+    do {                                                                                           \
+        velri_status _st = (expr);                                                                 \
+        if (_st != VELRI_OK) {                                                                     \
+            fprintf(stderr, "FAIL [%s:%d]: %s (status=%d)\n", __FILE__, __LINE__, (msg),           \
+                    (int)_st);                                                                     \
+            exit(1);                                                                               \
+        }                                                                                          \
+    } while (0)
+
+static float next_rand(uint64_t *rng, float scale) {
+    uint64_t x = *rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *rng = x;
+    uint32_t u = (uint32_t)((x * 2685821657736338717ULL) >> 40);
+    return ((float)u * (1.0f / 8388608.0f) - 1.0f) * scale;
+}
+
+static float *alloc_rand(size_t n, uint64_t *rng, float scale) {
+    float *p = (float *)calloc(n ? n : 1U, sizeof(float));
+    CHECK(p != nullptr, "oom");
+    for (size_t i = 0; i < n; ++i) {
+        p[i] = next_rand(rng, scale);
+    }
+    return p;
+}
+
+static float *alloc_ones_jitter(size_t n, uint64_t *rng, float jitter) {
+    float *p = (float *)calloc(n ? n : 1U, sizeof(float));
+    CHECK(p != nullptr, "oom");
+    for (size_t i = 0; i < n; ++i) {
+        p[i] = 1.0f + next_rand(rng, jitter);
+    }
+    return p;
+}
+
+typedef struct {
+    float *ln_1_w, *ln_1_b;
+    float *c_attn_w, *c_attn_b;
+    float *c_proj_w, *c_proj_b;
+    float *ln_2_w, *ln_2_b;
+    float *mlp_fc_w, *mlp_fc_b;
+    float *mlp_proj_w, *mlp_proj_b;
+} host_layer_weights;
+
+typedef struct {
+    float *wte;
+    float *wpe;
+    float *ln_f_w;
+    float *ln_f_b;
+    host_layer_weights *layers;
+    uint32_t n_layer;
+} host_gpt2_weights;
+
+static void init_host_weights(const velri_model_params *meta, host_gpt2_weights *w) {
+    memset(w, 0, sizeof(*w));
+    size_t d = meta->hidden_size;
+    size_t inner = meta->intermediate_size;
+    uint64_t rng = 0x69722026ULL;
+    float s = 0.08f;
+
+    w->wte = alloc_rand((size_t)meta->vocab_size * d, &rng, 0.25f);
+    w->wpe = alloc_rand((size_t)meta->max_position_embeddings * d, &rng, 0.15f);
+    w->ln_f_w = alloc_ones_jitter(d, &rng, 0.05f);
+    w->ln_f_b = alloc_rand(d, &rng, 0.05f);
+    w->n_layer = meta->num_hidden_layers;
+    w->layers = (host_layer_weights *)calloc(meta->num_hidden_layers, sizeof(*w->layers));
+    CHECK(w->layers != nullptr, "oom layers");
+
+    for (uint32_t i = 0U; i < meta->num_hidden_layers; ++i) {
+        host_layer_weights *lw = &w->layers[i];
+        lw->ln_1_w = alloc_ones_jitter(d, &rng, 0.05f);
+        lw->ln_1_b = alloc_rand(d, &rng, 0.05f);
+        lw->c_attn_w = alloc_rand(3U * d * d, &rng, s);
+        lw->c_attn_b = alloc_rand(3U * d, &rng, 0.05f);
+        lw->c_proj_w = alloc_rand(d * d, &rng, s);
+        lw->c_proj_b = alloc_rand(d, &rng, 0.05f);
+        lw->ln_2_w = alloc_ones_jitter(d, &rng, 0.05f);
+        lw->ln_2_b = alloc_rand(d, &rng, 0.05f);
+        lw->mlp_fc_w = alloc_rand(inner * d, &rng, s);
+        lw->mlp_fc_b = alloc_rand(inner, &rng, 0.05f);
+        lw->mlp_proj_w = alloc_rand(d * inner, &rng, s);
+        lw->mlp_proj_b = alloc_rand(d, &rng, 0.05f);
+    }
+}
+
+static void free_host_weights(host_gpt2_weights *w) {
+    if (!w) return;
+    free(w->wte);
+    free(w->wpe);
+    free(w->ln_f_w);
+    free(w->ln_f_b);
+    for (uint32_t i = 0U; i < w->n_layer; ++i) {
+        free(w->layers[i].ln_1_w);
+        free(w->layers[i].ln_1_b);
+        free(w->layers[i].c_attn_w);
+        free(w->layers[i].c_attn_b);
+        free(w->layers[i].c_proj_w);
+        free(w->layers[i].c_proj_b);
+        free(w->layers[i].ln_2_w);
+        free(w->layers[i].ln_2_b);
+        free(w->layers[i].mlp_fc_w);
+        free(w->layers[i].mlp_fc_b);
+        free(w->layers[i].mlp_proj_w);
+        free(w->layers[i].mlp_proj_b);
+    }
+    free(w->layers);
+}
+
+/* Independent pure-FP64 GPT-2 full-sequence reference producing logits for the last token. */
+static void ref_gpt2_fp64(const velri_model_params *meta, const host_gpt2_weights *w,
+                          const int32_t *tokens, size_t n_tok, float *out_logits) {
+    size_t d = meta->hidden_size;
+    size_t inner = meta->intermediate_size;
+    size_t nh = meta->num_attention_heads;
+    size_t hd = meta->head_dim;
+    CHECK(nh * hd == d, "ref head_dim matches hidden_size");
+    double eps = (double)meta->norm_eps;
+
+    double *x = (double *)calloc(n_tok * d, sizeof(double));
+    double *h = (double *)calloc(n_tok * d, sizeof(double));
+    double *qkv = (double *)calloc(n_tok * 3U * d, sizeof(double));
+    double *attn = (double *)calloc(n_tok * d, sizeof(double));
+    double *mlp = (double *)calloc(n_tok * inner, sizeof(double));
+    double *scores = (double *)calloc(n_tok, sizeof(double));
+    CHECK(x && h && qkv && attn && mlp && scores, "ref oom");
+
+    for (size_t t = 0U; t < n_tok; ++t) {
+        size_t tid = (size_t)tokens[t];
+        for (size_t c = 0U; c < d; ++c) {
+            x[t * d + c] = (double)w->wte[tid * d + c] + (double)w->wpe[t * d + c];
+        }
+    }
+
+    for (uint32_t l = 0U; l < meta->num_hidden_layers; ++l) {
+        const host_layer_weights *lw = &w->layers[l];
+
+        /* LN1 */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            double mean = 0.0;
+            for (size_t c = 0U; c < d; ++c) mean += x[t * d + c];
+            mean /= (double)d;
+            double var = 0.0;
+            for (size_t c = 0U; c < d; ++c) {
+                double df = x[t * d + c] - mean;
+                var += df * df;
+            }
+            double inv = 1.0 / sqrt(var / (double)d + eps);
+            for (size_t c = 0U; c < d; ++c) {
+                h[t * d + c] =
+                    (x[t * d + c] - mean) * inv * (double)lw->ln_1_w[c] + (double)lw->ln_1_b[c];
+            }
+        }
+
+        /* QKV = Linear(h, c_attn) */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t m = 0U; m < 3U * d; ++m) {
+                double acc = (double)lw->c_attn_b[m];
+                for (size_t k = 0U; k < d; ++k) {
+                    acc += h[t * d + k] * (double)lw->c_attn_w[m * d + k];
+                }
+                qkv[t * 3U * d + m] = acc;
+            }
+        }
+
+        /* Causal MHA */
+        double scale = 1.0 / sqrt((double)hd);
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t head = 0U; head < nh; ++head) {
+                const double *q = qkv + t * 3U * d + head * hd;
+                double smax = -1e300;
+                for (size_t j = 0U; j <= t; ++j) {
+                    const double *k = qkv + j * 3U * d + d + head * hd;
+                    double dot = 0.0;
+                    for (size_t c = 0U; c < hd; ++c) dot += q[c] * k[c];
+                    scores[j] = dot * scale;
+                    if (scores[j] > smax) smax = scores[j];
+                }
+                double ssum = 0.0;
+                for (size_t j = 0U; j <= t; ++j) {
+                    scores[j] = exp(scores[j] - smax);
+                    ssum += scores[j];
+                }
+                for (size_t c = 0U; c < hd; ++c) {
+                    double acc = 0.0;
+                    for (size_t j = 0U; j <= t; ++j) {
+                        const double *v = qkv + j * 3U * d + 2U * d + head * hd;
+                        acc += (scores[j] / ssum) * v[c];
+                    }
+                    attn[t * d + head * hd + c] = acc;
+                }
+            }
+        }
+
+        /* c_proj + residual */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t m = 0U; m < d; ++m) {
+                double acc = (double)lw->c_proj_b[m];
+                for (size_t k = 0U; k < d; ++k) {
+                    acc += attn[t * d + k] * (double)lw->c_proj_w[m * d + k];
+                }
+                x[t * d + m] += acc;
+            }
+        }
+
+        /* LN2 */
+        for (size_t t = 0U; t < n_tok; ++t) {
+            double mean = 0.0;
+            for (size_t c = 0U; c < d; ++c) mean += x[t * d + c];
+            mean /= (double)d;
+            double var = 0.0;
+            for (size_t c = 0U; c < d; ++c) {
+                double df = x[t * d + c] - mean;
+                var += df * df;
+            }
+            double inv = 1.0 / sqrt(var / (double)d + eps);
+            for (size_t c = 0U; c < d; ++c) {
+                h[t * d + c] =
+                    (x[t * d + c] - mean) * inv * (double)lw->ln_2_w[c] + (double)lw->ln_2_b[c];
+            }
+        }
+
+        /* MLP: GELU_tanh(c_fc(h)) -> c_proj + residual */
+        const double k_sqrt_2_over_pi = 0.79788456080286535588;
+        for (size_t t = 0U; t < n_tok; ++t) {
+            for (size_t m = 0U; m < inner; ++m) {
+                double acc = (double)lw->mlp_fc_b[m];
+                for (size_t k = 0U; k < d; ++k) {
+                    acc += h[t * d + k] * (double)lw->mlp_fc_w[m * d + k];
+                }
+                double inner_v = k_sqrt_2_over_pi * (acc + 0.044715 * acc * acc * acc);
+                mlp[t * inner + m] = 0.5 * acc * (1.0 + tanh(inner_v));
+            }
+            for (size_t m = 0U; m < d; ++m) {
+                double acc = (double)lw->mlp_proj_b[m];
+                for (size_t k = 0U; k < inner; ++k) {
+                    acc += mlp[t * inner + k] * (double)lw->mlp_proj_w[m * inner + k];
+                }
+                x[t * d + m] += acc;
+            }
+        }
+    }
+
+    /* Final LN on last row + tied lm_head */
+    const double *last = x + (n_tok - 1U) * d;
+    double mean = 0.0;
+    for (size_t c = 0U; c < d; ++c) mean += last[c];
+    mean /= (double)d;
+    double var = 0.0;
+    for (size_t c = 0U; c < d; ++c) {
+        double df = last[c] - mean;
+        var += df * df;
+    }
+    double inv = 1.0 / sqrt(var / (double)d + eps);
+    for (size_t c = 0U; c < d; ++c) {
+        h[c] = (last[c] - mean) * inv * (double)w->ln_f_w[c] + (double)w->ln_f_b[c];
+    }
+
+    for (uint32_t v = 0U; v < meta->vocab_size; ++v) {
+        double acc = 0.0;
+        for (size_t c = 0U; c < d; ++c) {
+            acc += h[c] * (double)w->wte[(size_t)v * d + c];
+        }
+        out_logits[v] = (float)acc;
+    }
+
+    free(x);
+    free(h);
+    free(qkv);
+    free(attn);
+    free(mlp);
+    free(scores);
+}
+
+static size_t manifest_entry_bytes(const velri_manifest_entry *e) {
+    size_t bytes = velri_dtype_bytes(e->dtype);
+    CHECK(bytes > 0U && e->rank >= 1U && e->rank <= VELRI_MAX_RANK, "valid manifest entry");
+    for (uint32_t r = 0U; r < e->rank; ++r) {
+        CHECK(e->dims[r] > 0U && bytes <= SIZE_MAX / e->dims[r], "manifest entry byte overflow");
+        bytes *= e->dims[r];
+    }
+    return bytes;
+}
+
+/* Generic name lookup simulating a weight loader matching `manifest.weights[i].name`. */
+static const void *resolve_host_weight(const velri_model_params *meta, const host_gpt2_weights *w,
+                                       const char *name, size_t *out_bytes) {
+    size_t d = meta->hidden_size;
+    size_t inner = meta->intermediate_size;
+
+    if (strcmp(name, "transformer.wte.weight") == 0) {
+        *out_bytes = (size_t)meta->vocab_size * d * sizeof(float);
+        return w->wte;
+    }
+    if (strcmp(name, "transformer.wpe.weight") == 0) {
+        *out_bytes = (size_t)meta->max_position_embeddings * d * sizeof(float);
+        return w->wpe;
+    }
+    if (strcmp(name, "transformer.ln_f.weight") == 0) {
+        *out_bytes = d * sizeof(float);
+        return w->ln_f_w;
+    }
+    if (strcmp(name, "transformer.ln_f.bias") == 0) {
+        *out_bytes = d * sizeof(float);
+        return w->ln_f_b;
+    }
+
+    const char *prefix = "transformer.h.";
+    size_t plen = strlen(prefix);
+    if (strncmp(name, prefix, plen) == 0) {
+        const char *num = name + plen;
+        if (*num >= '0' && *num <= '9') {
+            char *end = nullptr;
+            unsigned long layer = strtoul(num, &end, 10);
+            if (end && *end == '.' && layer < meta->num_hidden_layers) {
+                const host_layer_weights *lw = &w->layers[layer];
+                const char *sub = end + 1;
+                if (strcmp(sub, "ln_1.weight") == 0) {
+                    *out_bytes = d * sizeof(float);
+                    return lw->ln_1_w;
+                }
+                if (strcmp(sub, "ln_1.bias") == 0) {
+                    *out_bytes = d * sizeof(float);
+                    return lw->ln_1_b;
+                }
+                if (strcmp(sub, "attn.c_attn.weight") == 0) {
+                    *out_bytes = 3U * d * d * sizeof(float);
+                    return lw->c_attn_w;
+                }
+                if (strcmp(sub, "attn.c_attn.bias") == 0) {
+                    *out_bytes = 3U * d * sizeof(float);
+                    return lw->c_attn_b;
+                }
+                if (strcmp(sub, "attn.c_proj.weight") == 0) {
+                    *out_bytes = d * d * sizeof(float);
+                    return lw->c_proj_w;
+                }
+                if (strcmp(sub, "attn.c_proj.bias") == 0) {
+                    *out_bytes = d * sizeof(float);
+                    return lw->c_proj_b;
+                }
+                if (strcmp(sub, "ln_2.weight") == 0) {
+                    *out_bytes = d * sizeof(float);
+                    return lw->ln_2_w;
+                }
+                if (strcmp(sub, "ln_2.bias") == 0) {
+                    *out_bytes = d * sizeof(float);
+                    return lw->ln_2_b;
+                }
+                if (strcmp(sub, "mlp.c_fc.weight") == 0) {
+                    *out_bytes = inner * d * sizeof(float);
+                    return lw->mlp_fc_w;
+                }
+                if (strcmp(sub, "mlp.c_fc.bias") == 0) {
+                    *out_bytes = inner * sizeof(float);
+                    return lw->mlp_fc_b;
+                }
+                if (strcmp(sub, "mlp.c_proj.weight") == 0) {
+                    *out_bytes = d * inner * sizeof(float);
+                    return lw->mlp_proj_w;
+                }
+                if (strcmp(sub, "mlp.c_proj.bias") == 0) {
+                    *out_bytes = d * sizeof(float);
+                    return lw->mlp_proj_b;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void bind_all_weights(velri_plan *plan, const velri_manifest *manifest,
+                             const velri_model_params *meta, const host_gpt2_weights *w) {
+    for (uint32_t i = 0U; i < manifest->num_weights; ++i) {
+        const velri_manifest_entry *e = &manifest->weights[i];
+        const char *key = e->source_name[0] ? e->source_name : e->name;
+        size_t host_bytes = 0U;
+        const void *ptr = resolve_host_weight(meta, w, key, &host_bytes);
+        CHECK(ptr != nullptr, "every manifest weight name must resolve");
+        CHECK(manifest_entry_bytes(e) == host_bytes, "manifest weight shape matches host tensor");
+        CHECK_OK(velri_plan_bind_weight_host(plan, e->storage_id, ptr, host_bytes), e->name);
+    }
+}
+
+static double max_abs_diff(const float *a, const float *b, size_t n) {
+    double mx = 0.0;
+    for (size_t i = 0U; i < n; ++i) {
+        double d = fabs((double)a[i] - (double)b[i]);
+        if (d > mx) mx = d;
+    }
+    return mx;
+}
+
+static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id dev, const char *tag,
+                                     const velri_model_params *meta, const host_gpt2_weights *w,
+                                     const int32_t *seq, size_t seq_len, const float *ref_4,
+                                     const float *ref_6, float *out_final_logits) {
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "graph create");
+
+    velri_manifest manifest;
+    velri_manifest_init(&manifest);
+
+    velri_builder b;
+    velri_b_init(&b, g, &manifest, dev, dev, nullptr, nullptr);
+
+    CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2");
+    CHECK(manifest.token_ids_in != VELRI_INVALID_ID, "manifest recorded token_ids_in");
+    CHECK(manifest.logits_out != VELRI_INVALID_ID, "manifest recorded logits_out");
+    CHECK(velri_manifest_find_weight(&manifest, "transformer.wte.weight") != nullptr,
+          "manifest contains transformer.wte.weight");
+    CHECK(velri_manifest_find_weight(&manifest, "lm_head.weight") == nullptr,
+          "tied wte must not duplicate lm_head.weight in manifest");
+    CHECK(manifest.num_weights == 4U + 12U * meta->num_hidden_layers,
+          "exact GPT-2 tied weight count in manifest");
+    CHECK(manifest.num_states == 2U * meta->num_hidden_layers,
+          "exact GPT-2 KV-cache state count in manifest");
+
+    velri_plan *plan = nullptr;
+    CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare gpt2");
+    bind_all_weights(plan, &manifest, meta, w);
+
+    velri_memory_report rep;
+    CHECK_OK(velri_plan_memory_report(plan, &rep), "memory report");
+    const velri_device_memory_report *dr = &rep.devices[dev];
+    CHECK(rep.ram_staging_bytes == 0U, "single-device 0 B ram_staging");
+    CHECK(dr->scratch_packed_bytes < dr->scratch_unpacked_bytes,
+          "liveness scratch packing must reuse cells tightly");
+
+    printf("  [MEM] %-10s | weights=%zu B (%u tensors) | state=%zu B | scratch=%zu B "
+           "(unpacked=%zu B, %.1fx saved) | ovh=%zu B\n",
+           tag, dr->weight_bytes, manifest.num_weights, dr->state_bytes, dr->scratch_packed_bytes,
+           dr->scratch_unpacked_bytes,
+           (double)dr->scratch_unpacked_bytes / (double)dr->scratch_packed_bytes,
+           dr->allocator_overhead_bytes);
+
+    /* Two concurrent-capable slots sharing ONE plan and ONE weight arena.
+     * Note: ZERO host shadow buffers are bound for KV-cache STATE storages! */
+    velri_slot *slot_prefill = nullptr;
+    velri_slot *slot_decode = nullptr;
+    CHECK_OK(velri_slot_create(plan, &slot_prefill), "slot prefill");
+    CHECK_OK(velri_slot_create(plan, &slot_decode), "slot decode");
+
+    size_t tok_bytes = (size_t)meta->max_seq_len * sizeof(int32_t);
+    size_t logits_bytes = (size_t)meta->vocab_size * sizeof(float);
+    int32_t *tok_buf0 = (int32_t *)calloc(meta->max_seq_len, sizeof(int32_t));
+    int32_t *tok_buf1 = (int32_t *)calloc(meta->max_seq_len, sizeof(int32_t));
+    float *logits0 = (float *)calloc(meta->vocab_size, sizeof(float));
+    float *logits1 = (float *)calloc(meta->vocab_size, sizeof(float));
+    float *logits_after_reset = (float *)calloc(meta->vocab_size, sizeof(float));
+    CHECK(tok_buf0 && tok_buf1 && logits0 && logits1 && logits_after_reset, "io oom");
+
+    CHECK_OK(velri_slot_bind_host(slot_prefill, manifest.token_ids_in, tok_buf0, tok_bytes), "in0");
+    CHECK_OK(velri_slot_bind_host(slot_prefill, manifest.logits_out, logits0, logits_bytes), "out0");
+    CHECK_OK(velri_slot_bind_host(slot_decode, manifest.token_ids_in, tok_buf1, tok_bytes), "in1");
+    CHECK_OK(velri_slot_bind_host(slot_decode, manifest.logits_out, logits1, logits_bytes), "out1");
+
+    /* Slot 0: prefill 4 tokens in one step, then decode tokens 4 and 5 one by one */
+    memcpy(tok_buf0, seq, 4U * sizeof(int32_t));
+    velri_step_params sp_pre = {
+        .has_pos_offset = true, .pos_offset_override = 0U,
+        .has_seq_len = true, .seq_len_override = 4U,
+        .has_kv_len = true, .kv_len_override = 0U,
+    };
+    CHECK_OK(velri_slot_run(slot_prefill, &sp_pre, nullptr), "prefill 4");
+    CHECK(velri_slot_last_run_allocs(slot_prefill) == 0U, "prefill 0 allocs");
+    double err_pre4 = max_abs_diff(logits0, ref_4, meta->vocab_size);
+    CHECK(err_pre4 < 1e-4, "prefill(4) logits match FP64 reference");
+
+    for (size_t t = 4U; t < seq_len; ++t) {
+        tok_buf0[0] = seq[t];
+        velri_step_params sp_dec = {
+            .has_pos_offset = true, .pos_offset_override = t,
+            .has_seq_len = true, .seq_len_override = 1U,
+            .has_kv_len = true, .kv_len_override = t,
+        };
+        CHECK_OK(velri_slot_run(slot_prefill, &sp_dec, nullptr), "decode after prefill");
+        CHECK(velri_slot_last_run_allocs(slot_prefill) == 0U, "decode 0 allocs");
+    }
+    double err_pre_dec6 = max_abs_diff(logits0, ref_6, meta->vocab_size);
+    CHECK(err_pre_dec6 < 1e-4, "prefill(4)+decode(2) logits match FP64 reference");
+
+    /* Slot 1: pure token-by-token decode across all 6 tokens */
+    for (size_t t = 0U; t < seq_len; ++t) {
+        tok_buf1[0] = seq[t];
+        velri_step_params sp_dec = {
+            .has_pos_offset = true, .pos_offset_override = t,
+            .has_seq_len = true, .seq_len_override = 1U,
+            .has_kv_len = true, .kv_len_override = t,
+        };
+        CHECK_OK(velri_slot_run(slot_decode, &sp_dec, nullptr), "pure decode");
+        CHECK(velri_slot_last_run_allocs(slot_decode) == 0U, "pure decode 0 allocs");
+    }
+    double err_pre_vs_dec = max_abs_diff(logits0, logits1, meta->vocab_size);
+    CHECK(err_pre_vs_dec < 1e-4, "prefill+decode matches pure decode");
+
+    /* Reset Slot 0 and re-run prefill(4) -> must reproduce clean prefill! */
+    CHECK_OK(velri_slot_reset(slot_prefill), "reset slot0");
+    memcpy(tok_buf0, seq, 4U * sizeof(int32_t));
+    CHECK_OK(velri_slot_bind_host(slot_prefill, manifest.logits_out, logits_after_reset,
+                                  logits_bytes),
+             "rebind out0");
+    CHECK_OK(velri_slot_run(slot_prefill, &sp_pre, nullptr), "prefill after reset");
+    CHECK(velri_slot_last_run_allocs(slot_prefill) == 0U, "post-reset prefill 0 allocs");
+    CHECK(max_abs_diff(logits_after_reset, ref_4, meta->vocab_size) < 1e-4,
+          "reset slot reproduces clean prefill");
+
+    memcpy(out_final_logits, logits0, logits_bytes);
+    printf("  [PASS] %-10s | prefill(4) err=%.2e | pre+dec(6) err=%.2e | pre==dec diff=%.2e | 0 allocs\n",
+           tag, err_pre4, err_pre_dec6, err_pre_vs_dec);
+
+    free(tok_buf0);
+    free(tok_buf1);
+    free(logits0);
+    free(logits1);
+    free(logits_after_reset);
+    velri_slot_destroy(slot_decode);
+    velri_slot_destroy(slot_prefill);
+    velri_plan_destroy(plan);
+    velri_manifest_destroy(&manifest);
+    velri_graph_destroy(g);
+}
+
+int main(void) {
+    printf("=== Velri End-to-End GPT-2 Architecture Suite ===\n");
+
+    const velri_model_params meta = {
+        .vocab_size = 257U,
+        .max_position_embeddings = 64U,
+        .hidden_size = 128U,
+        .num_hidden_layers = 4U,
+        .num_attention_heads = 4U,
+        .num_key_value_heads = 4U,
+        .head_dim = 32U,
+        .intermediate_size = 512U,
+        .sliding_window = 0U,
+        .norm_eps = 1e-5f,
+        .hidden_act = VELRI_ACT_GELU_TANH,
+        .tie_word_embeddings = true,
+        .dtype = VELRI_DTYPE_F32,
+        .max_seq_len = 16U,
+        .max_ctx = 64U,
+    };
+
+    host_gpt2_weights w;
+    init_host_weights(&meta, &w);
+
+    const int32_t seq[6] = {12, 200, 7, 256, 42, 0};
+    float *ref_4 = (float *)calloc(meta.vocab_size, sizeof(float));
+    float *ref_6 = (float *)calloc(meta.vocab_size, sizeof(float));
+    float *cpu_logits = (float *)calloc(meta.vocab_size, sizeof(float));
+    float *vk_logits = (float *)calloc(meta.vocab_size, sizeof(float));
+    CHECK(ref_4 && ref_6 && cpu_logits && vk_logits, "oom");
+
+    ref_gpt2_fp64(&meta, &w, seq, 4U, ref_4);
+    ref_gpt2_fp64(&meta, &w, seq, 6U, ref_6);
+
+    velri_context_config ccfg = {
+        .cpu_workers = 4U,
+        .cpu_variant = VELRI_CPU_AUTO,
+        .enable_vulkan = true,
+    };
+    velri_context *ctx = nullptr;
+    CHECK_OK(velri_context_create(&ccfg, &ctx), "ctx");
+
+    velri_device_id cpu_dev = 0U;
+    CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
+    run_gpt2_suite_on_device(ctx, cpu_dev, "cpu:0", &meta, &w, seq, 6U, ref_4, ref_6, cpu_logits);
+
+    velri_device_id vk_dev = 0U;
+    if (velri_context_find_device(ctx, "vulkan", 0U, &vk_dev) == VELRI_OK) {
+        run_gpt2_suite_on_device(ctx, vk_dev, "vulkan:0", &meta, &w, seq, 6U, ref_4, ref_6,
+                                 vk_logits);
+        double cpu_vk = max_abs_diff(cpu_logits, vk_logits, meta.vocab_size);
+        CHECK(cpu_vk < 1e-4, "CPU and Vulkan GPT-2 logits match");
+        printf("  [PASS] cpu:0 == vulkan:0 max_abs_diff=%.2e\n", cpu_vk);
+    } else {
+        printf("  [SKIP] vulkan:0 (not enabled or no GPU available)\n");
+    }
+
+    velri_context_destroy(ctx);
+    free(ref_4);
+    free(ref_6);
+    free(cpu_logits);
+    free(vk_logits);
+    free_host_weights(&w);
+    printf("=== GPT-2 End-to-End Suite PASSED ===\n");
+    return 0;
+}

@@ -132,4 +132,17 @@ void ref_vec_mul_f32(size_t count, const float *a, const float *b, float *y);
 void ref_quantize_row_f32_i8(size_t rows, size_t k, const float *x, size_t x_stride,
                              int8_t *x_i8, size_t xi8_stride, float *scale_out);
 
+void velri_ref_embedding_f32(size_t vocab, size_t dim, size_t active_t, size_t pos_offset,
+                             const float *table, size_t table_stride, const int32_t *ids,
+                             float *out, size_t out_stride);
+
+void velri_ref_copy_last_row_f32(size_t active_t, size_t dim, const float *x, size_t x_stride,
+                                 float *y);
+
+void velri_ref_attention_f32(size_t active_t, size_t n_heads, size_t n_kv_heads, size_t head_dim,
+                             size_t kv_pos, size_t max_ctx, float scale, size_t sliding_window,
+                             bool causal, const float *q, size_t q_stride, const float *k_in,
+                             size_t k_stride, const float *v_in, size_t v_stride, float *k_cache,
+                             float *v_cache, float *out, size_t o_stride);
+
 #endif /* VELRI_TEST_REFERENCE_H */

@@ -9,8 +9,49 @@
 enum {
     VELRI_MAX_DEVICES = VELRI_MAX_REPORT_DEVICES,
     VELRI_MAX_BACKENDS = 16,
-    VELRI_MAX_SUBMIT_BATCH = 32
+    VELRI_MAX_SUBMIT_BATCH = 32,
+    VELRI_MAX_WEIGHT_SLABS = 64
 };
+
+/* Pack non-host weights into slabs up to 512 MiB each (avoids per-tensor Vulkan allocations). */
+#define VELRI_WEIGHT_SLAB_LIMIT ((size_t)512U * 1024U * 1024U)
+
+typedef enum {
+    VELRI_ARENA_NONE = 0,
+    VELRI_ARENA_SCRATCH = 1,
+    VELRI_ARENA_WEIGHT = 2,
+    VELRI_ARENA_STATE = 3,
+    VELRI_ARENA_IO = 4
+} velri_arena_kind;
+
+static inline bool velri_op_is_dynamic_seq(const velri_resolved_op *op) {
+    return op && (op->raw.dynamic_seq || op->kind == VELRI_OP_EMBEDDING ||
+                  op->kind == VELRI_OP_ATTENTION || op->kind == VELRI_OP_COPY_LAST_ROW);
+}
+
+static inline size_t velri_effective_rows(const velri_resolved_op *op, size_t static_rows,
+                                          const velri_step_params *params) {
+    if (params && params->has_seq_len && velri_op_is_dynamic_seq(op) &&
+        params->seq_len_override > 0U && params->seq_len_override <= static_rows) {
+        return params->seq_len_override;
+    }
+    return static_rows;
+}
+
+static inline size_t velri_effective_elemwise_count(const velri_resolved_op *op,
+                                                    const velri_tensor_view *v,
+                                                    const velri_step_params *params) {
+    size_t n = 0U;
+    if (velri_tensor_view_num_elements(v, &n) != VELRI_OK) {
+        return 0U;
+    }
+    if (params && params->has_seq_len && velri_op_is_dynamic_seq(op) && v->rank >= 2U &&
+        v->dims[0] > 0U && params->seq_len_override > 0U &&
+        params->seq_len_override <= v->dims[0]) {
+        return params->seq_len_override * (n / v->dims[0]);
+    }
+    return n;
+}
 
 static inline bool velri_mul_overflow_size(size_t a, size_t b, size_t *out) {
     if (a != 0U && b > SIZE_MAX / a) {
@@ -128,14 +169,14 @@ typedef struct {
     velri_device_id device_id;
     size_t byte_size;
     size_t align;
-    bool in_scratch_arena; /* True => lives inside per-device packed scratch arena */
-    size_t arena_offset;   /* Offset inside that device's scratch arena */
+    velri_arena_kind arena_kind; /* Arena owning this storage's device memory (if any) */
+    uint32_t slab_idx;           /* For VELRI_ARENA_WEIGHT: index in plan->weight_slabs[dev] */
+    size_t arena_offset;         /* Byte offset inside the owning arena/slab */
 } velri_plan_storage;
 
 typedef struct {
     const void *host_ptr;
     size_t bound_bytes;
-    void *device_handle; /* Allocated once per plan for non-host WEIGHT storages */
     bool is_bound;
 } velri_plan_weight_binding;
 
@@ -175,6 +216,16 @@ struct velri_plan {
     uint32_t num_storages;
 
     velri_plan_weight_binding *weight_bindings; /* Shared immutable WEIGHT bindings [num_user_storages] */
+
+    void *weight_slabs[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
+    size_t weight_slab_bytes[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
+    uint32_t num_weight_slabs[VELRI_MAX_DEVICES];
+
+    size_t state_arena_bytes[VELRI_MAX_DEVICES];
+    size_t state_arena_align[VELRI_MAX_DEVICES];
+
+    size_t io_arena_bytes[VELRI_MAX_DEVICES];
+    size_t io_arena_align[VELRI_MAX_DEVICES];
 
     size_t scratch_arena_bytes[VELRI_MAX_DEVICES];
     size_t scratch_arena_align[VELRI_MAX_DEVICES];
