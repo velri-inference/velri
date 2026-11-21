@@ -4,7 +4,7 @@
 
 **Velri** owns the model and inference layer: loading model files and weights, composing architectures from reusable blocks, resolving placement rules, and managing sessions and generation. All computation, kernel launch graphs, and device backends live inside **`velri-lib/`** ([velri-lib/docs/EN/architecture.md](../../velri-lib/docs/EN/architecture.md)).
 
-**Status:** today `VelriLib::cpu` and Velri's consumer integration test are implemented. Remaining engine modules (`src/model/`, `src/format/`, `src/runtime/`, apps) are tracked in [roadmap.md](roadmap.md).
+**Status:** `VelriLib::velri` (CPU Slang AOT + opt-in Vulkan 1.3), streaming C23 JSON + cascading placement (`src/format/json.{h,c}`, `src/config/placement.{h,c}`), and engine layer/architecture composition (`src/model/`) are implemented and tested. The public engine runtime (`include/velri/`, `src/runtime/`) and `.vtq` / CLI apps follow in [roadmap.md](roadmap.md).
 
 ---
 
@@ -33,7 +33,7 @@ flowchart TD
 | Project / Directory | Status | Responsibility |
 | :--- | :--- | :--- |
 | Velri: `include/velri/` | Planned | Public C23 engine API (`Context`, `Model`, `Program`, `Session`) |
-| Velri: `src/model/`, `src/format/` | Planned | Family adapters, reusable blocks, JSON config, weight format readers |
+| Velri: `src/model/`, `src/config/`, `src/format/` | Active (in progress) | Family adapters, engine layer helpers, cascading JSON placement, streaming JSON scanner, weight format readers |
 | Velri: `src/runtime/`, `apps/` | Planned | Sessions, batching, sampling, tokenization, CLI, and HTTP/SSE server |
 | Velri: `tests/integration/` | Implemented | Public C API consumer check and installed `VelriLib` package test |
 | `velri-lib/` | Partially implemented | Tensors, graph, Slang AOT kernels, CPU/Vulkan backends, `velri_pool` ([details](../../velri-lib/docs/EN/architecture.md)) |
@@ -88,7 +88,7 @@ cmake --build build-pkg && ctest --test-dir build-pkg --output-on-failure
 | Vulkan declarations | [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) (Apache-2.0/MIT) | Active | Only when Vulkan backend is enabled in `velri-lib` |
 | Vulkan loader | [volk](https://github.com/zeux/volk) (MIT, C) | Planned | Internal Vulkan layer in `velri-lib`; per-device dispatch tables |
 | GPU memory allocator | [VMA](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT, C++/C API) | Planned | Internal to Vulkan backend (`velri-lib` planner owns lifetimes) |
-| JSON parsing (config & metadata) | [yyjson](https://github.com/ibireme/yyjson) (MIT, C) | Planned | Load time only; zero JSON parsing on hot paths |
+| JSON parsing (config & metadata) | Built-in zero-dependency C23 streaming scanner (`src/format/json.{h,c}`) | Active | Load time only (config & `.vtq` footer); 0 B heap allocs, zero JSON on hot paths |
 | C unit tests & fixtures | [Unity](https://github.com/ThrowTheSwitch/Unity) (MIT) + CTest + Python | Planned / CTest active | Automated tests and independent numerical fixture generation |
 
 CPU-only builds never require the Vulkan SDK; disabled backends add zero headers or libraries.

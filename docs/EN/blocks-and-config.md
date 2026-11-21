@@ -68,7 +68,7 @@ Attention descriptions separate five independent concerns:
 
 ## 2. Target Placement JSON Configuration
 
-Configuration is parsed once at load time via `yyjson`, validated, and lowered into a flat placement plan. Kernels never see JSON.
+Configuration is parsed once at load time via the built-in zero-dependency C23 streaming JSON scanner (`src/format/json.{h,c}`), validated, and lowered into a flat placement plan (`src/config/placement.{h,c}`). Kernels never see JSON.
 
 ### Placement fields and devices
 Any node in the model tree accepts three inheritable placement keys:

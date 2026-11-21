@@ -4,7 +4,7 @@
 
 **Velri** отвечает за уровень моделей и инференса: загрузку файлов модели и весов, сборку архитектур из переиспользуемых блоков, применение правил размещения, управление сеансами и генерацией. Все вычисления, граф запуска кернелов и бэкенды устройств инкапсулированы в библиотеке **`velri-lib/`** ([velri-lib/docs/RU/architecture.md](../../velri-lib/docs/RU/architecture.md)).
 
-**Статус:** сейчас реализованы CPU-операции `VelriLib::cpu` и интеграционный тест подключения из Velri. Остальные модули движка (`src/model/`, `src/format/`, `src/runtime/`, приложения) запланированы в [roadmap.md](roadmap.md).
+**Статус:** реализованы и протестированы `VelriLib::velri` (CPU Slang AOT + опциональный Vulkan 1.3), потоковый C23 JSON и каскадное размещение (`src/format/json.{h,c}`, `src/config/placement.{h,c}`), а также слой моделей (`src/model/`). Публичный рантайм движка (`include/velri/`, `src/runtime/`), загрузчик `.vtq` и приложения запланированы в [roadmap.md](roadmap.md).
 
 ---
 
@@ -33,7 +33,7 @@ flowchart TD
 | Проект / каталог | Статус | Ответственность |
 | :--- | :--- | :--- |
 | Velri: `include/velri/` | План | Публичный C23 API движка (`Context`, `Model`, `Program`, `Session`) |
-| Velri: `src/model/`, `src/format/` | План | Адаптеры семейств, переиспользуемые блоки, JSON-конфиг, чтение форматов весов |
+| Velri: `src/model/`, `src/config/`, `src/format/` | Активно (в работе) | Адаптеры семейств, хелперы слоёв, каскадный JSON-конфиг, потоковый JSON-сканер, чтение форматов весов |
 | Velri: `src/runtime/`, `apps/` | План | Сеансы, батчинг, семплирование, токенизация, CLI и HTTP/SSE-сервер |
 | Velri: `tests/integration/` | Есть | Проверка подключения публичного C API и CMake-пакета `VelriLib` |
 | `velri-lib/` | Частично есть | Тензоры, граф, Slang AOT-кернелы, бэкенды CPU/Vulkan, `velri_pool` ([подробнее](../../velri-lib/docs/RU/architecture.md)) |
@@ -88,7 +88,7 @@ cmake --build build-pkg && ctest --test-dir build-pkg --output-on-failure
 | Объявления Vulkan | [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) (Apache-2.0/MIT) | Активно | Только при включённом Vulkan-бэкенде внутри `velri-lib` |
 | Загрузка функций Vulkan | [volk](https://github.com/zeux/volk) (MIT, C) | План | Внутренний слой Vulkan в `velri-lib`; отдельные таблицы на устройство |
 | Аллокатор памяти GPU | [VMA](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT, C++/C API) | План | Внутри Vulkan-бэкенда (время жизни ресурсов задаёт планировщик `velri-lib`) |
-| Разбор JSON (конфиг и метаданные) | [yyjson](https://github.com/ibireme/yyjson) (MIT, C) | План | Только при загрузке модели/конфига; на горячем пути JSON нет |
+| Разбор JSON (конфиг и метаданные) | Встроенный zero-dependency C23 потоковый сканер (`src/format/json.{h,c}`) | Активно | Только при загрузке конфига и футера `.vtq`; 0 B аллокаций, на горячем пути JSON нет |
 | C-тесты и фикстуры | [Unity](https://github.com/ThrowTheSwitch/Unity) (MIT) + CTest + Python | План / CTest есть | Автотесты и генерация независимых численных фикстур |
 
 CPU-сборка не требует Vulkan SDK; выключенные бэкенды не добавляют своих заголовков и библиотек в сборку.

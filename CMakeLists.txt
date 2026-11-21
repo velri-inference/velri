@@ -25,8 +25,10 @@ else()
     find_package(VelriLib 0.1.0 EXACT CONFIG REQUIRED)
 endif()
 
-# Velri engine model layers & architectures (thin metadata-driven graphs composed from VelriLib blocks).
+# Velri engine: streaming JSON, cascading placement, model layers & architectures.
 add_library(velri_engine STATIC
+    src/format/json.c
+    src/config/placement.c
     src/model/layers.c
     src/model/arch/gpt2.c
 )
@@ -60,4 +62,19 @@ if(BUILD_TESTING)
         target_link_libraries(test_gpt2_blocks PRIVATE m)
     endif()
     add_test(NAME gpt2_blocks COMMAND test_gpt2_blocks)
+
+    add_executable(test_config_placement tests/test_config_placement.c)
+    target_link_libraries(test_config_placement PRIVATE velri_engine VelriLib::velri)
+    target_compile_definitions(test_config_placement PRIVATE
+        VELRI_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    if(MSVC OR CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(test_config_placement PRIVATE /W4 /fp:precise /std:clatest)
+    else()
+        target_compile_options(test_config_placement PRIVATE -Wall -Wextra -Wpedantic -fno-fast-math)
+    endif()
+    if(UNIX)
+        target_link_libraries(test_config_placement PRIVATE m)
+    endif()
+    add_test(NAME config_placement COMMAND test_config_placement)
 endif()
