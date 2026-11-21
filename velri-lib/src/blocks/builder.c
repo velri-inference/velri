@@ -604,6 +604,135 @@ velri_tensor velri_b_subview_2d_cols(velri_builder *b, velri_tensor base, size_t
     return out;
 }
 
+velri_tensor velri_b_subview_2d_rows(velri_builder *b, velri_tensor base, size_t row_offset,
+                                     size_t num_rows) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    if (!b->graph || !base.valid || base.rank != 2U || num_rows == 0U ||
+        row_offset > base.dims[0] || num_rows > base.dims[0] - row_offset) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+
+    size_t elem_bytes = velri_dtype_bytes(base.dtype);
+    if (elem_bytes == 0U) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    size_t elem_offset = 0U;
+    size_t extra_byte_offset = 0U;
+    if (velri_mul_overflow_size(row_offset, base.strides[0], &elem_offset) ||
+        velri_mul_overflow_size(elem_offset, elem_bytes, &extra_byte_offset)) {
+        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_tensor_view base_view;
+    memset(&base_view, 0, sizeof(base_view));
+    base_view.storage_id = base.storage_id;
+    base_view.dtype = base.dtype;
+    base_view.rank = 2U;
+    base_view.dims[0] = base.dims[0];
+    base_view.dims[1] = base.dims[1];
+    base_view.strides[0] = base.strides[0];
+    base_view.strides[1] = base.strides[1];
+    base_view.byte_offset = base.byte_offset;
+
+    const size_t sub_dims[2] = {num_rows, base.dims[1]};
+    const size_t sub_strides[2] = {base.strides[0], base.strides[1]};
+    velri_tensor_view sub_view;
+    velri_status st = velri_tensor_view_subview(&base_view, 2U, sub_dims, sub_strides,
+                                                extra_byte_offset, &sub_view);
+    if (st != VELRI_OK) {
+        velri_b_set_error(b, st);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_view_id vid = VELRI_INVALID_ID;
+    st = velri_graph_add_view(b->graph, &sub_view, &vid);
+    if (st != VELRI_OK) {
+        velri_b_set_error(b, st);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_tensor out = VELRI_TENSOR_NONE;
+    out.storage_id = base.storage_id;
+    out.view_id = vid;
+    out.dtype = base.dtype;
+    out.rank = 2U;
+    out.dims[0] = sub_view.dims[0];
+    out.dims[1] = sub_view.dims[1];
+    out.strides[0] = sub_view.strides[0];
+    out.strides[1] = sub_view.strides[1];
+    out.byte_offset = sub_view.byte_offset;
+    out.device_id = base.device_id;
+    out.is_seq_dynamic = (row_offset == 0U && num_rows == base.dims[0]) && base.is_seq_dynamic;
+    out.valid = true;
+    return out;
+}
+
+velri_tensor velri_b_subview_1d(velri_builder *b, velri_tensor base, size_t offset, size_t len) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    if (!b->graph || !base.valid || base.rank != 1U || base.strides[0] != 1U || len == 0U ||
+        offset > base.dims[0] || len > base.dims[0] - offset) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+
+    size_t elem_bytes = velri_dtype_bytes(base.dtype);
+    if (elem_bytes == 0U) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    size_t extra_byte_offset = 0U;
+    if (velri_mul_overflow_size(offset, elem_bytes, &extra_byte_offset)) {
+        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_tensor_view base_view;
+    memset(&base_view, 0, sizeof(base_view));
+    base_view.storage_id = base.storage_id;
+    base_view.dtype = base.dtype;
+    base_view.rank = 1U;
+    base_view.dims[0] = base.dims[0];
+    base_view.strides[0] = base.strides[0];
+    base_view.byte_offset = base.byte_offset;
+
+    const size_t sub_dims[1] = {len};
+    const size_t sub_strides[1] = {1U};
+    velri_tensor_view sub_view;
+    velri_status st = velri_tensor_view_subview(&base_view, 1U, sub_dims, sub_strides,
+                                                extra_byte_offset, &sub_view);
+    if (st != VELRI_OK) {
+        velri_b_set_error(b, st);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_view_id vid = VELRI_INVALID_ID;
+    st = velri_graph_add_view(b->graph, &sub_view, &vid);
+    if (st != VELRI_OK) {
+        velri_b_set_error(b, st);
+        return VELRI_TENSOR_NONE;
+    }
+
+    velri_tensor out = VELRI_TENSOR_NONE;
+    out.storage_id = base.storage_id;
+    out.view_id = vid;
+    out.dtype = base.dtype;
+    out.rank = 1U;
+    out.dims[0] = sub_view.dims[0];
+    out.strides[0] = sub_view.strides[0];
+    out.byte_offset = sub_view.byte_offset;
+    out.device_id = base.device_id;
+    out.is_seq_dynamic = (offset == 0U && len == base.dims[0]) && base.is_seq_dynamic;
+    out.valid = true;
+    return out;
+}
+
 /* ---- Primitive Operation Builders ---- */
 
 velri_tensor velri_b_embedding(velri_builder *b, velri_tensor table, velri_tensor ids_or_none,
@@ -955,6 +1084,55 @@ velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_
     op.outputs[0] = out.view_id;
     op.outputs[1] = k_cache.view_id;
     op.outputs[2] = v_cache.view_id;
+    op.attr.attention.n_heads = n_heads;
+    op.attr.attention.n_kv_heads = n_kv_heads;
+    op.attr.attention.head_dim = head_dim;
+    op.attr.attention.scale = scale;
+    op.attr.attention.sliding_window = sliding_window;
+    op.attr.attention.causal = causal;
+
+    return emit_op(b, &op) ? out : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_b_latent_attention(velri_builder *b, velri_tensor q, velri_tensor h_in,
+                                      velri_tensor w_k, velri_tensor w_v, velri_tensor b_v_or_none,
+                                      velri_tensor h_cache, uint32_t n_heads, uint32_t n_kv_heads,
+                                      uint32_t head_dim, float scale, uint32_t sliding_window,
+                                      bool causal) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    if (!q.valid || !h_in.valid || !w_k.valid || !w_v.valid || !h_cache.valid ||
+        q.rank != 2U || h_in.rank != 2U || w_k.rank != 2U || w_v.rank != 2U ||
+        h_cache.rank != 2U || (b_v_or_none.valid && b_v_or_none.rank != 1U) ||
+        n_heads == 0U || n_kv_heads == 0U || head_dim == 0U) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    size_t attn_dim = 0U;
+    if (velri_mul_overflow_size((size_t)n_heads, (size_t)head_dim, &attn_dim)) {
+        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+        return VELRI_TENSOR_NONE;
+    }
+
+    const size_t out_dims[2] = {q.dims[0], attn_dim};
+    velri_tensor out = velri_b_scratch(b, q.dtype, 2U, out_dims);
+    if (!out.valid) {
+        return VELRI_TENSOR_NONE;
+    }
+    out.is_seq_dynamic = true;
+
+    velri_op_desc op = init_op_desc(VELRI_OP_LATENT_ATTENTION, b_v_or_none.valid ? 5U : 4U, 2U);
+    op.dynamic_seq = true;
+    op.inputs[0] = q.view_id;
+    op.inputs[1] = h_in.view_id;
+    op.inputs[2] = w_k.view_id;
+    op.inputs[3] = w_v.view_id;
+    if (b_v_or_none.valid) {
+        op.inputs[4] = b_v_or_none.view_id;
+    }
+    op.outputs[0] = out.view_id;
+    op.outputs[1] = h_cache.view_id;
     op.attr.attention.n_heads = n_heads;
     op.attr.attention.n_kv_heads = n_kv_heads;
     op.attr.attention.head_dim = head_dim;

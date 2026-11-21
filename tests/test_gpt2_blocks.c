@@ -423,7 +423,8 @@ static double max_abs_diff(const float *a, const float *b, size_t n) {
     return mx;
 }
 
-static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id dev, const char *tag,
+static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id store_dev,
+                                     velri_device_id compute_dev, const char *tag,
                                      const velri_model_params *meta, const host_gpt2_weights *w,
                                      const int32_t *seq, size_t seq_len, const float *ref_4,
                                      const float *ref_6, float *out_final_logits) {
@@ -434,7 +435,7 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id dev, co
     velri_manifest_init(&manifest);
 
     velri_builder b;
-    velri_b_init(&b, g, &manifest, dev, dev, nullptr, nullptr);
+    velri_b_init(&b, g, &manifest, store_dev, compute_dev, nullptr, nullptr);
 
     CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2");
     CHECK(manifest.token_ids_in != VELRI_INVALID_ID, "manifest recorded token_ids_in");
@@ -445,8 +446,19 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id dev, co
           "tied wte must not duplicate lm_head.weight in manifest");
     CHECK(manifest.num_weights == 4U + 12U * meta->num_hidden_layers,
           "exact GPT-2 tied weight count in manifest");
-    CHECK(manifest.num_states == 2U * meta->num_hidden_layers,
-          "exact GPT-2 KV-cache state count in manifest");
+    if (meta->latent_kv) {
+        CHECK(manifest.num_states == meta->num_hidden_layers,
+              "exact GPT-2 latent h_cache state count in manifest");
+        CHECK(velri_manifest_find_state(&manifest, "transformer.h.0.attn.h_cache") != nullptr,
+              "manifest contains transformer.h.0.attn.h_cache");
+    } else {
+        CHECK(manifest.num_states == 2U * meta->num_hidden_layers,
+              "exact GPT-2 standard k/v_cache state count in manifest");
+        CHECK(velri_manifest_find_state(&manifest, "transformer.h.0.attn.k_cache") != nullptr,
+              "manifest contains transformer.h.0.attn.k_cache");
+        CHECK(velri_manifest_find_state(&manifest, "transformer.h.0.attn.v_cache") != nullptr,
+              "manifest contains transformer.h.0.attn.v_cache");
+    }
 
     velri_plan *plan = nullptr;
     CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare gpt2");
@@ -454,17 +466,24 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id dev, co
 
     velri_memory_report rep;
     CHECK_OK(velri_plan_memory_report(plan, &rep), "memory report");
-    const velri_device_memory_report *dr = &rep.devices[dev];
-    CHECK(rep.ram_staging_bytes == 0U, "single-device 0 B ram_staging");
-    CHECK(dr->scratch_packed_bytes < dr->scratch_unpacked_bytes,
+    const velri_device_memory_report *dr_store = &rep.devices[store_dev];
+    const velri_device_memory_report *dr_comp = &rep.devices[compute_dev];
+    const size_t per_cache_bytes =
+        (size_t)meta->num_hidden_layers * (size_t)meta->max_ctx * (size_t)meta->hidden_size *
+        sizeof(float);
+    const size_t expected_state_bytes = meta->latent_kv ? per_cache_bytes : (2U * per_cache_bytes);
+    CHECK(dr_comp->state_bytes == expected_state_bytes,
+          "STATE footprint matches standard (2x) vs latent (1x) KV mode");
+    CHECK(rep.ram_staging_bytes == 0U, "0 B ram_staging on single-dev or host<->dev offload");
+    CHECK(dr_comp->scratch_packed_bytes < dr_comp->scratch_unpacked_bytes,
           "liveness scratch packing must reuse cells tightly");
 
-    printf("  [MEM] %-10s | weights=%zu B (%u tensors) | state=%zu B | scratch=%zu B "
+    printf("  [MEM] %-18s | weights=%zu B (%u tensors) | state=%zu B | scratch=%zu B "
            "(unpacked=%zu B, %.1fx saved) | ovh=%zu B\n",
-           tag, dr->weight_bytes, manifest.num_weights, dr->state_bytes, dr->scratch_packed_bytes,
-           dr->scratch_unpacked_bytes,
-           (double)dr->scratch_unpacked_bytes / (double)dr->scratch_packed_bytes,
-           dr->allocator_overhead_bytes);
+           tag, dr_store->weight_bytes, manifest.num_weights, dr_comp->state_bytes,
+           dr_comp->scratch_packed_bytes, dr_comp->scratch_unpacked_bytes,
+           (double)dr_comp->scratch_unpacked_bytes / (double)dr_comp->scratch_packed_bytes,
+           dr_comp->allocator_overhead_bytes);
 
     /* Two concurrent-capable slots sharing ONE plan and ONE weight arena.
      * Note: ZERO host shadow buffers are bound for KV-cache STATE storages! */
@@ -538,7 +557,7 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id dev, co
           "reset slot reproduces clean prefill");
 
     memcpy(out_final_logits, logits0, logits_bytes);
-    printf("  [PASS] %-10s | prefill(4) err=%.2e | pre+dec(6) err=%.2e | pre==dec diff=%.2e | 0 allocs\n",
+    printf("  [PASS] %-18s | prefill(4) err=%.2e | pre+dec(6) err=%.2e | pre==dec diff=%.2e | 0 allocs\n",
            tag, err_pre4, err_pre_dec6, err_pre_vs_dec);
 
     free(tok_buf0);
@@ -556,7 +575,7 @@ static void run_gpt2_suite_on_device(velri_context *ctx, velri_device_id dev, co
 int main(void) {
     printf("=== Velri End-to-End GPT-2 Architecture Suite ===\n");
 
-    const velri_model_params meta = {
+    const velri_model_params meta_std = {
         .vocab_size = 257U,
         .max_position_embeddings = 64U,
         .hidden_size = 128U,
@@ -572,20 +591,28 @@ int main(void) {
         .dtype = VELRI_DTYPE_F32,
         .max_seq_len = 16U,
         .max_ctx = 64U,
+        .latent_kv = false,
     };
+    velri_model_params meta_lat = meta_std;
+    meta_lat.latent_kv = true;
 
     host_gpt2_weights w;
-    init_host_weights(&meta, &w);
+    init_host_weights(&meta_std, &w);
 
     const int32_t seq[6] = {12, 200, 7, 256, 42, 0};
-    float *ref_4 = (float *)calloc(meta.vocab_size, sizeof(float));
-    float *ref_6 = (float *)calloc(meta.vocab_size, sizeof(float));
-    float *cpu_logits = (float *)calloc(meta.vocab_size, sizeof(float));
-    float *vk_logits = (float *)calloc(meta.vocab_size, sizeof(float));
-    CHECK(ref_4 && ref_6 && cpu_logits && vk_logits, "oom");
+    float *ref_4 = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    float *ref_6 = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    float *cpu_std_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    float *cpu_lat_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    float *vk_std_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    float *vk_lat_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    float *offload_lat_logits = (float *)calloc(meta_std.vocab_size, sizeof(float));
+    CHECK(ref_4 && ref_6 && cpu_std_logits && cpu_lat_logits && vk_std_logits && vk_lat_logits &&
+              offload_lat_logits,
+          "oom");
 
-    ref_gpt2_fp64(&meta, &w, seq, 4U, ref_4);
-    ref_gpt2_fp64(&meta, &w, seq, 6U, ref_6);
+    ref_gpt2_fp64(&meta_std, &w, seq, 4U, ref_4);
+    ref_gpt2_fp64(&meta_std, &w, seq, 6U, ref_6);
 
     velri_context_config ccfg = {
         .cpu_workers = 4U,
@@ -597,15 +624,32 @@ int main(void) {
 
     velri_device_id cpu_dev = 0U;
     CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
-    run_gpt2_suite_on_device(ctx, cpu_dev, "cpu:0", &meta, &w, seq, 6U, ref_4, ref_6, cpu_logits);
+    run_gpt2_suite_on_device(ctx, cpu_dev, cpu_dev, "cpu:0 [std-kv]", &meta_std, &w, seq, 6U,
+                             ref_4, ref_6, cpu_std_logits);
+    run_gpt2_suite_on_device(ctx, cpu_dev, cpu_dev, "cpu:0 [latent-kv]", &meta_lat, &w, seq, 6U,
+                             ref_4, ref_6, cpu_lat_logits);
+    double cpu_std_vs_lat = max_abs_diff(cpu_std_logits, cpu_lat_logits, meta_std.vocab_size);
+    CHECK(cpu_std_vs_lat < 1e-4, "CPU standard KV and latent KV logits match");
+    printf("  [PASS] cpu:0 std-kv == latent-kv max_abs_diff=%.2e\n", cpu_std_vs_lat);
 
     velri_device_id vk_dev = 0U;
     if (velri_context_find_device(ctx, "vulkan", 0U, &vk_dev) == VELRI_OK) {
-        run_gpt2_suite_on_device(ctx, vk_dev, "vulkan:0", &meta, &w, seq, 6U, ref_4, ref_6,
-                                 vk_logits);
-        double cpu_vk = max_abs_diff(cpu_logits, vk_logits, meta.vocab_size);
-        CHECK(cpu_vk < 1e-4, "CPU and Vulkan GPT-2 logits match");
-        printf("  [PASS] cpu:0 == vulkan:0 max_abs_diff=%.2e\n", cpu_vk);
+        run_gpt2_suite_on_device(ctx, vk_dev, vk_dev, "vk:0  [std-kv]", &meta_std, &w, seq, 6U,
+                                 ref_4, ref_6, vk_std_logits);
+        run_gpt2_suite_on_device(ctx, vk_dev, vk_dev, "vk:0  [latent-kv]", &meta_lat, &w, seq, 6U,
+                                 ref_4, ref_6, vk_lat_logits);
+        run_gpt2_suite_on_device(ctx, cpu_dev, vk_dev, "cpu->vk [latent]", &meta_lat, &w, seq, 6U,
+                                 ref_4, ref_6, offload_lat_logits);
+        double vk_std_vs_lat = max_abs_diff(vk_std_logits, vk_lat_logits, meta_std.vocab_size);
+        double cpu_vk_std = max_abs_diff(cpu_std_logits, vk_std_logits, meta_std.vocab_size);
+        double cpu_vk_lat = max_abs_diff(cpu_lat_logits, vk_lat_logits, meta_std.vocab_size);
+        double offload_diff = max_abs_diff(vk_lat_logits, offload_lat_logits, meta_std.vocab_size);
+        CHECK(vk_std_vs_lat < 1e-4, "Vulkan standard KV and latent KV logits match");
+        CHECK(cpu_vk_std < 1e-4, "CPU and Vulkan standard KV GPT-2 logits match");
+        CHECK(cpu_vk_lat < 1e-4, "CPU and Vulkan latent KV GPT-2 logits match");
+        CHECK(offload_diff < 1e-4, "Offloaded CPU->Vulkan latent KV GPT-2 logits match");
+        printf("  [PASS] vk std==lat=%.2e | cpu==vk std=%.2e | cpu==vk lat=%.2e | offload=%.2e\n",
+               vk_std_vs_lat, cpu_vk_std, cpu_vk_lat, offload_diff);
     } else {
         printf("  [SKIP] vulkan:0 (not enabled or no GPU available)\n");
     }
@@ -613,8 +657,11 @@ int main(void) {
     velri_context_destroy(ctx);
     free(ref_4);
     free(ref_6);
-    free(cpu_logits);
-    free(vk_logits);
+    free(cpu_std_logits);
+    free(cpu_lat_logits);
+    free(vk_std_logits);
+    free(vk_lat_logits);
+    free(offload_lat_logits);
     free_host_weights(&w);
     printf("=== GPT-2 End-to-End Suite PASSED ===\n");
     return 0;

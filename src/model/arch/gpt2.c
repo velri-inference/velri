@@ -3,6 +3,7 @@
 static const velri_pre_norm_layer_desc k_gpt2_layer = {
     .norm_kind = VELRI_NORM_LAYER,
     .norm_bias = true,
+    .has_rope  = false,
     .fused_qkv = true,
     .attn_bias = true,
     .mlp_gated = false,

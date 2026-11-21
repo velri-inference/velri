@@ -26,7 +26,8 @@ typedef enum {
 
 static inline bool velri_op_is_dynamic_seq(const velri_resolved_op *op) {
     return op && (op->raw.dynamic_seq || op->kind == VELRI_OP_EMBEDDING ||
-                  op->kind == VELRI_OP_ATTENTION || op->kind == VELRI_OP_COPY_LAST_ROW);
+                  op->kind == VELRI_OP_ATTENTION || op->kind == VELRI_OP_COPY_LAST_ROW ||
+                  op->kind == VELRI_OP_LATENT_ATTENTION);
 }
 
 static inline size_t velri_effective_rows(const velri_resolved_op *op, size_t static_rows,

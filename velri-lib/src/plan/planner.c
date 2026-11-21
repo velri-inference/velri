@@ -530,6 +530,15 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
         st = pack_state_and_io_arenas(plan);
     }
 
+    /* 1-step-adjacent offloaded WEIGHT shadow cache: deduplicates both intra-op subviews
+     * (e.g. W_K & W_V inside latent_attention) and immediately consecutive ops on the same
+     * device (e.g. q_linear -> latent_attention reading fused qkv_w), without pinning
+     * non-adjacent tied weights (e.g. wte / lm_head) across the graph. */
+    velri_device_id prev_w_dev = VELRI_INVALID_ID;
+    uint32_t prev_w_cnt = 0U;
+    velri_storage_id prev_w_sids[VELRI_OP_MAX_INPUTS];
+    uint32_t prev_w_idxs[VELRI_OP_MAX_INPUTS];
+
     /* Lower each operation node into device-verified steps + cached explicit transfers. */
     for (uint32_t n = 0U; n < graph->num_nodes && st == VELRI_OK; ++n) {
         const velri_graph_node *node = &graph->nodes[n];
@@ -547,6 +556,10 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
         memset(in_args, 0, sizeof(in_args));
         memset(out_args, 0, sizeof(out_args));
 
+        uint32_t cur_w_cnt = 0U;
+        velri_storage_id cur_w_sids[VELRI_OP_MAX_INPUTS];
+        uint32_t cur_w_idxs[VELRI_OP_MAX_INPUTS];
+
         /* 1. Ensure every present input has a valid copy on `chosen_dev` (cached per (sid, dev)). */
         for (uint32_t i = 0U; i < resolved.num_inputs; ++i) {
             if (!resolved.input_present[i]) {
@@ -554,6 +567,25 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
             }
             velri_storage_id sid = resolved.inputs[i].storage_id;
             uint32_t use_idx = valid_copy[(size_t)sid * VELRI_MAX_DEVICES + chosen_dev];
+            if (use_idx == UINT32_MAX && plan->storages[sid].kind == VELRI_STORAGE_WEIGHT) {
+                for (uint32_t k = 0U; k < cur_w_cnt; ++k) {
+                    if (cur_w_sids[k] == sid) {
+                        use_idx = cur_w_idxs[k];
+                        break;
+                    }
+                }
+                if (use_idx == UINT32_MAX && prev_w_dev == chosen_dev) {
+                    for (uint32_t k = 0U; k < prev_w_cnt; ++k) {
+                        if (prev_w_sids[k] == sid) {
+                            use_idx = prev_w_idxs[k];
+                            cur_w_sids[cur_w_cnt] = sid;
+                            cur_w_idxs[cur_w_cnt] = use_idx;
+                            cur_w_cnt++;
+                            break;
+                        }
+                    }
+                }
+            }
             if (use_idx == UINT32_MAX) {
                 st = add_shadow_storage(&pb, chosen_dev, plan->storages[sid].dtype,
                                         plan->storages[sid].byte_size, plan->storages[sid].align,
@@ -562,11 +594,12 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
                 st = emit_ram_transfer(&pb, owner_dev[sid], owner_idx[sid], chosen_dev, use_idx,
                                        plan->storages[sid].byte_size);
                 if (st != VELRI_OK) break;
-                /* For cross-device offloaded WEIGHTs, keep shadow lifetime local to this op so
-                 * non-adjacent reuses (e.g. tied wte/lm_head) do not pin a huge scratch slot
-                 * across the entire graph. */
                 if (plan->storages[sid].kind != VELRI_STORAGE_WEIGHT) {
                     valid_copy[(size_t)sid * VELRI_MAX_DEVICES + chosen_dev] = use_idx;
+                } else {
+                    cur_w_sids[cur_w_cnt] = sid;
+                    cur_w_idxs[cur_w_cnt] = use_idx;
+                    cur_w_cnt++;
                 }
             }
             in_args[i].present = true;
@@ -593,7 +626,8 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
 
             if (dst_idx == UINT32_MAX) {
                 bool is_rmw = (resolved.kind == VELRI_OP_FUSED_ADD_RMSNORM && o == 0U) ||
-                              (resolved.kind == VELRI_OP_ATTENTION && (o == 1U || o == 2U));
+                              (resolved.kind == VELRI_OP_ATTENTION && (o == 1U || o == 2U)) ||
+                              (resolved.kind == VELRI_OP_LATENT_ATTENTION && o == 1U);
                 bool need_preserve =
                     is_rmw || !view_covers_full_storage(&resolved.outputs[o],
                                                         plan->storages[sid].byte_size);
@@ -638,6 +672,13 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
             valid_copy[(size_t)sid * VELRI_MAX_DEVICES + chosen_dev] = out_dsts[o];
             owner_dev[sid] = chosen_dev;
             owner_idx[sid] = out_dsts[o];
+        }
+
+        prev_w_dev = chosen_dev;
+        prev_w_cnt = cur_w_cnt;
+        for (uint32_t k = 0U; k < cur_w_cnt; ++k) {
+            prev_w_sids[k] = cur_w_sids[k];
+            prev_w_idxs[k] = cur_w_idxs[k];
         }
 
         /* 4. Optional backend preparation hook. */

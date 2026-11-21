@@ -145,4 +145,12 @@ void velri_ref_attention_f32(size_t active_t, size_t n_heads, size_t n_kv_heads,
                              size_t k_stride, const float *v_in, size_t v_stride, float *k_cache,
                              float *v_cache, float *out, size_t o_stride);
 
+void velri_ref_latent_attention_f32(size_t active_t, size_t n_heads, size_t n_kv_heads,
+                                    size_t head_dim, size_t d_lat, size_t kv_pos, size_t max_ctx,
+                                    float scale, size_t sliding_window, bool causal,
+                                    const float *q, size_t q_stride, const float *h_in,
+                                    size_t h_stride, const float *w_k, size_t wk_stride,
+                                    const float *w_v, size_t wv_stride, const float *b_v,
+                                    float *h_cache, float *out, size_t o_stride);
+
 #endif /* VELRI_TEST_REFERENCE_H */

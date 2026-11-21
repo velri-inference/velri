@@ -466,7 +466,8 @@ velri_status velri_op_validate(const velri_resolved_op *op) {
         uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
         uint32_t hd = op->raw.attr.attention.head_dim;
         float sc = op->raw.attr.attention.scale;
-        if (nh == 0U || nkvh == 0U || hd == 0U || hd > 256U || (nh % nkvh) != 0U) {
+        if (nh == 0U || nkvh == 0U || hd == 0U || hd > VELRI_ATTN_MAX_HEAD_DIM ||
+            (nh % nkvh) != 0U) {
             return VELRI_ERR_INVALID;
         }
         if (sc != 0.0f && (!(sc > 0.0f) || !isfinite(sc))) {
@@ -525,6 +526,64 @@ velri_status velri_op_validate(const velri_resolved_op *op) {
             x->dtype != VELRI_DTYPE_F32 || y->dtype != VELRI_DTYPE_F32 ||
             x->dims[0] == 0U || y->dims[0] != 1U || x->dims[1] != y->dims[1] ||
             views_overlap(x, y)) {
+            return VELRI_ERR_INVALID;
+        }
+        return VELRI_OK;
+    }
+
+    case VELRI_OP_LATENT_ATTENTION: {
+        if (op->num_inputs < 4U || op->num_inputs > 5U || op->num_outputs != 2U ||
+            !op->input_present[0] || !op->input_present[1] || !op->input_present[2] ||
+            !op->input_present[3]) {
+            return VELRI_ERR_INVALID;
+        }
+        const velri_tensor_view *q = &op->inputs[0];
+        const velri_tensor_view *h_in = &op->inputs[1];
+        const velri_tensor_view *w_k = &op->inputs[2];
+        const velri_tensor_view *w_v = &op->inputs[3];
+        const velri_tensor_view *out = &op->outputs[0];
+        const velri_tensor_view *h_cache = &op->outputs[1];
+
+        uint32_t nh = op->raw.attr.attention.n_heads;
+        uint32_t nkvh = op->raw.attr.attention.n_kv_heads;
+        uint32_t hd = op->raw.attr.attention.head_dim;
+        float sc = op->raw.attr.attention.scale;
+        if (nh == 0U || nkvh == 0U || hd == 0U || hd > VELRI_ATTN_MAX_HEAD_DIM ||
+            (nh % nkvh) != 0U) {
+            return VELRI_ERR_INVALID;
+        }
+        if (sc != 0.0f && (!(sc > 0.0f) || !isfinite(sc))) {
+            return VELRI_ERR_INVALID;
+        }
+        if (!is_unit_inner_2d(q) || !is_unit_inner_2d(h_in) || !is_unit_inner_2d(w_k) ||
+            !is_unit_inner_2d(w_v) || !is_unit_inner_2d(out) || !is_unit_inner_2d(h_cache)) {
+            return VELRI_ERR_INVALID;
+        }
+        if (q->dtype != VELRI_DTYPE_F32 || h_in->dtype != VELRI_DTYPE_F32 ||
+            w_k->dtype != VELRI_DTYPE_F32 || w_v->dtype != VELRI_DTYPE_F32 ||
+            out->dtype != VELRI_DTYPE_F32 || h_cache->dtype != VELRI_DTYPE_F32) {
+            return VELRI_ERR_UNSUPPORTED;
+        }
+        size_t max_t = q->dims[0];
+        size_t d_lat = h_in->dims[1];
+        size_t kv_dim = (size_t)nkvh * (size_t)hd;
+        if (max_t == 0U || d_lat == 0U || d_lat > VELRI_LATENT_ATTN_MAX_DLAT ||
+            h_in->dims[0] != max_t ||
+            out->dims[0] != max_t || q->dims[1] != (size_t)nh * (size_t)hd ||
+            out->dims[1] != (size_t)nh * (size_t)hd ||
+            w_k->dims[0] != kv_dim || w_k->dims[1] != d_lat ||
+            w_v->dims[0] != kv_dim || w_v->dims[1] != d_lat ||
+            !velri_tensor_view_is_contiguous(h_cache) ||
+            h_cache->dims[0] < max_t || h_cache->dims[1] != d_lat) {
+            return VELRI_ERR_INVALID;
+        }
+        if (!check_opt_1d_param(op, 4U, VELRI_DTYPE_F32, kv_dim, out, h_cache)) {
+            return VELRI_ERR_INVALID;
+        }
+        if (views_overlap(out, q) || views_overlap(out, h_in) || views_overlap(out, w_k) ||
+            views_overlap(out, w_v) || views_overlap(out, h_cache) ||
+            views_overlap(h_cache, q) || views_overlap(h_cache, h_in) ||
+            views_overlap(h_cache, w_k) || views_overlap(h_cache, w_v)) {
             return VELRI_ERR_INVALID;
         }
         return VELRI_OK;

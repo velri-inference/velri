@@ -276,3 +276,28 @@ EpilogueParams make_ep(Ptr<float, Access.Read> bias, Ptr<float, Access.Read> x_s
                        w0, w1, active_t, n_heads, n_kv_heads, head_dim,
                        kv_pos, max_ctx, scale, sliding_window, causal);
 }
+
+[DllExport] export __extern_cpp void VSYM(latent_append_f32)(
+    Ptr<float, Access.Read> h_in, uint h_stride,
+    Ptr<float> h_cache,
+    uint t0, uint t1, uint kv_pos, uint d_lat)
+{
+    latent_append_cpu(h_in, h_stride, h_cache, t0, t1, kv_pos, d_lat);
+}
+
+[DllExport] export __extern_cpp void VSYM(latent_attention_f32)(
+    Ptr<float, Access.Read> q, uint q_stride,
+    Ptr<float, Access.Read> h_cache,
+    Ptr<float, Access.Read> w_k, uint wk_stride,
+    Ptr<float, Access.Read> w_v, uint wv_stride,
+    Ptr<float, Access.Read> b_v, uint has_bv,
+    Ptr<float> out, uint o_stride,
+    uint w0, uint w1, uint active_t, uint n_heads, uint n_kv_heads,
+    uint head_dim, uint d_lat, uint kv_pos, float scale,
+    uint sliding_window, uint causal)
+{
+    latent_attention_rows_cpu(q, q_stride, h_cache, w_k, wk_stride, w_v, wv_stride,
+                              b_v, has_bv, out, o_stride, w0, w1, active_t, n_heads,
+                              n_kv_heads, head_dim, d_lat, kv_pos, scale,
+                              sliding_window, causal);
+}

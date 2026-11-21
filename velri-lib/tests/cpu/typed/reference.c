@@ -479,3 +479,136 @@ void velri_ref_attention_f32(size_t active_t, size_t n_heads, size_t n_kv_heads,
 
     free(acc_heap);
 }
+
+void velri_ref_latent_attention_f32(size_t active_t, size_t n_heads, size_t n_kv_heads,
+                                    size_t head_dim, size_t d_lat, size_t kv_pos, size_t max_ctx,
+                                    float scale, size_t sliding_window, bool causal,
+                                    const float *q, size_t q_stride, const float *h_in,
+                                    size_t h_stride, const float *w_k, size_t wk_stride,
+                                    const float *w_v, size_t wv_stride, const float *b_v,
+                                    float *h_cache, float *out, size_t o_stride) {
+    if (active_t == 0U || n_heads == 0U || n_kv_heads == 0U || head_dim == 0U || d_lat == 0U ||
+        (n_heads % n_kv_heads) != 0U || kv_pos > max_ctx || active_t > max_ctx - kv_pos) {
+        return;
+    }
+
+    /* Stage 1: append new latent rows into contiguous [max_ctx, d_lat] h_cache. */
+    for (size_t t = 0U; t < active_t; ++t) {
+        memcpy(h_cache + (kv_pos + t) * d_lat, h_in + t * h_stride, d_lat * sizeof(float));
+    }
+
+    /*
+     * Stage 2: exact two-pass FP64 attention via explicit K/V materialization:
+     *   k_j = h_j * W_{K,kvh}^T,   v_j = h_j * W_{V,kvh}^T + b_{V,kvh}
+     * Independently cross-checks the weight-absorption identity used by the kernel.
+     */
+    size_t kv_total = kv_pos + active_t;
+    size_t kv_end0 = causal ? (kv_pos + 1U) : kv_total;
+    size_t min_kv_start =
+        (sliding_window > 0U && kv_end0 > sliding_window) ? (kv_end0 - sliding_window) : 0U;
+    size_t kv_span = kv_total - min_kv_start;
+    if (kv_span == 0U || kv_span > SIZE_MAX / head_dim ||
+        (kv_span * head_dim) > SIZE_MAX / sizeof(double) || kv_span > SIZE_MAX / sizeof(double)) {
+        return;
+    }
+
+    double *k_exp = (double *)malloc(kv_span * head_dim * sizeof(double));
+    double *v_exp = (double *)malloc(kv_span * head_dim * sizeof(double));
+    double *scores = (double *)malloc(kv_span * sizeof(double));
+    double acc_stack[256];
+    double *acc = acc_stack;
+    double *acc_heap = nullptr;
+    if (head_dim > 256U) {
+        if (head_dim <= SIZE_MAX / sizeof(double)) {
+            acc_heap = (double *)malloc(head_dim * sizeof(double));
+        }
+        acc = acc_heap;
+    }
+    if (!k_exp || !v_exp || !scores || !acc) {
+        free(k_exp);
+        free(v_exp);
+        free(scores);
+        free(acc_heap);
+        return;
+    }
+
+    double sc = (scale > 0.0f) ? (double)scale : (1.0 / sqrt((double)head_dim));
+    size_t heads_per_kv = n_heads / n_kv_heads;
+
+    for (size_t kvh = 0U; kvh < n_kv_heads; ++kvh) {
+        size_t kvh_row_base = kvh * head_dim;
+
+        /* Materialize exact FP64 K and V for this KV head across [min_kv_start, kv_total). */
+        for (size_t j = 0U; j < kv_span; ++j) {
+            const float *h_row = h_cache + (min_kv_start + j) * d_lat;
+            double *k_dst = k_exp + j * head_dim;
+            double *v_dst = v_exp + j * head_dim;
+            for (size_t r = 0U; r < head_dim; ++r) {
+                const float *wk_r = w_k + (kvh_row_base + r) * wk_stride;
+                const float *wv_r = w_v + (kvh_row_base + r) * wv_stride;
+                double ks = 0.0;
+                double vs = b_v ? (double)b_v[kvh_row_base + r] : 0.0;
+                for (size_t d = 0U; d < d_lat; ++d) {
+                    double hd_val = (double)h_row[d];
+                    ks += hd_val * (double)wk_r[d];
+                    vs += hd_val * (double)wv_r[d];
+                }
+                k_dst[r] = ks;
+                v_dst[r] = vs;
+            }
+        }
+
+        /* Exact two-pass FP64 attention for all query heads mapped to `kvh`. */
+        for (size_t t = 0U; t < active_t; ++t) {
+            size_t kv_end = causal ? (kv_pos + t + 1U) : kv_total;
+            size_t kv_start =
+                (sliding_window > 0U && kv_end > sliding_window) ? (kv_end - sliding_window) : 0U;
+            for (size_t h_off = 0U; h_off < heads_per_kv; ++h_off) {
+                size_t h = kvh * heads_per_kv + h_off;
+                const float *q_row = q + t * q_stride + h * head_dim;
+                float *o_row = out + t * o_stride + h * head_dim;
+                if (kv_start >= kv_end) {
+                    memset(o_row, 0, head_dim * sizeof(float));
+                    continue;
+                }
+
+                double m = -INFINITY;
+                for (size_t k_idx = kv_start; k_idx < kv_end; ++k_idx) {
+                    const double *k_row = k_exp + (k_idx - min_kv_start) * head_dim;
+                    double dot = 0.0;
+                    for (size_t r = 0U; r < head_dim; ++r) {
+                        dot += (double)q_row[r] * k_row[r];
+                    }
+                    double s = dot * sc;
+                    scores[k_idx - kv_start] = s;
+                    if (s > m) {
+                        m = s;
+                    }
+                }
+
+                for (size_t r = 0U; r < head_dim; ++r) {
+                    acc[r] = 0.0;
+                }
+                double sum_w = 0.0;
+                for (size_t k_idx = kv_start; k_idx < kv_end; ++k_idx) {
+                    const double *v_row = v_exp + (k_idx - min_kv_start) * head_dim;
+                    double w = exp(scores[k_idx - kv_start] - m);
+                    sum_w += w;
+                    for (size_t r = 0U; r < head_dim; ++r) {
+                        acc[r] += w * v_row[r];
+                    }
+                }
+
+                double inv_sum = (sum_w > 0.0) ? (1.0 / sum_w) : 0.0;
+                for (size_t r = 0U; r < head_dim; ++r) {
+                    o_row[r] = (float)(acc[r] * inv_sum);
+                }
+            }
+        }
+    }
+
+    free(k_exp);
+    free(v_exp);
+    free(scores);
+    free(acc_heap);
+}

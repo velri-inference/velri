@@ -125,6 +125,9 @@ velri_tensor velri_b_scratch(velri_builder *b, velri_dtype dtype, uint32_t rank,
                              const size_t *dims);
 velri_tensor velri_b_subview_2d_cols(velri_builder *b, velri_tensor base, size_t col_offset,
                                      size_t num_cols);
+velri_tensor velri_b_subview_2d_rows(velri_builder *b, velri_tensor base, size_t row_offset,
+                                     size_t num_rows);
+velri_tensor velri_b_subview_1d(velri_builder *b, velri_tensor base, size_t offset, size_t len);
 
 /* ---- Primitive Operation Builders ---- */
 
@@ -150,6 +153,11 @@ velri_tensor velri_b_attention(velri_builder *b, velri_tensor q, velri_tensor k_
                                velri_tensor v_in, velri_tensor k_cache, velri_tensor v_cache,
                                uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
                                float scale, uint32_t sliding_window, bool causal);
+velri_tensor velri_b_latent_attention(velri_builder *b, velri_tensor q, velri_tensor h_in,
+                                      velri_tensor w_k, velri_tensor w_v, velri_tensor b_v_or_none,
+                                      velri_tensor h_cache, uint32_t n_heads, uint32_t n_kv_heads,
+                                      uint32_t head_dim, float scale, uint32_t sliding_window,
+                                      bool causal);
 velri_tensor velri_b_copy_last_row(velri_builder *b, velri_tensor x);
 
 /* ---- High-Level Reusable Blocks & Layers ---- */
@@ -193,6 +201,7 @@ typedef struct {
     bool causal;
     bool fused_qkv;
     bool has_bias;
+    bool latent_kv;          /* True => cache single input `h_cache` + exact weight absorption (2x less STATE) */
     velri_dtype dtype;
 } velri_attention_spec;
 
@@ -233,9 +242,15 @@ typedef struct {
 /* Creates INPUT token_ids [max_seq_len] (recorded in manifest->token_ids_in) and embeds tokens (+ optional pos). */
 velri_tensor velri_block_embedding(velri_builder *b, const velri_embedding_spec *spec);
 
-/* Attention block: fused or split QKV projections -> zero-copy views -> KV-cache attention -> o_proj. */
+/* Attention block: fused or split QKV projections -> zero-copy views -> KV or latent-KV attention -> o_proj. */
 velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char *prefix,
                                    const velri_attention_spec *spec);
+
+/* Latent weight-absorbed attention block: caches arbitrary latent `h_lat` (`h_lat == x` for
+ * direct input-state caching, or compressed `c_kv` for MLA) in `attn.h_cache` and absorbs
+ * W_K / W_V online -> o_proj. */
+velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velri_tensor h_lat,
+                                          const char *prefix, const velri_attention_spec *spec);
 
 /* MLP block: standard 2-linear (in-place act) or gated 3-linear (in-place gated act). */
 velri_tensor velri_block_mlp(velri_builder *b, velri_tensor x, const char *prefix,
@@ -265,15 +280,17 @@ typedef struct {
     bool tie_word_embeddings;
     velri_dtype dtype;
 
-    /* Runtime execution bounds (from placement/session config). */
+    /* Runtime execution & memory-policy knobs (from placement/session config). */
     uint32_t max_seq_len;
     uint32_t max_ctx;
+    bool latent_kv; /* Cache single latent input H_cache + exact W_K/W_V absorption (no RoPE, d_lat <= 2048). */
 } velri_model_params;
 
 typedef struct {
     velri_norm_kind norm_kind;
     bool norm_bias;
     bool rms_unit_offset;
+    bool has_rope;         /* True when attention applies RoPE to Q/K (disallows raw-input latent_kv) */
     bool fused_qkv;
     bool attn_bias;
     bool mlp_gated;

@@ -1195,7 +1195,121 @@ static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, co
         }
     }
 
-    printf("  [PASS] %-14s — all 15 ops + edge cases verified vs FP64 reference.\n", tag);
+    /* 17. Latent Attention (exact h_cache + weight absorption: GPT-2 d_lat=768 + GQA/sliding/bidir) */
+    {
+        struct {
+            const char *name;
+            uint32_t nh, nkvh, hd, d_lat, max_t, max_ctx, prefill_t, dec_steps, win;
+            bool causal, has_bv;
+            uint64_t seed;
+        } cases[3] = {
+            {"lat_gpt2_d768_bv", 12U, 12U, 64U, 768U, 24U, 40U, 24U, 2U, 0U, true, true, 0x1A7E0001ULL},
+            {"lat_gqa_win5_nobv", 6U, 2U, 64U, 300U, 12U, 24U, 9U, 2U, 5U, true, false, 0x1A7E0002ULL},
+            {"lat_bidir_odd513", 4U, 2U, 48U, 513U, 18U, 32U, 17U, 2U, 0U, false, true, 0x1A7E0003ULL},
+        };
+        for (int ci = 0; ci < 3; ++ci) {
+            uint32_t nh = cases[ci].nh, nkvh = cases[ci].nkvh, hd = cases[ci].hd;
+            uint32_t d_lat = cases[ci].d_lat, max_t = cases[ci].max_t, max_ctx = cases[ci].max_ctx;
+            size_t q_dim = (size_t)nh * hd, kv_dim = (size_t)nkvh * hd;
+            size_t q_str = q_dim + 3U, h_str = (size_t)d_lat + 5U;
+            size_t wk_str = (size_t)d_lat + 3U, wv_str = (size_t)d_lat + 7U, o_str = q_dim + 1U;
+
+            float *hq = (float *)xcalloc((size_t)max_t * q_str, sizeof(float));
+            float *hh = (float *)xcalloc((size_t)max_t * h_str, sizeof(float));
+            float *hwk = (float *)xcalloc(kv_dim * wk_str, sizeof(float));
+            float *hwv = (float *)xcalloc(kv_dim * wv_str, sizeof(float));
+            float *hbv = cases[ci].has_bv ? (float *)xcalloc(kv_dim, sizeof(float)) : nullptr;
+            float *ho = (float *)xcalloc((size_t)max_t * o_str, sizeof(float));
+            float *ho_ref = (float *)xcalloc((size_t)max_t * o_str, sizeof(float));
+            float *hhc_ref = (float *)xcalloc((size_t)max_ctx * d_lat, sizeof(float));
+
+            uint64_t rng = cases[ci].seed;
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hwk, kv_dim * wk_str, &rng, 0.12f);
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hwv, kv_dim * wv_str, &rng, 0.12f);
+            if (hbv) velri_test_fill_dtype(VELRI_DTYPE_F32, hbv, kv_dim, &rng, 0.25f);
+
+            velri_graph *g = nullptr;
+            CHECK_OK(velri_graph_create(&g), "lat g");
+            velri_storage_id sq = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * q_str, dev);
+            velri_storage_id sh = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, (size_t)max_t * h_str, dev);
+            velri_storage_id swk = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, kv_dim * wk_str, dev);
+            velri_storage_id swv = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, kv_dim * wv_str, dev);
+            velri_storage_id sbv = cases[ci].has_bv ? add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, kv_dim, dev) : 0U;
+            velri_storage_id so = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, (size_t)max_t * o_str, dev);
+            velri_storage_id shc = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, (size_t)max_ctx * d_lat, dev);
+
+            velri_op_desc op = {
+                .kind = VELRI_OP_LATENT_ATTENTION,
+                .num_inputs = cases[ci].has_bv ? 5U : 4U,
+                .num_outputs = 2U,
+                .inputs = {
+                    add_view_2d_strided(g, sq, VELRI_DTYPE_F32, max_t, q_dim, q_str),
+                    add_view_2d_strided(g, sh, VELRI_DTYPE_F32, max_t, d_lat, h_str),
+                    add_view_2d_strided(g, swk, VELRI_DTYPE_F32, kv_dim, d_lat, wk_str),
+                    add_view_2d_strided(g, swv, VELRI_DTYPE_F32, kv_dim, d_lat, wv_str),
+                    cases[ci].has_bv ? add_view_1d(g, sbv, VELRI_DTYPE_F32, kv_dim, 0U) : VELRI_INVALID_ID,
+                },
+                .outputs = {
+                    add_view_2d_strided(g, so, VELRI_DTYPE_F32, max_t, q_dim, o_str),
+                    add_view_2d_strided(g, shc, VELRI_DTYPE_F32, max_ctx, d_lat, d_lat),
+                },
+                .dynamic_seq = true,
+                .attr.attention = {
+                    .n_heads = nh, .n_kv_heads = nkvh, .head_dim = hd,
+                    .scale = 0.0f, .sliding_window = cases[ci].win, .causal = cases[ci].causal,
+                },
+            };
+            CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add lat");
+            velri_plan *plan = nullptr;
+            velri_slot *slot = nullptr;
+            CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prep lat");
+            CHECK_OK(velri_plan_bind_weight_host(plan, swk, hwk, kv_dim * wk_str * sizeof(float)), "wk");
+            CHECK_OK(velri_plan_bind_weight_host(plan, swv, hwv, kv_dim * wv_str * sizeof(float)), "wv");
+            if (hbv) CHECK_OK(velri_plan_bind_weight_host(plan, sbv, hbv, kv_dim * sizeof(float)), "bv");
+            CHECK_OK(velri_slot_create(plan, &slot), "slot lat");
+            CHECK_OK(velri_slot_bind_host(slot, sq, hq, (size_t)max_t * q_str * sizeof(float)), "q");
+            CHECK_OK(velri_slot_bind_host(slot, sh, hh, (size_t)max_t * h_str * sizeof(float)), "h");
+            CHECK_OK(velri_slot_bind_host(slot, so, ho, (size_t)max_t * o_str * sizeof(float)), "o");
+
+            /* Prefill step */
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hq, (size_t)cases[ci].prefill_t * q_str, &rng, 0.5f);
+            velri_test_fill_dtype(VELRI_DTYPE_F32, hh, (size_t)cases[ci].prefill_t * h_str, &rng, 0.5f);
+            velri_step_params sp = {.has_seq_len = true, .seq_len_override = cases[ci].prefill_t,
+                                    .has_kv_len = true, .kv_len_override = 0U};
+            CHECK_OK(velri_slot_run(slot, &sp, nullptr), cases[ci].name);
+            CHECK(velri_slot_last_run_allocs(slot) == 0U, "lat prefill 0 allocs");
+            velri_ref_latent_attention_f32(cases[ci].prefill_t, nh, nkvh, hd, d_lat, 0U, max_ctx,
+                                           0.0f, cases[ci].win, cases[ci].causal,
+                                           hq, q_str, hh, h_str, hwk, wk_str, hwv, wv_str, hbv,
+                                           hhc_ref, ho_ref, o_str);
+            CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, cases[ci].prefill_t, q_dim, o_str) <= 2e-4,
+                  cases[ci].name);
+
+            /* Incremental decode steps */
+            for (uint32_t ds = 0U; ds < cases[ci].dec_steps; ++ds) {
+                uint32_t kv_pos = cases[ci].prefill_t + ds;
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hq, q_str, &rng, 0.5f);
+                velri_test_fill_dtype(VELRI_DTYPE_F32, hh, h_str, &rng, 0.5f);
+                velri_step_params dsp = {.has_seq_len = true, .seq_len_override = 1U,
+                                         .has_kv_len = true, .kv_len_override = kv_pos};
+                CHECK_OK(velri_slot_run(slot, &dsp, nullptr), cases[ci].name);
+                CHECK(velri_slot_last_run_allocs(slot) == 0U, "lat decode 0 allocs");
+                velri_ref_latent_attention_f32(1U, nh, nkvh, hd, d_lat, kv_pos, max_ctx,
+                                               0.0f, cases[ci].win, cases[ci].causal,
+                                               hq, q_str, hh, h_str, hwk, wk_str, hwv, wv_str, hbv,
+                                               hhc_ref, ho_ref, o_str);
+                CHECK(velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, ho_ref, ho, 1U, q_dim, o_str) <= 2e-4,
+                      cases[ci].name);
+            }
+
+            velri_slot_destroy(slot);
+            velri_plan_destroy(plan);
+            velri_graph_destroy(g);
+            free(hq); free(hh); free(hwk); free(hwv); free(hbv); free(ho); free(ho_ref); free(hhc_ref);
+        }
+    }
+
+    printf("  [PASS] %-14s — all 16 ops + edge cases verified vs FP64 reference.\n", tag);
 }
 
 int main(void) {

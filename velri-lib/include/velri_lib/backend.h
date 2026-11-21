@@ -22,7 +22,9 @@ enum {
     VELRI_MAX_RANK = 4,
     VELRI_INVALID_ID = 0xFFFFFFFFU,
     VELRI_OP_MAX_INPUTS = 6,
-    VELRI_OP_MAX_OUTPUTS = 3
+    VELRI_OP_MAX_OUTPUTS = 3,
+    VELRI_ATTN_MAX_HEAD_DIM = 256,
+    VELRI_LATENT_ATTN_MAX_DLAT = 2048
 };
 
 typedef uint32_t velri_storage_id;
@@ -89,7 +91,8 @@ typedef enum {
     VELRI_OP_QUANTIZE_ROW = 11,
     VELRI_OP_EMBEDDING = 12,
     VELRI_OP_ATTENTION = 13,
-    VELRI_OP_COPY_LAST_ROW = 14
+    VELRI_OP_COPY_LAST_ROW = 14,
+    VELRI_OP_LATENT_ATTENTION = 15
 } velri_op_kind;
 
 typedef struct {

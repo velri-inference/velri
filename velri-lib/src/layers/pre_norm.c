@@ -168,6 +168,10 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
+    if (p->latent_kv && desc->has_rope) {
+        velri_b_set_error(b, VELRI_ERR_UNSUPPORTED);
+        return VELRI_TENSOR_NONE;
+    }
 
     const velri_layer_spec spec = {
         .scope = "hidden-layers",
@@ -194,6 +198,7 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
             .causal = true,
             .fused_qkv = desc->fused_qkv,
             .has_bias = desc->attn_bias,
+            .latent_kv = p->latent_kv,
             .dtype = p->dtype,
         },
         .mlp = {

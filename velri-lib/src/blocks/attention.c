@@ -29,7 +29,9 @@ static bool make_proj_weights(velri_builder *b, const char *prefix, const char *
                               size_t in_dim, bool has_bias, velri_tensor *out_w,
                               velri_tensor *out_b) {
     *out_w = VELRI_TENSOR_NONE;
-    *out_b = VELRI_TENSOR_NONE;
+    if (out_b) {
+        *out_b = VELRI_TENSOR_NONE;
+    }
 
     char w_name[VELRI_MANIFEST_NAME_MAX];
     if (!format_tensor_name(b, w_name, prefix, proj_name, ".weight")) {
@@ -42,6 +44,10 @@ static bool make_proj_weights(velri_builder *b, const char *prefix, const char *
     }
 
     if (has_bias) {
+        if (!out_b) {
+            velri_b_set_error(b, VELRI_ERR_INVALID);
+            return false;
+        }
         char b_name[VELRI_MANIFEST_NAME_MAX];
         if (!format_tensor_name(b, b_name, prefix, proj_name, ".bias")) {
             return false;
@@ -55,32 +61,31 @@ static bool make_proj_weights(velri_builder *b, const char *prefix, const char *
     return true;
 }
 
-velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char *prefix,
-                                   const velri_attention_spec *spec) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
+static bool validate_attention_common(velri_builder *b, velri_tensor x,
+                                      const velri_attention_spec *spec, size_t *out_q_dim,
+                                      size_t *out_kv_dim, size_t *out_qkv_dim) {
     if (!x.valid || x.rank != 2U || !spec || spec->n_heads == 0U || spec->n_kv_heads == 0U ||
-        spec->head_dim == 0U || spec->head_dim > 256U || (spec->n_heads % spec->n_kv_heads) != 0U ||
-        spec->max_ctx == 0U || x.dims[0] > (size_t)spec->max_ctx ||
-        velri_dtype_bytes(spec->dtype) == 0U || !spec->o_name || spec->o_name[0] == '\0') {
+        spec->head_dim == 0U || spec->head_dim > VELRI_ATTN_MAX_HEAD_DIM ||
+        (spec->n_heads % spec->n_kv_heads) != 0U || spec->max_ctx == 0U ||
+        x.dims[0] > (size_t)spec->max_ctx || velri_dtype_bytes(spec->dtype) == 0U ||
+        !spec->o_name || spec->o_name[0] == '\0') {
         velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
+        return false;
     }
     if (spec->scale != 0.0f && (!(spec->scale > 0.0f) || !isfinite(spec->scale))) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
+        return false;
     }
     if (spec->fused_qkv) {
         if (!spec->qkv_name || spec->qkv_name[0] == '\0') {
             velri_b_set_error(b, VELRI_ERR_INVALID);
-            return VELRI_TENSOR_NONE;
+            return false;
         }
     } else {
         if (!spec->q_name || spec->q_name[0] == '\0' || !spec->k_name || spec->k_name[0] == '\0' ||
             !spec->v_name || spec->v_name[0] == '\0') {
             velri_b_set_error(b, VELRI_ERR_INVALID);
-            return VELRI_TENSOR_NONE;
+            return false;
         }
     }
 
@@ -90,7 +95,7 @@ velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char 
         velri_mul_overflow_size((size_t)spec->n_kv_heads, (size_t)spec->head_dim, &kv_dim) ||
         q_dim > (size_t)UINT32_MAX || kv_dim > (size_t)UINT32_MAX) {
         velri_b_set_error(b, VELRI_ERR_OVERFLOW);
-        return VELRI_TENSOR_NONE;
+        return false;
     }
     size_t qkv_dim = 0U;
     if (spec->fused_qkv) {
@@ -98,8 +103,133 @@ velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char 
         if (velri_mul_overflow_size(2U, kv_dim, &two_kv) ||
             velri_add_overflow_size(q_dim, two_kv, &qkv_dim) || qkv_dim > (size_t)UINT32_MAX) {
             velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+            return false;
+        }
+    }
+
+    *out_q_dim = q_dim;
+    *out_kv_dim = kv_dim;
+    *out_qkv_dim = qkv_dim;
+    return true;
+}
+
+static velri_tensor apply_output_proj(velri_builder *b, velri_tensor attn, const char *prefix,
+                                      const velri_attention_spec *spec, velri_dtype act_dtype,
+                                      size_t d_model, size_t q_dim) {
+    velri_tensor o_w = VELRI_TENSOR_NONE;
+    velri_tensor o_b = VELRI_TENSOR_NONE;
+    if (!make_proj_weights(b, prefix, spec->o_name, spec->dtype, act_dtype, d_model, q_dim,
+                           spec->has_bias, &o_w, &o_b)) {
+        return VELRI_TENSOR_NONE;
+    }
+    return velri_b_linear(b, attn, o_w, o_b);
+}
+
+velri_tensor velri_block_latent_attention(velri_builder *b, velri_tensor x, velri_tensor h_lat,
+                                          const char *prefix, const velri_attention_spec *spec) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+
+    size_t q_dim = 0U, kv_dim = 0U, qkv_dim = 0U;
+    if (!validate_attention_common(b, x, spec, &q_dim, &kv_dim, &qkv_dim)) {
+        return VELRI_TENSOR_NONE;
+    }
+    if (!h_lat.valid || h_lat.rank != 2U || h_lat.dims[0] != x.dims[0] || h_lat.dims[1] == 0U) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    if (h_lat.dims[1] > VELRI_LATENT_ATTN_MAX_DLAT) {
+        velri_b_set_error(b, VELRI_ERR_UNSUPPORTED);
+        return VELRI_TENSOR_NONE;
+    }
+    /* Fused [Q|K|V] projection expects a single shared input tensor (`h_lat == x`). */
+    if (spec->fused_qkv && (h_lat.storage_id != x.storage_id || h_lat.view_id != x.view_id)) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+
+    if (spec->scope) {
+        velri_b_push_scope(b, spec->scope);
+        if (b->err != VELRI_OK) {
             return VELRI_TENSOR_NONE;
         }
+    }
+
+    size_t d_model = x.dims[1];
+    size_t d_lat = h_lat.dims[1];
+    velri_dtype act_dtype =
+        (x.dtype == VELRI_DTYPE_F64 && spec->dtype == VELRI_DTYPE_F64) ? VELRI_DTYPE_F64
+                                                                       : VELRI_DTYPE_F32;
+
+    velri_tensor q = VELRI_TENSOR_NONE;
+    velri_tensor w_k = VELRI_TENSOR_NONE;
+    velri_tensor w_v = VELRI_TENSOR_NONE;
+    velri_tensor b_v = VELRI_TENSOR_NONE;
+
+    if (spec->fused_qkv) {
+        /* Standard fused [Q | K | V] row-concatenated projection: slice W_Q, W_K, W_V zero-copy.
+         * Key bias b_K is omitted by exact softmax shift invariance (q . b_K is key-independent). */
+        velri_tensor qkv_w = VELRI_TENSOR_NONE;
+        velri_tensor qkv_b = VELRI_TENSOR_NONE;
+        if (!make_proj_weights(b, prefix, spec->qkv_name, spec->dtype, act_dtype, qkv_dim, d_model,
+                               spec->has_bias, &qkv_w, &qkv_b)) {
+            return VELRI_TENSOR_NONE;
+        }
+        velri_tensor w_q = velri_b_subview_2d_rows(b, qkv_w, 0U, q_dim);
+        w_k = velri_b_subview_2d_rows(b, qkv_w, q_dim, kv_dim);
+        w_v = velri_b_subview_2d_rows(b, qkv_w, q_dim + kv_dim, kv_dim);
+        velri_tensor b_q = VELRI_TENSOR_NONE;
+        if (spec->has_bias) {
+            b_q = velri_b_subview_1d(b, qkv_b, 0U, q_dim);
+            b_v = velri_b_subview_1d(b, qkv_b, q_dim + kv_dim, kv_dim);
+        }
+        q = velri_b_linear(b, x, w_q, b_q);
+    } else {
+        /* Split Q / K / V (also supports compressed MLA where d_lat != d_model). */
+        velri_tensor q_w = VELRI_TENSOR_NONE;
+        velri_tensor q_b = VELRI_TENSOR_NONE;
+        if (!make_proj_weights(b, prefix, spec->q_name, spec->dtype, act_dtype, q_dim, d_model,
+                               spec->has_bias, &q_w, &q_b) ||
+            !make_proj_weights(b, prefix, spec->k_name, spec->dtype, act_dtype, kv_dim, d_lat,
+                               false, &w_k, nullptr) ||
+            !make_proj_weights(b, prefix, spec->v_name, spec->dtype, act_dtype, kv_dim, d_lat,
+                               spec->has_bias, &w_v, &b_v)) {
+            return VELRI_TENSOR_NONE;
+        }
+        q = velri_b_linear(b, x, q_w, q_b);
+    }
+
+    char h_cache_name[VELRI_MANIFEST_NAME_MAX];
+    if (!format_tensor_name(b, h_cache_name, prefix, "attn.h_cache", nullptr)) {
+        return VELRI_TENSOR_NONE;
+    }
+    const size_t dim_h[2] = {spec->max_ctx, d_lat};
+    velri_tensor h_cache = velri_b_state(b, h_cache_name, h_lat.dtype, 2U, dim_h);
+
+    velri_tensor attn = velri_b_latent_attention(b, q, h_lat, w_k, w_v, b_v, h_cache, spec->n_heads,
+                                                 spec->n_kv_heads, spec->head_dim, spec->scale,
+                                                 spec->sliding_window, spec->causal);
+    velri_tensor out = apply_output_proj(b, attn, prefix, spec, act_dtype, d_model, q_dim);
+
+    if (spec->scope) {
+        velri_b_pop_scope(b);
+    }
+    return (b->err == VELRI_OK) ? out : VELRI_TENSOR_NONE;
+}
+
+velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char *prefix,
+                                   const velri_attention_spec *spec) {
+    if (!b || b->err != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    if (spec && spec->latent_kv) {
+        return velri_block_latent_attention(b, x, x, prefix, spec);
+    }
+
+    size_t q_dim = 0U, kv_dim = 0U, qkv_dim = 0U;
+    if (!validate_attention_common(b, x, spec, &q_dim, &kv_dim, &qkv_dim)) {
+        return VELRI_TENSOR_NONE;
     }
 
     if (spec->scope) {
@@ -130,12 +260,9 @@ velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char 
         k = velri_b_subview_2d_cols(b, qkv, q_dim, kv_dim);
         v = velri_b_subview_2d_cols(b, qkv, q_dim + kv_dim, kv_dim);
     } else {
-        velri_tensor q_w = VELRI_TENSOR_NONE;
-        velri_tensor q_b = VELRI_TENSOR_NONE;
-        velri_tensor k_w = VELRI_TENSOR_NONE;
-        velri_tensor k_b = VELRI_TENSOR_NONE;
-        velri_tensor v_w = VELRI_TENSOR_NONE;
-        velri_tensor v_b = VELRI_TENSOR_NONE;
+        velri_tensor q_w = VELRI_TENSOR_NONE, q_b = VELRI_TENSOR_NONE;
+        velri_tensor k_w = VELRI_TENSOR_NONE, k_b = VELRI_TENSOR_NONE;
+        velri_tensor v_w = VELRI_TENSOR_NONE, v_b = VELRI_TENSOR_NONE;
         if (!make_proj_weights(b, prefix, spec->q_name, spec->dtype, act_dtype, q_dim, d_model,
                                spec->has_bias, &q_w, &q_b) ||
             !make_proj_weights(b, prefix, spec->k_name, spec->dtype, act_dtype, kv_dim, d_model,
@@ -163,18 +290,10 @@ velri_tensor velri_block_attention(velri_builder *b, velri_tensor x, const char 
     velri_tensor attn = velri_b_attention(b, q, k, v, k_cache, v_cache, spec->n_heads,
                                           spec->n_kv_heads, spec->head_dim, spec->scale,
                                           spec->sliding_window, spec->causal);
-
-    velri_tensor o_w = VELRI_TENSOR_NONE;
-    velri_tensor o_b = VELRI_TENSOR_NONE;
-    if (!make_proj_weights(b, prefix, spec->o_name, spec->dtype, act_dtype, d_model, q_dim,
-                           spec->has_bias, &o_w, &o_b)) {
-        return VELRI_TENSOR_NONE;
-    }
-    velri_tensor out = velri_b_linear(b, attn, o_w, o_b);
+    velri_tensor out = apply_output_proj(b, attn, prefix, spec, act_dtype, d_model, q_dim);
 
     if (spec->scope) {
         velri_b_pop_scope(b);
     }
-
     return (b->err == VELRI_OK) ? out : VELRI_TENSOR_NONE;
 }

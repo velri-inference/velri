@@ -372,6 +372,8 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/attention.slang|vk_kv_append_f32"
         "${_vk}/attention.slang|vk_attention_decode_f32"
         "${_vk}/attention.slang|vk_attention_prefill_f32"
+        "${_vk}/attention.slang|vk_latent_append_f32"
+        "${_vk}/attention.slang|vk_latent_attention_f32"
     )
     velri_compile_vk_shaders(VELRI_VK_SHADER_HEADER
         "${VELRI_SLANG_GEN_DIR}/spv"
