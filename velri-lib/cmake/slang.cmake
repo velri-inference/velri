@@ -32,10 +32,6 @@ set(VELRI_SLANG_COMMON_DEPS
     "${VELRI_SLANG_DIR}/ops/linear_cpu.slang"
 )
 
-if(NOT WIN32)
-    find_package(Threads REQUIRED)
-endif()
-
 set(_velri_obj_ext "${CMAKE_C_OUTPUT_EXTENSION}")
 if(NOT _velri_obj_ext)
     if(WIN32)
@@ -274,8 +270,6 @@ if(VELRI_X86_VARIANTS)
 endif()
 
 add_library(velri_cpu STATIC
-    src/platform/cpu_caps.c
-    src/platform/pool.c
     src/backend/cpu/slang_cpu_dispatch.c
     ${VELRI_SLANG_CPU_OBJS}
 )
@@ -292,9 +286,7 @@ target_include_directories(velri_cpu PUBLIC
 target_compile_definitions(velri_cpu PRIVATE VELRI_X86_VARIANTS=${VELRI_X86_VARIANTS})
 target_compile_options(velri_cpu PRIVATE ${VELRI_BASE_FLAGS})
 velri_strict_target(velri_cpu)
-if(NOT WIN32)
-    target_link_libraries(velri_cpu PUBLIC Threads::Threads)
-endif()
+target_link_libraries(velri_cpu PUBLIC velri_platform)
 if(UNIX)
     target_link_libraries(velri_cpu PRIVATE m)
 endif()
@@ -309,6 +301,7 @@ if(VELRI_LIB_BUILD_TESTS OR VELRI_ENABLE_VULKAN)
         target_compile_options(velri_typed_reference PRIVATE ${VELRI_BASE_FLAGS} -ffp-contract=off)
     endif()
     velri_strict_target(velri_typed_reference)
+    target_link_libraries(velri_typed_reference PRIVATE velri_platform)
     if(UNIX)
         target_link_libraries(velri_typed_reference PUBLIC m)
     endif()
@@ -455,9 +448,6 @@ if(VELRI_ENABLE_VULKAN)
     target_compile_options(velri_vulkan PRIVATE ${VELRI_BASE_FLAGS})
     velri_strict_target(velri_vulkan)
     target_link_libraries(velri_vulkan PUBLIC velri_cpu)
-    if(NOT WIN32)
-        target_link_libraries(velri_vulkan PRIVATE ${CMAKE_DL_LIBS})
-    endif()
 
     if(VELRI_LIB_BUILD_TESTS)
         add_executable(bench_vulkan tools/bench_vulkan.c)

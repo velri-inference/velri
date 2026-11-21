@@ -94,12 +94,15 @@ function(velri_strict_target target)
     endif()
 endfunction()
 
+# Standalone OS platform library (`VelriLib::platform`: os_posix.c / os_win32.c, cpu_caps, pool)
+include(cmake/platform.cmake)
+
 # Slang AOT CPU kernels (required) + optional Vulkan SPIR-V 1.6 backend
 include(cmake/slang.cmake)
 
-# Install CMake package exporting VelriLib::cpu (and VelriLib::vulkan when enabled)
+# Install CMake package exporting VelriLib::platform, VelriLib::cpu (and VelriLib::vulkan when enabled)
 include(CMakePackageConfigHelpers)
-set(_velri_install_targets velri_cpu)
+set(_velri_install_targets velri_platform velri_cpu)
 if(VELRI_ENABLE_VULKAN)
     list(APPEND _velri_install_targets velri_vulkan)
 endif()

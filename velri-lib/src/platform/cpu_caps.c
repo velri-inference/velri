@@ -1,22 +1,6 @@
-#if defined(_WIN32)
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0601
-#endif
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#define _GNU_SOURCE
-#if defined(__unix__) || defined(__APPLE__)
-#include <unistd.h>
-#endif
-#endif
-
+#include "os.h"
 #include "velri_lib/types.h"
 #include <stdatomic.h>
-#if defined(__linux__)
-#include <stdio.h>
-#include <sched.h>
-#endif
 
 #if defined(__x86_64__) || defined(_M_X64)
 #if defined(_MSC_VER)
@@ -71,185 +55,103 @@ static uint64_t read_xcr0(void) {
     return ((uint64_t)edx << 32) | eax;
 #endif
 }
-#endif
 
-static inline void cpu_caps_relax(void) {
-#if defined(_WIN32)
-    YieldProcessor();
-#elif defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__)
-    __asm__ volatile("yield");
+static void detect_x86_features(velri_cpu_info *info) {
+    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+    unsigned int max_leaf = 0;
+#if defined(_MSC_VER)
+    int r0[4] = {0};
+    __cpuid(r0, 0);
+    max_leaf = (unsigned int)r0[0];
+    if (max_leaf < 1) {
+        return;
+    }
+    int r1[4] = {0};
+    __cpuid(r1, 1);
+    ecx = (unsigned int)r1[2];
+    (void)eax; (void)ebx; (void)edx;
+#else
+    max_leaf = __get_cpuid_max(0, nullptr);
+    if (max_leaf < 1 || !__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+        return;
+    }
 #endif
+    bool osxsave = (ecx & (1U << 27)) != 0;
+    uint64_t xcr0 = osxsave ? read_xcr0() : 0;
+    bool ymm_os = (xcr0 & 0x6ULL) == 0x6ULL;
+    bool zmm_os = (xcr0 & 0xE6ULL) == 0xE6ULL;
+
+    if (ymm_os) {
+        info->has_fma = (ecx & (1U << 12)) != 0;
+        info->has_f16c = (ecx & (1U << 29)) != 0;
+    }
+    if (max_leaf < 7) {
+        return;
+    }
+
+#if defined(_MSC_VER)
+    int r7[4] = {0};
+    __cpuidex(r7, 7, 0);
+    ebx = (unsigned int)r7[1];
+    ecx = (unsigned int)r7[2];
+#else
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        return;
+    }
+#endif
+    if (ymm_os) {
+        info->has_avx2 = (ebx & (1U << 5)) != 0;
+    }
+    if (zmm_os) {
+        info->has_avx512f = (ebx & (1U << 16)) != 0;
+        info->has_avx512dq = (ebx & (1U << 17)) != 0;
+        info->has_avx512bw = (ebx & (1U << 30)) != 0;
+        info->has_avx512vl = (ebx & (1U << 31)) != 0;
+        info->has_avx512_vnni = (ecx & (1U << 11)) != 0;
+    }
+
+    unsigned int a1 = 0, b1 = 0, c1 = 0, d1 = 0;
+#if defined(_MSC_VER)
+    int r71[4] = {0};
+    __cpuidex(r71, 7, 1);
+    a1 = (unsigned int)r71[0];
+    (void)b1; (void)c1; (void)d1;
+#else
+    if (!__get_cpuid_count(7, 1, &a1, &b1, &c1, &d1)) {
+        return;
+    }
+#endif
+    if (ymm_os) {
+        info->has_avx_vnni = (a1 & (1U << 4)) != 0;
+    }
+    if (zmm_os && info->has_avx512f && info->has_avx512bw && info->has_avx512vl) {
+        info->has_avx512_bf16 = (a1 & (1U << 5)) != 0;
+    }
 }
+#endif
 
 static velri_cpu_info g_info;
-#if defined(__linux__)
-static uint8_t g_cpu_l3_domain[1024];
-#endif
 static size_t g_l3_domain_bytes = 16ULL * 1024ULL * 1024ULL;
 static atomic_int g_init_state = 0; /* 0 = uninit, 1 = busy, 2 = ready */
 
 static void init_cpu_info_once(void) {
-    int st = atomic_load_explicit(&g_init_state, memory_order_acquire);
-    if (st == 2) {
+    if (atomic_load_explicit(&g_init_state, memory_order_acquire) == 2) {
         return;
     }
     int expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&g_init_state, &expected, 1, memory_order_acq_rel,
                                                  memory_order_acquire)) {
         while (atomic_load_explicit(&g_init_state, memory_order_acquire) != 2) {
-            cpu_caps_relax();
+            velri_os_cpu_relax();
         }
         return;
     }
 
     velri_cpu_info info = {0};
-
-#if defined(_WIN32)
-    DWORD nproc = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    if (nproc == 0) {
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        nproc = si.dwNumberOfProcessors;
-    }
-    info.hardware_threads = (nproc > 0 && nproc < 65536) ? (int)nproc : 1;
-#elif defined(_SC_NPROCESSORS_ONLN)
-    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
-    info.hardware_threads = (nproc > 0 && nproc < 65536) ? (int)nproc : 1;
-#else
-    info.hardware_threads = 1;
-#endif
-    info.num_l3_domains = 1;
-#if defined(__linux__)
-    {
-        int seen_l3[256];
-        int seen_cnt = 0;
-        int limit = info.hardware_threads < 1024 ? info.hardware_threads : 1024;
-        for (int cpu = 0; cpu < limit; ++cpu) {
-            char path[128];
-            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cache/index3/id", cpu);
-            FILE *f = fopen(path, "r");
-            if (!f) {
-                continue;
-            }
-            int id = -1;
-            bool ok = (fscanf(f, "%d", &id) == 1 && id >= 0);
-            fclose(f);
-            if (!ok) {
-                continue;
-            }
-            int dom_idx = -1;
-            for (int i = 0; i < seen_cnt; ++i) {
-                if (seen_l3[i] == id) {
-                    dom_idx = i;
-                    break;
-                }
-            }
-            if (dom_idx < 0 && seen_cnt < 256) {
-                dom_idx = seen_cnt;
-                seen_l3[seen_cnt++] = id;
-            }
-            if (dom_idx >= 0) {
-                g_cpu_l3_domain[cpu] = (uint8_t)dom_idx;
-            }
-        }
-        if (seen_cnt > 1) {
-            info.num_l3_domains = seen_cnt;
-        }
-        FILE *fsz = fopen("/sys/devices/system/cpu/cpu0/cache/index3/size", "r");
-        if (fsz) {
-            unsigned long val = 0;
-            char unit = '\0';
-            if (fscanf(fsz, "%lu%c", &val, &unit) >= 1 && val > 0) {
-                size_t mult = 1;
-                if (unit == 'K' || unit == 'k') {
-                    mult = 1024ULL;
-                } else if (unit == 'M' || unit == 'm') {
-                    mult = 1024ULL * 1024ULL;
-                } else if (unit == 'G' || unit == 'g') {
-                    mult = 1024ULL * 1024ULL * 1024ULL;
-                }
-                if (val * mult >= 1024ULL * 1024ULL) {
-                    g_l3_domain_bytes = (size_t)val * mult;
-                }
-            }
-            fclose(fsz);
-        }
-    }
-#endif
-
+    info.hardware_threads = velri_os_hardware_threads();
+    velri_os_detect_l3(info.hardware_threads, &info.num_l3_domains, &g_l3_domain_bytes);
 #if defined(__x86_64__) || defined(_M_X64)
-    unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
-    unsigned int max_leaf = 0;
-#if defined(_MSC_VER)
-    {
-        int r0[4] = {0};
-        __cpuid(r0, 0);
-        max_leaf = (unsigned int)r0[0];
-    }
-    if (max_leaf >= 1) {
-        int r1[4] = {0};
-        __cpuid(r1, 1);
-        eax = (unsigned int)r1[0];
-        ebx = (unsigned int)r1[1];
-        ecx = (unsigned int)r1[2];
-        edx = (unsigned int)r1[3];
-        (void)eax; (void)ebx; (void)edx;
-#else
-    max_leaf = __get_cpuid_max(0, nullptr);
-    if (max_leaf >= 1 && __get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-#endif
-        bool osxsave = (ecx & (1U << 27)) != 0;
-        uint64_t xcr0 = osxsave ? read_xcr0() : 0;
-        bool ymm_os = (xcr0 & 0x6ULL) == 0x6ULL;
-        bool zmm_os = (xcr0 & 0xE6ULL) == 0xE6ULL;
-
-        if (ymm_os) {
-            info.has_fma = (ecx & (1U << 12)) != 0;
-            info.has_f16c = (ecx & (1U << 29)) != 0;
-        }
-#if defined(_MSC_VER)
-        if (max_leaf >= 7) {
-            int r7[4] = {0};
-            __cpuidex(r7, 7, 0);
-            ebx = (unsigned int)r7[1];
-            ecx = (unsigned int)r7[2];
-#else
-        if (max_leaf >= 7 && __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-#endif
-            if (ymm_os) {
-                info.has_avx2 = (ebx & (1U << 5)) != 0;
-            }
-            if (zmm_os) {
-                info.has_avx512f = (ebx & (1U << 16)) != 0;
-                info.has_avx512dq = (ebx & (1U << 17)) != 0;
-                info.has_avx512bw = (ebx & (1U << 30)) != 0;
-                info.has_avx512vl = (ebx & (1U << 31)) != 0;
-                info.has_avx512_vnni = (ecx & (1U << 11)) != 0;
-            }
-            unsigned int a1 = 0, b1 = 0, c1 = 0, d1 = 0;
-#if defined(_MSC_VER)
-            {
-                int r71[4] = {0};
-                __cpuidex(r71, 7, 1);
-                a1 = (unsigned int)r71[0];
-                b1 = (unsigned int)r71[1];
-                c1 = (unsigned int)r71[2];
-                d1 = (unsigned int)r71[3];
-                (void)b1; (void)c1; (void)d1;
-#else
-            if (__get_cpuid_count(7, 1, &a1, &b1, &c1, &d1)) {
-#endif
-                if (ymm_os) {
-                    info.has_avx_vnni = (a1 & (1U << 4)) != 0;
-                }
-                if (zmm_os && info.has_avx512f && info.has_avx512bw && info.has_avx512vl) {
-                    info.has_avx512_bf16 = (a1 & (1U << 5)) != 0;
-                }
-            }
-        }
-    }
+    detect_x86_features(&info);
 #endif
 
     g_info = info;
@@ -266,13 +168,7 @@ int velri_current_l3_domain(void) {
     if (g_info.num_l3_domains <= 1) {
         return 0;
     }
-#if defined(__linux__)
-    int cpu = sched_getcpu();
-    if (cpu >= 0 && (size_t)cpu < sizeof(g_cpu_l3_domain)) {
-        return (int)g_cpu_l3_domain[cpu];
-    }
-#endif
-    return -1;
+    return velri_os_current_l3_domain();
 }
 
 size_t velri_l3_domain_bytes(void) {

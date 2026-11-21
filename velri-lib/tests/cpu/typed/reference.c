@@ -1,9 +1,4 @@
-#if defined(__linux__) || defined(__unix__)
-#define _GNU_SOURCE
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
-
+#include "os.h"
 #include "reference.h"
 #include <float.h>
 #include <math.h>
@@ -11,47 +6,16 @@
 #include <string.h>
 
 velri_guard_buf velri_guard_alloc(size_t bytes, size_t align) {
-    velri_guard_buf gb = {0};
-    if (align == 0) {
-        align = 1;
-    }
-#if defined(__linux__) || defined(__unix__)
-    size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    size_t need = ((bytes + align + page - 1) / page) * page;
-    if (need == 0) {
-        need = page;
-    }
-    size_t total = need + page;
-    uint8_t *base =
-        (uint8_t *)mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (base == MAP_FAILED) {
-        abort();
-    }
-    if (mprotect(base + need, page, PROT_NONE) != 0) {
-        abort();
-    }
-    uintptr_t end_addr = (uintptr_t)(base + need);
-    uintptr_t start_addr = (end_addr - bytes) & ~(uintptr_t)(align - 1);
-    gb.raw_map = base;
-    gb.map_bytes = total;
-    gb.ptr = (void *)start_addr;
-#else
-    gb.raw_map = malloc(bytes + align);
-    uintptr_t u = ((uintptr_t)gb.raw_map + align - 1) & ~(uintptr_t)(align - 1);
-    gb.ptr = (void *)u;
-#endif
-    return gb;
+    velri_os_guard_buf g = velri_os_guard_alloc(bytes, align);
+    return (velri_guard_buf){.raw_map = g.raw_map, .map_bytes = g.map_bytes, .ptr = g.ptr};
 }
 
 void velri_guard_free(velri_guard_buf *gb) {
-    if (!gb || !gb->raw_map) {
+    if (!gb) {
         return;
     }
-#if defined(__linux__) || defined(__unix__)
-    (void)munmap(gb->raw_map, gb->map_bytes);
-#else
-    free(gb->raw_map);
-#endif
+    velri_os_guard_buf g = {.raw_map = gb->raw_map, .map_bytes = gb->map_bytes, .ptr = gb->ptr};
+    velri_os_guard_free(&g);
     gb->raw_map = nullptr;
     gb->ptr = nullptr;
     gb->map_bytes = 0;

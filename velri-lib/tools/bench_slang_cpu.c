@@ -1,15 +1,4 @@
-#if defined(_WIN32)
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0601
-#endif
-#define WIN32_LEAN_AND_MEAN
-#include <malloc.h>
-#include <windows.h>
-#else
-#define _POSIX_C_SOURCE 200809L
-#include <time.h>
-#endif
-
+#include "os.h"
 #include "velri_lib/kernels.h"
 #include "velri_lib/slang_cpu.h"
 #include "reference.h"
@@ -37,42 +26,15 @@ static void check_ok(velri_status st, const char *ctx) {
 
 static void *xalloc(size_t bytes) {
     size_t sz = bytes ? ((bytes + 63u) & ~(size_t)63u) : 64u;
-#if defined(_WIN32)
-    void *p = _aligned_malloc(sz, 64);
-#else
-    void *p = nullptr;
-    if (posix_memalign(&p, 64, sz) != 0) p = nullptr;
-#endif
+    void *p = velri_os_aligned_alloc(64u, sz);
     if (!p) die("aligned allocation failed");
     memset(p, 0, sz);
     return p;
 }
 
-static void xfree(void *p) {
-#if defined(_WIN32)
-    _aligned_free(p);
-#else
-    free(p);
-#endif
-}
+static void xfree(void *p) { velri_os_aligned_free(p); }
 
-static double now_sec(void) {
-#if defined(_WIN32)
-    static double inv_freq = 0.0;
-    if (inv_freq == 0.0) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        inv_freq = (f.QuadPart > 0) ? (1.0 / (double)f.QuadPart) : 1.0;
-    }
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    return (double)c.QuadPart * inv_freq;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-#endif
-}
+static double now_sec(void) { return (double)velri_os_monotonic_ns() * 1e-9; }
 
 static int cmp_dbl(const void *a, const void *b) {
     double da = *(const double *)a, db = *(const double *)b;

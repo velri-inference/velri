@@ -1,12 +1,6 @@
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#define _POSIX_C_SOURCE 200809L
-#include <dlfcn.h>
-#endif
 #define VK_NO_PROTOTYPES
 
+#include "os.h"
 #include "velri_lib/vulkan.h"
 #include "velri_vk_shaders.h"
 
@@ -167,7 +161,7 @@ struct velri_vk_buf {
 };
 
 struct velri_vk_ctx {
-    void *dl_handle;
+    velri_os_lib *dl_handle;
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
     PFN_vkCreateInstance vkCreateInstance;
     PFN_vkDestroyInstance vkDestroyInstance;
@@ -374,46 +368,17 @@ velri_status velri_vk_create(velri_vk_ctx **out_ctx) {
     velri_vk_ctx *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) return VELRI_ERR_NOMEM;
 
-#if defined(_WIN32)
-    ctx->dl_handle = (void *)LoadLibraryA("vulkan-1.dll");
+    ctx->dl_handle = velri_os_dlopen_vulkan();
     if (!ctx->dl_handle) {
         velri_vk_destroy(ctx);
         return VELRI_ERR_UNSUPPORTED;
     }
-    FARPROC sym = GetProcAddress((HMODULE)ctx->dl_handle, "vkGetInstanceProcAddr");
+    void *sym = velri_os_dlsym(ctx->dl_handle, "vkGetInstanceProcAddr");
     if (!sym) {
         velri_vk_destroy(ctx);
         return VELRI_ERR_UNSUPPORTED;
     }
     memcpy(&ctx->vkGetInstanceProcAddr, &sym, sizeof(ctx->vkGetInstanceProcAddr));
-#elif defined(__APPLE__)
-    ctx->dl_handle = dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
-    if (!ctx->dl_handle) ctx->dl_handle = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
-    if (!ctx->dl_handle) ctx->dl_handle = dlopen("libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
-    if (!ctx->dl_handle) {
-        velri_vk_destroy(ctx);
-        return VELRI_ERR_UNSUPPORTED;
-    }
-    void *sym = dlsym(ctx->dl_handle, "vkGetInstanceProcAddr");
-    if (!sym) {
-        velri_vk_destroy(ctx);
-        return VELRI_ERR_UNSUPPORTED;
-    }
-    memcpy(&ctx->vkGetInstanceProcAddr, &sym, sizeof(ctx->vkGetInstanceProcAddr));
-#else
-    ctx->dl_handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!ctx->dl_handle) ctx->dl_handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
-    if (!ctx->dl_handle) {
-        velri_vk_destroy(ctx);
-        return VELRI_ERR_UNSUPPORTED;
-    }
-    void *sym = dlsym(ctx->dl_handle, "vkGetInstanceProcAddr");
-    if (!sym) {
-        velri_vk_destroy(ctx);
-        return VELRI_ERR_UNSUPPORTED;
-    }
-    memcpy(&ctx->vkGetInstanceProcAddr, &sym, sizeof(ctx->vkGetInstanceProcAddr));
-#endif
 
     PFN_vkVoidFunction p_create_inst = ctx->vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
     memcpy(&ctx->vkCreateInstance, &p_create_inst, sizeof(ctx->vkCreateInstance));
@@ -886,11 +851,7 @@ void velri_vk_destroy(velri_vk_ctx *ctx) {
         ctx->vkDestroyDevice(ctx->device, nullptr);
     }
     if (ctx->instance) ctx->vkDestroyInstance(ctx->instance, nullptr);
-#if defined(_WIN32)
-    if (ctx->dl_handle) FreeLibrary((HMODULE)ctx->dl_handle);
-#else
-    if (ctx->dl_handle) dlclose(ctx->dl_handle);
-#endif
+    velri_os_dlclose(ctx->dl_handle);
     free(ctx);
 }
 

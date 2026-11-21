@@ -1,11 +1,4 @@
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <malloc.h>
-#include <windows.h>
-#else
-#define _POSIX_C_SOURCE 200809L
-#endif
-
+#include "os.h"
 #include "velri_lib/kernels.h"
 #include "velri_lib/vulkan.h"
 #include "reference.h"
@@ -29,24 +22,13 @@ static void check_ok(velri_status st, const char *ctx) {
 
 static void *xalloc(size_t bytes) {
     size_t sz = bytes ? ((bytes + 63u) & ~(size_t)63u) : 64u;
-#if defined(_WIN32)
-    void *p = _aligned_malloc(sz, 64);
-#else
-    void *p = nullptr;
-    if (posix_memalign(&p, 64, sz) != 0) p = nullptr;
-#endif
+    void *p = velri_os_aligned_alloc(64u, sz);
     if (!p) die("aligned allocation failed");
     memset(p, 0, sz);
     return p;
 }
 
-static void xfree(void *p) {
-#if defined(_WIN32)
-    _aligned_free(p);
-#else
-    free(p);
-#endif
-}
+static void xfree(void *p) { velri_os_aligned_free(p); }
 
 static void fill_dtype(velri_dtype dt, void *buf, size_t n, uint64_t *rng, float scale) {
     if (dt == VELRI_DTYPE_F32) {

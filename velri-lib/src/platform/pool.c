@@ -1,104 +1,22 @@
-#if defined(_WIN32)
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0601
-#endif
-#define WIN32_LEAN_AND_MEAN
-#include <malloc.h>
-#include <windows.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#endif
-#else
-#define _POSIX_C_SOURCE 200809L
-#include <pthread.h>
-#include <time.h>
-#endif
-
+#include "os.h"
 #include "velri_lib/pool.h"
 #include <stdatomic.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
-static inline void cpu_relax(void) {
-#if defined(_WIN32)
-    YieldProcessor();
-#elif defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__)
-    __asm__ volatile("yield");
-#else
-    /* no-op */
-#endif
-}
-
-static inline size_t ctz64(uint64_t x) {
-#if defined(_MSC_VER)
-    unsigned long idx = 0;
-    _BitScanForward64(&idx, x);
-    return (size_t)idx;
-#else
-    return (size_t)__builtin_ctzll(x);
-#endif
-}
-
-static inline void *aligned_alloc64(size_t bytes) {
-    size_t sz = bytes ? ((bytes + 63ULL) & ~63ULL) : 64ULL;
-#if defined(_WIN32)
-    return _aligned_malloc(sz, 64);
-#else
-    void *p = nullptr;
-    if (posix_memalign(&p, 64, sz) != 0) {
-        return nullptr;
-    }
-    return p;
-#endif
-}
-
-static inline void aligned_free64(void *p) {
-#if defined(_WIN32)
-    _aligned_free(p);
-#else
-    free(p);
-#endif
-}
-
-static inline uint64_t monotonic_ns(void) {
-#if defined(_WIN32)
-    static _Atomic uint64_t g_qpf = 0;
-    uint64_t freq = atomic_load_explicit(&g_qpf, memory_order_relaxed);
-    if (freq == 0) {
-        LARGE_INTEGER f;
-        QueryPerformanceFrequency(&f);
-        freq = (f.QuadPart > 0) ? (uint64_t)f.QuadPart : UINT64_C(1);
-        atomic_store_explicit(&g_qpf, freq, memory_order_relaxed);
-    }
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    uint64_t q = (uint64_t)c.QuadPart;
-    return (q / freq) * UINT64_C(1000000000) + ((q % freq) * UINT64_C(1000000000)) / freq;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
-#endif
-}
+/*
+ * Persistent low-latency worker pool (100% OS-agnostic C23; all OS primitives
+ * live in `velri_platform` via `os.h`).
+ */
 
 typedef struct {
     alignas(64) _Atomic uint64_t done_gen;
     size_t worker_id;
     void *scratch;
     velri_pool *pool;
-#if defined(_WIN32)
-    HANDLE thread;
-    CRITICAL_SECTION mtx;
-    CONDITION_VARIABLE cv;
-#else
-    pthread_t thread;
-    pthread_mutex_t mtx;
-    pthread_cond_t cv;
-#endif
-    bool sync_ready;
+    velri_os_thread *thread;
+    velri_os_mutex *mtx;
+    velri_os_cond *cv;
 } velri_worker_slot;
 
 struct velri_pool {
@@ -114,75 +32,16 @@ struct velri_pool {
     velri_worker_slot *slots;
 };
 
-static inline bool slot_sync_init(velri_worker_slot *slot) {
-#if defined(_WIN32)
-    InitializeCriticalSection(&slot->mtx);
-    InitializeConditionVariable(&slot->cv);
-    slot->sync_ready = true;
-    return true;
-#else
-    if (pthread_mutex_init(&slot->mtx, nullptr) != 0) {
-        return false;
-    }
-    if (pthread_cond_init(&slot->cv, nullptr) != 0) {
-        pthread_mutex_destroy(&slot->mtx);
-        return false;
-    }
-    slot->sync_ready = true;
-    return true;
-#endif
-}
-
-static inline void slot_sync_destroy(velri_worker_slot *slot) {
-    if (!slot->sync_ready) {
-        return;
-    }
-#if defined(_WIN32)
-    DeleteCriticalSection(&slot->mtx);
-#else
-    pthread_cond_destroy(&slot->cv);
-    pthread_mutex_destroy(&slot->mtx);
-#endif
-    slot->sync_ready = false;
-}
-
-static inline void slot_lock(velri_worker_slot *slot) {
-#if defined(_WIN32)
-    EnterCriticalSection(&slot->mtx);
-#else
-    pthread_mutex_lock(&slot->mtx);
-#endif
-}
-
-static inline void slot_unlock(velri_worker_slot *slot) {
-#if defined(_WIN32)
-    LeaveCriticalSection(&slot->mtx);
-#else
-    pthread_mutex_unlock(&slot->mtx);
-#endif
-}
-
-static inline void slot_wait(velri_worker_slot *slot) {
-#if defined(_WIN32)
-    SleepConditionVariableCS(&slot->cv, &slot->mtx, INFINITE);
-#else
-    pthread_cond_wait(&slot->cv, &slot->mtx);
-#endif
-}
-
 static void signal_worker_slot(velri_worker_slot *slot) {
-    if (slot->sync_ready) {
-        slot_lock(slot);
-#if defined(_WIN32)
-        WakeConditionVariable(&slot->cv);
-#else
-        pthread_cond_signal(&slot->cv);
-#endif
-        slot_unlock(slot);
+    if (slot->mtx && slot->cv) {
+        velri_os_mutex_lock(slot->mtx);
+        velri_os_cond_signal(slot->cv);
+        velri_os_mutex_unlock(slot->mtx);
     }
 }
 
-static void worker_loop(velri_worker_slot *slot) {
+static void worker_loop(void *arg) {
+    velri_worker_slot *slot = (velri_worker_slot *)arg;
     velri_pool *pool = slot->pool;
     const size_t wid = slot->worker_id;
     const size_t mask_idx = wid >> 6;
@@ -200,16 +59,10 @@ static void worker_loop(velri_worker_slot *slot) {
         size_t cnw = (size_t)(word & UINT64_C(0xFFFF));
 
         if (cg == g && wid < cnw) {
-            /*
-             * Keep recently active workers spinning on the shared broadcast line `dispatch_word`
-             * (read-only S state in L1d) for up to 250 ms between back-to-back dispatches so OS
-             * wakeups never pull unpinned workers off distinct physical cores. Inactive workers
-             * (`wid >= cnw`) skip spinning and park immediately.
-             */
-            const uint64_t deadline = monotonic_ns() + UINT64_C(250000000);
+            const uint64_t deadline = velri_os_monotonic_ns() + UINT64_C(250000000);
             do {
                 for (int spin = 0; spin < 2048; ++spin) {
-                    cpu_relax();
+                    velri_os_cpu_relax();
                     word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
                     cg = word >> 16;
                     if (cg != g) {
@@ -221,12 +74,12 @@ static void worker_loop(velri_worker_slot *slot) {
                     atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
                     break;
                 }
-            } while (monotonic_ns() < deadline);
+            } while (velri_os_monotonic_ns() < deadline);
         }
 
         if (cg == g || wid >= cnw) {
             g = cg;
-            slot_lock(slot);
+            velri_os_mutex_lock(slot->mtx);
             atomic_fetch_or_explicit(&pool->parked_mask[mask_idx], mask_bit, memory_order_seq_cst);
             while (!atomic_load_explicit(&pool->stopping, memory_order_acquire)) {
                 word = atomic_load_explicit(&pool->dispatch_word, memory_order_seq_cst);
@@ -236,11 +89,11 @@ static void worker_loop(velri_worker_slot *slot) {
                     break;
                 }
                 g = cg;
-                slot_wait(slot);
+                velri_os_cond_wait(slot->cv, slot->mtx);
             }
             atomic_fetch_and_explicit(&pool->parked_mask[mask_idx], ~mask_bit,
                                       memory_order_relaxed);
-            slot_unlock(slot);
+            velri_os_mutex_unlock(slot->mtx);
         }
 
         if (atomic_load_explicit(&pool->stopping, memory_order_acquire)) {
@@ -254,46 +107,14 @@ static void worker_loop(velri_worker_slot *slot) {
     }
 }
 
-#if defined(_WIN32)
-static DWORD WINAPI worker_entry(LPVOID arg) {
-    worker_loop((velri_worker_slot *)arg);
-    return 0;
-}
-#else
-static void *worker_entry(void *arg) {
-    worker_loop((velri_worker_slot *)arg);
-    return nullptr;
-}
-#endif
-
-static bool worker_spawn(velri_worker_slot *slot) {
-#if defined(_WIN32)
-    slot->thread = CreateThread(nullptr, 0, worker_entry, slot, 0, nullptr);
-    return slot->thread != nullptr;
-#else
-    return pthread_create(&slot->thread, nullptr, worker_entry, slot) == 0;
-#endif
-}
-
-static void worker_join(velri_worker_slot *slot) {
-#if defined(_WIN32)
-    if (slot->thread) {
-        WaitForSingleObject(slot->thread, INFINITE);
-        CloseHandle(slot->thread);
-        slot->thread = nullptr;
-    }
-#else
-    (void)pthread_join(slot->thread, nullptr);
-#endif
-}
-
 static void free_pool_slots(velri_pool *pool, size_t count) {
     for (size_t j = 0; j < count; ++j) {
-        slot_sync_destroy(&pool->slots[j]);
-        aligned_free64(pool->slots[j].scratch);
+        velri_os_cond_destroy(pool->slots[j].cv);
+        velri_os_mutex_destroy(pool->slots[j].mtx);
+        velri_os_aligned_free(pool->slots[j].scratch);
     }
-    aligned_free64(pool->slots);
-    aligned_free64(pool);
+    velri_os_aligned_free(pool->slots);
+    velri_os_aligned_free(pool);
 }
 
 velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
@@ -306,7 +127,7 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
         return VELRI_ERR_OVERFLOW;
     }
 
-    velri_pool *pool = (velri_pool *)aligned_alloc64(sizeof(velri_pool));
+    velri_pool *pool = (velri_pool *)velri_os_aligned_alloc(64, sizeof(velri_pool));
     if (!pool) {
         return VELRI_ERR_NOMEM;
     }
@@ -321,9 +142,10 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
         atomic_init(&pool->parked_mask[m], UINT64_C(0));
     }
 
-    pool->slots = (velri_worker_slot *)aligned_alloc64(num_workers * sizeof(velri_worker_slot));
+    pool->slots = (velri_worker_slot *)velri_os_aligned_alloc(
+        64, num_workers * sizeof(velri_worker_slot));
     if (!pool->slots) {
-        aligned_free64(pool);
+        velri_os_aligned_free(pool);
         return VELRI_ERR_NOMEM;
     }
     memset(pool->slots, 0, num_workers * sizeof(velri_worker_slot));
@@ -332,12 +154,15 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
         pool->slots[i].worker_id = i;
         pool->slots[i].pool = pool;
         atomic_init(&pool->slots[i].done_gen, UINT64_C(0));
-        if (i > 0 && !slot_sync_init(&pool->slots[i])) {
-            free_pool_slots(pool, i);
-            return VELRI_ERR_NOMEM;
+        if (i > 0) {
+            if (!velri_os_mutex_create(&pool->slots[i].mtx) ||
+                !velri_os_cond_create(&pool->slots[i].cv)) {
+                free_pool_slots(pool, i + 1);
+                return VELRI_ERR_NOMEM;
+            }
         }
         if (pool->scratch_bytes > 0) {
-            pool->slots[i].scratch = aligned_alloc64(pool->scratch_bytes);
+            pool->slots[i].scratch = velri_os_aligned_alloc(64, pool->scratch_bytes);
             if (!pool->slots[i].scratch) {
                 free_pool_slots(pool, i + 1);
                 return VELRI_ERR_NOMEM;
@@ -351,7 +176,7 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
     atomic_store_explicit(&pool->slots[0].done_gen, UINT64_C(1), memory_order_release);
 
     for (size_t i = 1; i < num_workers; ++i) {
-        if (!worker_spawn(&pool->slots[i])) {
+        if (!velri_os_thread_spawn(&pool->slots[i].thread, worker_loop, &pool->slots[i])) {
             atomic_store_explicit(&pool->stopping, true, memory_order_seq_cst);
             uint64_t next_gen = ++pool->host_gen;
             atomic_store_explicit(&pool->dispatch_word, (next_gen << 16) | (uint64_t)num_workers,
@@ -360,7 +185,7 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
                 signal_worker_slot(&pool->slots[j]);
             }
             for (size_t j = 1; j < i; ++j) {
-                worker_join(&pool->slots[j]);
+                velri_os_thread_join(pool->slots[j].thread);
             }
             free_pool_slots(pool, num_workers);
             return VELRI_ERR_NOMEM;
@@ -370,7 +195,7 @@ velri_status velri_pool_create(size_t num_workers, size_t scratch_per_worker,
     for (size_t i = 1; i < num_workers; ++i) {
         while (atomic_load_explicit(&pool->slots[i].done_gen, memory_order_acquire) !=
                UINT64_C(1)) {
-            cpu_relax();
+            velri_os_cpu_relax();
         }
     }
 
@@ -391,7 +216,7 @@ void velri_pool_destroy(velri_pool *pool) {
             signal_worker_slot(&pool->slots[i]);
         }
         for (size_t i = 1; i < pool->num_workers; ++i) {
-            worker_join(&pool->slots[i]);
+            velri_os_thread_join(pool->slots[i].thread);
         }
     }
     free_pool_slots(pool, pool->num_workers);
@@ -444,7 +269,7 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
         }
         uint64_t pm = atomic_load_explicit(&pool->parked_mask[m], memory_order_relaxed) & valid;
         while (pm != 0) {
-            size_t bit = ctz64(pm);
+            size_t bit = velri_os_ctz64(pm);
             pm &= pm - UINT64_C(1);
             signal_worker_slot(&pool->slots[m * 64ULL + bit]);
         }
@@ -454,7 +279,7 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
 
     for (size_t i = 1; i < nw; ++i) {
         while (atomic_load_explicit(&pool->slots[i].done_gen, memory_order_acquire) != next_gen) {
-            cpu_relax();
+            velri_os_cpu_relax();
         }
     }
 }
