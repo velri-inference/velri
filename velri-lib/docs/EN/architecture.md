@@ -4,7 +4,7 @@
 
 **Velri-lib** is the computation library living in the `velri-lib/` directory of the Velri repository. It provides mathematical operations, a unified kernel system, compute graphs, and device backends behind a common **C23 API** (`include/velri_lib/`). Implementation internals may use **C23 and C++23**; the library builds and runs tests standalone through CMake with no Python or PyTorch dependency.
 
-**Status:** the `VelriLib::core` runtime (`Storage`/`TensorView`, operation graph, liveness memory planner, 6-group backend contract, RAM transfer bus, and independent execution slots), Slang AOT CPU operations (`VelriLib::cpu`, with mandatory build-time `slangc`), and the opt-in Vulkan 1.3 / SPIR-V 1.6 backend (`VelriLib::vulkan`) are implemented and verified today ([kernels.md](kernels.md)). The earlier handwritten C23/SIMD backend is preserved on branch `archive/c23-cpu-legacy`.
+**Status:** the consolidated `VelriLib::velri` library (alias `VelriLib::core`) is implemented and verified today: `Storage`/`TensorView`, operation graph, liveness memory planner, plan-shared weights, device-resident state, Backend Contract v2 with batched async execution, RAM transfer bus, built-in Slang AOT CPU backend (mandatory build-time `slangc`), and opt-in Vulkan 1.3 / SPIR-V 1.6 backend ([kernels.md](kernels.md)). The earlier handwritten C23/SIMD backend is preserved on branch `archive/c23-cpu-legacy`.
 
 ---
 
@@ -22,7 +22,7 @@ Adding a new model block built from supported operations requires no changes to 
 | Mathematical decoding of quantized weight formats | Model file/container I/O, metadata, tokenization, and CLI/HTTP |
 | Operation references, contract tests, and kernel benchmarks | Full-model fixtures, logit verification, and end-to-end benchmarks |
 
-The engine consumes the library strictly through public headers in `include/velri_lib/` and exported CMake targets (`VelriLib::cpu` and future targets). Private headers under `velri-lib/src/` are never exposed.
+The engine consumes the library strictly through public headers in `include/velri_lib/` and the exported CMake target `VelriLib::velri` (alias `VelriLib::core`). Private headers under `velri-lib/src/` are never exposed.
 
 ---
 
@@ -113,13 +113,13 @@ Input storage, weight storage, accumulator, and output dtypes are specified inde
 
 | Directory | Status | Purpose |
 | :--- | :--- | :--- |
-| `include/velri_lib/` | Implemented (`velri_lib.h`, `tensor.h`, `backend.h`, `graph.h`, `kernels.h`, `types.h`, `pool.h`, `linear_typed.h`, `ops.h`, `slang_cpu.h`, `vulkan.h`) | Public C23 library API |
-| `src/backend/cpu/` | Implemented (`slang_cpu_dispatch.c`, `cpu_backend.c`) | Slang AOT CPU dispatch and 6-group CPU adapter over `velri_pool` |
-| `src/platform/` | Implemented (`cpu_caps.c`, `pool.c`) | ISA/cache detection, persistent `velri_pool` (POSIX + Win32) |
-| `src/kernels/slang/` | Implemented (`common/` + `ops/` + `entry_{cpu,vulkan}.slang`) | Unified Slang kernel modules (AOT → SPIR-V 1.6 and CPU LLVM IR / `.o`) |
-| `src/core/`, `src/ops/`, `src/graph/` | Implemented (`tensor.c`, `runtime_ctx.c`, `registry.c`, `graph.c`) | Tensors, storage, op registry, static backend registry, and graph builder |
-| `src/plan/`, `src/runtime/` | Implemented (`planner.c`, `executor.c`) | Memory/placement planner (scratch packing, RAM transfers), execution slots, cancellation |
-| `src/backend/vulkan/` | Implemented (opt-in `-DVELRI_ENABLE_VULKAN=ON`) | Vulkan 1.3 / SPIR-V 1.6 compute backend (`vk_backend.c`, `vk_backend_adapter.c`) |
-| `tests/`, `tools/`, `cmake/` | Implemented | References (`reference.c`), `test_core_contract` (+ `mock_async`), `bench_slang_cpu`, `bench_vulkan`, `slang.cmake`, `core.cmake` |
+| `include/velri_lib/` | Implemented (`types.h`, `backend.h`, `graph.h`, `velri_lib.h`) | Public C23 library API |
+| `src/backend/cpu/` | Implemented (`cpu_backend.c`) | Built-in Slang AOT CPU backend over internal `velri_pool` |
+| `src/platform/` | Implemented (`os.h`, `os_posix.c`, `os_win32.c`, `cpu_caps.c`, `pool.{h,c}`) | OS abstraction boundary, CPU ISA detection, persistent `velri_pool` |
+| `src/kernels/slang/` | Implemented (`common/`, `ops/`, `entry_cpu.slang`, `vk/*.slang`) | Modular Slang kernel sources (AOT → CPU LLVM IR / `.o` and Vulkan SPIR-V 1.6) |
+| `src/core/`, `src/ops/`, `src/graph/` | Implemented (`tensor.c`, `runtime_ctx.c`, `registry.c`, `graph.c`) | Tensors, storage, op validator, static backend registry, and graph builder |
+| `src/plan/`, `src/runtime/` | Implemented (`planner.c`, `executor.c`) | Liveness scratch planner, RAM transfers, batched execution slots, cancellation |
+| `src/backend/vulkan/` | Implemented (opt-in `-DVELRI_ENABLE_VULKAN=ON`) | Built-in Vulkan 1.3 / SPIR-V 1.6 backend (`vk_backend.c`) with async `VkFence` ring |
+| `tests/`, `tools/`, `cmake/` | Implemented | References (`reference.c`), `test_kernels`, `test_core_contract` (+ `mock_async`), optional `bench_slang_cpu`/`bench_vulkan`, `slang.cmake` |
 
 Planned directories are not populated with stub APIs ahead of working code. Standalone and integrated build instructions live in [velri-lib/README.md](../../README.md) and [Velri Architecture](../../../docs/EN/architecture.md).

@@ -10,9 +10,9 @@ Documentation: **[English](docs/EN/README.md)** · **[Русский](docs/RU/RE
 
 ## Current Status
 
-- **`VelriLib::core`, `VelriLib::cpu` (Slang AOT), and `VelriLib::vulkan` (SPIR-V 1.6, opt-in) are implemented and verified in `velri-lib/`:**
-  - Core library (`<velri_lib/velri_lib.h>`): `Storage` / `TensorView` + explicit K/V roles, operation registry, graph builder, liveness scratch memory planner, UMA-aware memory report, 6-group backend contract, static registry, cross-backend RAM transfer bus, and independent concurrent execution slots (`core_contract` passes with 2 concurrent slots, mock async backend, cancellation/error drain, and hybrid CPU↔Vulkan).
-  - MatOps kernels: 23 modular CPU kernels (`GEMV`/`GEMM`, norms, RoPE, activations, `GatedMLP`, `Softmax`, `FWHT`, `QuantRow`) compiled from shared Slang modules (`common/` + `ops/`) alongside 35 `spirv-val`-verified Vulkan shaders (`CoopMat`, `Split-K`) and persistent `velri_pool` ([Kernels](velri-lib/docs/EN/kernels.md)).
+- **`VelriLib::velri` (alias `VelriLib::core`) is implemented and verified in `velri-lib/`:**
+  - Single consolidated C23 library (`<velri_lib/velri_lib.h>` — 4 public headers: `types.h`, `backend.h`, `graph.h`, `velri_lib.h`): `Storage` / `TensorView`, operation registry, graph builder, liveness scratch memory planner, UMA-aware memory report, plan-shared weights (`velri_plan_bind_weight_host`), device-resident state with explicit host sync, refcounted lifetimes, 6-group Backend Contract v2 with command-buffer batching, cross-backend RAM transfer bus, and independent concurrent execution slots (`core_contract` passes).
+  - MatOps kernels: 23 modular CPU kernels (`GEMV`/`GEMM` incl. FP64, norms, RoPE, activations, `GatedMLP`, `Softmax`, `FWHT`, `QuantRow`) compiled AOT from shared Slang modules (`common/` + `ops/`) alongside 29 `spirv-val`-verified modular Vulkan shaders (`src/kernels/slang/vk/`, `CoopMat`, `Split-K`), verified across every CPU ISA and Vulkan GPU by `test_kernels` ([Kernels](velri-lib/docs/EN/kernels.md)).
 - The earlier handwritten C23/SIMD CPU backend and deprecated `VelriLib::cpu_linear` target are preserved for reference on branch `archive/c23-cpu-legacy`.
 - Model blocks (`Attention`, `TransformerLayer`), `Model`/`Program`/`Session`, weight loading, and full inference are next ([Roadmap](docs/EN/roadmap.md)).
 
@@ -26,7 +26,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-`slangc` is a build-time AOT tool only (no Slang or LLVM runtime dependency). Default CPU builds require no Vulkan SDK or network access; pass `-DVELRI_ENABLE_VULKAN=ON` to also build `VelriLib::vulkan` and `bench_vulkan`. For standalone library builds and package installation, see [velri-lib/README.md](velri-lib/README.md).
+`slangc` is a build-time AOT tool only (no Slang or LLVM runtime dependency). Default CPU builds require no Vulkan SDK or network access; pass `-DVELRI_ENABLE_VULKAN=ON` to enable the built-in Vulkan 1.3 backend and `-DVELRI_BUILD_BENCHMARKS=ON` to build `bench_slang_cpu` / `bench_vulkan`. For standalone library builds and package installation, see [velri-lib/README.md](velri-lib/README.md).
 
 ## Design Principles
 

@@ -4,7 +4,7 @@
 
 **Velri-lib** — вычислительная библиотека в каталоге `velri-lib/` репозитория Velri. Она предоставляет математические операции, единую систему кернелов, граф вычислений и бэкенды устройств за общим **C23 API** (`include/velri_lib/`). Внутри реализации допускается **C23 и C++23**; библиотека собирается и тестируется автономно через CMake без Python и PyTorch.
 
-**Статус:** реализованы и протестированы ядро `VelriLib::core` (`Storage`/`TensorView`, граф операций, планировщик памяти, 6-групповой контракт бэкендов, обмен через RAM и независимые слоты исполнения), Slang AOT CPU-операции `VelriLib::cpu` (`slangc` обязателен при сборке) и опциональный Vulkan 1.3 / SPIR-V 1.6 бэкенд `VelriLib::vulkan` ([kernels.md](kernels.md)). Прежний ручной C23/SIMD-код сохранён на ветке `archive/c23-cpu-legacy`.
+**Статус:** реализована и протестирована единая библиотека `VelriLib::velri` (алиас `VelriLib::core`): `Storage`/`TensorView`, граф операций, планировщик памяти, общие веса уровня плана, резидентное состояние устройства, Backend Contract v2 с пакетным асинхронным запуском, обмен через RAM, встроенный Slang AOT CPU-бэкенд (`slangc` обязателен при сборке) и опциональный Vulkan 1.3 / SPIR-V 1.6 бэкенд ([kernels.md](kernels.md)). Прежний ручной C23/SIMD-код сохранён на ветке `archive/c23-cpu-legacy`.
 
 ---
 
@@ -22,7 +22,7 @@
 | Математическое декодирование квантованных форматов весов | Чтение файлов модели, контейнеров, метаданных, токенизация и CLI/HTTP |
 | Эталоны операций, контрактные тесты и бенчмарки кернелов | Фикстуры целых моделей, сверка логитов и end-to-end замеры |
 
-Движок подключает библиотеку только через публичные заголовки `include/velri_lib/` и экспортированные цели CMake (`VelriLib::cpu` и будущие цели). Внутренние заголовки из `velri-lib/src/` наружу не экспортируются.
+Движок подключает библиотеку только через публичные заголовки `include/velri_lib/` и экспортированную цель CMake `VelriLib::velri` (алиас `VelriLib::core`). Внутренние заголовки из `velri-lib/src/` наружу не экспортируются.
 
 ---
 
@@ -113,13 +113,13 @@ flowchart TD
 
 | Каталог | Статус | Назначение |
 | :--- | :--- | :--- |
-| `include/velri_lib/` | Есть (`velri_lib.h`, `tensor.h`, `backend.h`, `graph.h`, `kernels.h`, `types.h`, `pool.h`, `linear_typed.h`, `ops.h`, `slang_cpu.h`, `vulkan.h`) | Публичный C23 API библиотеки |
-| `src/backend/cpu/` | Есть (`slang_cpu_dispatch.c`, `cpu_backend.c`) | Диспетчер Slang AOT CPU-кернелов и 6-групповой CPU-адаптер поверх `velri_pool` |
-| `src/platform/` | Есть (`cpu_caps.c`, `pool.c`) | Определение ISA/кэшей, постоянный пул потоков `velri_pool` (POSIX + Win32) |
-| `src/kernels/slang/` | Есть (`common/` + `ops/` + `entry_{cpu,vulkan}.slang`) | Единые модули кернелов на Slang (AOT → SPIR-V 1.6 и CPU LLVM IR / `.o`) |
-| `src/core/`, `src/ops/`, `src/graph/` | Есть (`tensor.c`, `runtime_ctx.c`, `registry.c`, `graph.c`) | Тензоры, хранилища, реестр операций, статический реестр бэкендов и конструктор графа |
-| `src/plan/`, `src/runtime/` | Есть (`planner.c`, `executor.c`) | Планировщик памяти/размещения (упаковка `scratch`, RAM-пересылки), слоты исполнения и отмена |
-| `src/backend/vulkan/` | Есть (опционально `-DVELRI_ENABLE_VULKAN=ON`) | Vulkan 1.3 / SPIR-V 1.6 бэкенд (`vk_backend.c`, `vk_backend_adapter.c`) |
-| `tests/`, `tools/`, `cmake/` | Есть | Эталоны (`reference.c`), `test_core_contract` (+ `mock_async`), `bench_slang_cpu`, `bench_vulkan`, `slang.cmake`, `core.cmake` |
+| `include/velri_lib/` | Есть (`types.h`, `backend.h`, `graph.h`, `velri_lib.h`) | Публичный C23 API библиотеки |
+| `src/backend/cpu/` | Есть (`cpu_backend.c`) | Встроенный Slang AOT CPU-бэкенд поверх внутреннего `velri_pool` |
+| `src/platform/` | Есть (`os.h`, `os_posix.c`, `os_win32.c`, `cpu_caps.c`, `pool.{h,c}`) | Граница OS-вызовов, определение ISA CPU, постоянный пул `velri_pool` |
+| `src/kernels/slang/` | Есть (`common/`, `ops/`, `entry_cpu.slang`, `vk/*.slang`) | Модульные исходники Slang (AOT → CPU LLVM IR / `.o` и Vulkan SPIR-V 1.6) |
+| `src/core/`, `src/ops/`, `src/graph/` | Есть (`tensor.c`, `runtime_ctx.c`, `registry.c`, `graph.c`) | Тензоры, хранилища, валидатор операций, статический реестр бэкендов и граф |
+| `src/plan/`, `src/runtime/` | Есть (`planner.c`, `executor.c`) | Планировщик `scratch`, RAM-пересылки, пакетные слоты исполнения и отмена |
+| `src/backend/vulkan/` | Есть (опционально `-DVELRI_ENABLE_VULKAN=ON`) | Встроенный Vulkan 1.3 / SPIR-V 1.6 бэкенд (`vk_backend.c`) с кольцом `VkFence` |
+| `tests/`, `tools/`, `cmake/` | Есть | Эталоны (`reference.c`), `test_kernels`, `test_core_contract` (+ `mock_async`), опциональные `bench_slang_cpu`/`bench_vulkan`, `slang.cmake` |
 
 Пустые каталоги заранее не заводятся; модули появляются вместе с проверяемой реализацией. Инструкции сборки библиотеки и её интеграции в Velri — в [velri-lib/README.md](../../README.md) и [архитектуре Velri](../../../docs/RU/architecture.md).

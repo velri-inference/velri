@@ -8,9 +8,11 @@ Documentation: **[English](docs/EN/architecture.md)** · **[Русский](docs
 
 ## What Works Today
 
-- **`VelriLib::core`** (`<velri_lib/velri_lib.h>`): `Storage` / `TensorView` (zero-copy subviews, explicit K/V roles), operation registry, device-agnostic graph builder, liveness scratch arena packer, UMA-aware memory budget report, 6-group backend contract & static registry (CPU adapter + optional Vulkan adapter), automatic `Device A -> RAM staging -> Device B` transfers, and concurrent isolated `velri_slot` execution with `0 B` hot-path allocations, verified by `test_core_contract`.
-- **`VelriLib::cpu`** (`<velri_lib/kernels.h>`, alias `VelriLib::slang_cpu`): Slang AOT CPU kernels (`entry_cpu.slang` compiled via `slangc` into target-neutral LLVM IR → Clang or native `.o` variants `base`, `avx2`, `avx512` with zero per-ISA source duplication) dispatched over persistent `velri_pool`, verified via `bench_slang_cpu --verify-only`.
-- **`VelriLib::vulkan`** (`-DVELRI_ENABLE_VULKAN=ON`, `<velri_lib/vulkan.h>`): opt-in Vulkan 1.3 / SPIR-V 1.6 compute backend with 35 `spirv-val`-verified Slang shaders (`CoopMat` `FP16`/`BF16`/`W8A8`, `Split-K` `FP32` GEMM, GEMV, norms, RoPE, activations, softmax, FWHT, and quantization), verified via `bench_vulkan --verify-only` and hybrid CPU↔Vulkan graph tests.
+- **`VelriLib::velri`** (compatibility alias `VelriLib::core`, umbrella header `<velri_lib/velri_lib.h>`): single consolidated static library exposing 4 public C23 headers (`types.h`, `backend.h`, `graph.h`, `velri_lib.h`):
+  - Core runtime: `Storage` / `TensorView` (zero-copy subviews), central operation validator, device-agnostic graph builder, liveness scratch arena packer, UMA-aware memory report, plan-level shared `WEIGHT` bindings (`velri_plan_bind_weight_host`), device-resident `STATE` with explicit host sync (`velri_slot_sync_state_{from,to}_host`), refcounted `ctx`/`plan` lifetimes, automatic `Device A -> RAM staging -> Device B` transfers with residence deduplication, and concurrent isolated `velri_slot` execution (`0 B` hot-path allocations).
+  - Built-in CPU backend: 23 Slang AOT kernels (`entry_cpu.slang` compiled via `slangc` into target-neutral LLVM IR → Clang or native `.o` variants `base`, `avx2`, `avx512`, including FP64 linear) dispatched over persistent `velri_pool`.
+  - Built-in Vulkan backend (`-DVELRI_ENABLE_VULKAN=ON`): Vulkan 1.3 / SPIR-V 1.6 compute backend with 29 `spirv-val`-verified modular Slang shaders (`src/kernels/slang/vk/`), lazy pipeline creation, bounded chunked staging, and pre-allocated 8-slot async `VkFence` ring supporting multi-op `submit_batch`.
+  - Verification: `test_kernels` (unified CPU ISAs + Vulkan correctness across all 12 ops + edge cases) and `test_core_contract`.
 - The earlier handwritten C23/SIMD CPU backend and deprecated `VelriLib::cpu_linear` target are archived on branch `archive/c23-cpu-legacy`. Public C headers are experimental and do not promise a stable binary ABI yet.
 
 ---
@@ -25,9 +27,10 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Standalone builds enable tests (`bench_slang_cpu` / `slang_cpu_verify`, and `bench_vulkan` / `vulkan_verify` when Vulkan is enabled) by default; as a subproject, tests are opt-in via `VELRI_LIB_BUILD_TESTS`. CMake options:
+Standalone builds enable tests (`test_kernels` and `test_core_contract`) by default; as a subproject, tests are opt-in via `VELRI_LIB_BUILD_TESTS`. CMake options:
 - `VELRI_CPU_MULTIVERSION` (`ON`): build x86-64 AVX2 and AVX-512 AOT variants alongside `base`.
-- `VELRI_ENABLE_VULKAN` (`OFF`): build `VelriLib::vulkan` SPIR-V 1.6 shaders (`spirv-val` checked) and `bench_vulkan`.
+- `VELRI_ENABLE_VULKAN` (`OFF`): enable the built-in Vulkan 1.3 / SPIR-V 1.6 compute backend (`spirv-val` checked).
+- `VELRI_BUILD_BENCHMARKS` (`OFF`): build optional roofline tools `bench_slang_cpu` and (with Vulkan) `bench_vulkan` + ceiling calibration shaders.
 - `VELRI_SANITIZE` (`OFF`): enable ASan + UBSan on C23 host code.
 - `VELRI_SLANGC`: optional explicit path to `slangc` when not on `PATH` or `~/.local/bin`.
 - `VELRI_SLANG_CPU_MODE` (`AUTO`): `AUTO` (uses target-neutral `LLVM_IR -> Clang` when Clang matches `slangc`'s LLVM version, falling back to `OBJECT` for GCC or older Clang), `LLVM_IR`, or `OBJECT`.
@@ -68,7 +71,7 @@ From source:
 
 ```cmake
 add_subdirectory(path/to/velri-lib velri-lib-build)
-target_link_libraries(my_application PRIVATE VelriLib::cpu)
+target_link_libraries(my_application PRIVATE VelriLib::velri)
 ```
 
 Or from an installed package (`VelriLib 0.1.0 EXACT`):
@@ -79,7 +82,7 @@ cmake --install build --prefix /path/to/velri-lib-install
 
 ```cmake
 find_package(VelriLib 0.1.0 EXACT CONFIG REQUIRED)
-target_link_libraries(my_application PRIVATE VelriLib::cpu)
+target_link_libraries(my_application PRIVATE VelriLib::velri)
 ```
 
-Consumers include `<velri_lib/kernels.h>` and link `VelriLib::cpu` (and optionally `<velri_lib/vulkan.h>` + `VelriLib::vulkan`). `slangc` is required only at build time; shipped binaries have zero Slang or LLVM runtime dependency, and CPU-only builds require no Vulkan SDK or network downloads.
+Consumers include `<velri_lib/velri_lib.h>` and link `VelriLib::velri` (alias `VelriLib::core`). `slangc` is required only at build time; shipped binaries have zero Slang or LLVM runtime dependency, and CPU-only builds require no Vulkan SDK or network downloads.

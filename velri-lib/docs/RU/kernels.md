@@ -4,7 +4,7 @@
 
 Вместо раздельного сопровождения GLSL-шейдеров, `#ifdef`-комбинаций и дублирующихся ручных SIMD-файлов под каждую архитектуру CPU целевая система кернелов `Velri-lib` строится вокруг **Khronos Slang** (`Apache-2.0 WITH LLVM-exception`) с **чистой AOT-компиляцией через `slangc` при сборке**.
 
-**Статус:** активная реализация в `velri-lib/src/kernels/slang/`. `slangc` обязателен при сборке `VelriLib::cpu` (23 CPU MatOps-кернела поверх `velri_pool`), а опция `-DVELRI_ENABLE_VULKAN=ON` добавляет 35 SPIR-V 1.6 шейдеров `VelriLib::vulkan`. Прежний ручной C23/SIMD-код сохранён для исторических сравнений на ветке `archive/c23-cpu-legacy`.
+**Статус:** активная реализация в `velri-lib/src/kernels/slang/`. `slangc` обязателен при сборке `VelriLib::velri` (23 CPU MatOps-кернела поверх `velri_pool`, включая FP64 linear), а опция `-DVELRI_ENABLE_VULKAN=ON` добавляет 29 модульных SPIR-V 1.6 шейдеров в `src/kernels/slang/vk/` (плюс 6 шейдеров калибровки потолков в `tools/vk_ceilings.slang` только при `VELRI_BUILD_BENCHMARKS=ON`). Прежний ручной C23/SIMD-код сохранён для исторических сравнений на ветке `archive/c23-cpu-legacy`.
 
 ---
 
@@ -68,7 +68,7 @@ Slang умеет выдавать CPU-код через LLVM (`slang-llvm`: LLVM
 4. Для горячего CPU `GEMM` / `GEMV` критичны регистровый тайлинг, перепаковка панелей в `scratch` и аппаратные dot-инструкции (`vdpbf16ps`, `vpdpbusd`). Если стандартный CPU-бэкенд Slang не вытягивает нужный кодген, мы фиксируем конкретный разрыв по замерам и точечно дорабатываем CPU-бэкенд Slang (чистый C-ABI, `fp16`/`bf16`, векторные примитивы / интринсики).
 
 ### Проверенные результаты и ограничения Slang `2026.22.1`
-Slang CPU собирается всегда в составе `VelriLib::cpu` (`entry_cpu.slang`, верификатор и бенчмарк `bench_slang_cpu`); Vulkan включается опцией `-DVELRI_ENABLE_VULKAN=ON` (`entry_vulkan.slang`, `bench_vulkan`). На `slangc 2026.22.1` подтверждены оба целевых пути из общих модулей `common/` и `ops/`:
+Slang CPU всегда собирается в составе `VelriLib::velri` (`entry_cpu.slang`); Vulkan включается опцией `-DVELRI_ENABLE_VULKAN=ON` (`vk/*.slang`), и оба бэкенда проверяются сквозным тестом `test_kernels` (опциональные `bench_slang_cpu`/`bench_vulkan` собираются при `-DVELRI_BUILD_BENCHMARKS=ON`). На `slangc 2026.22.1` подтверждены оба целевых пути из общих модулей `common/`:
 - **CPU (`VELRI_SLANG_CPU_MODE=AUTO|LLVM_IR|OBJECT`):** чистый C-ABI (`[DllExport] export __extern_cpp`) без runtime-зависимостей; единый исходник `linear_cpu.slang` компилируется под любые ОС и архитектуры без дублей.
   - **Основной путь (`LLVM_IR`, по умолчанию для совместимого Clang):** `slangc -target llvm-ir -O0 -fp-mode fast` выдаёт платформо-независимый LLVM IR, [strip_ll_target.cmake](../../cmake/strip_ll_target.cmake) очищает хостовые `target datalayout` / `target triple`, а сам CMake-компилятор (`Clang`) понижает `.ll` → `.o`/`.obj` с флагами целевого тулчейна. Это убирает хардкод ОС и CPU-архитектур и открывает **Linux (x86-64, AArch64, RISC-V 64 / RVV 1.0)**, **Windows (x86-64, ARM64)**, **Android (`arm64-v8a`, `x86_64`)** и **macOS** из одного исходника.
   - **Автоматический fallback (`OBJECT`, для GCC и старых версий Clang):** при конфигурации CMake выполняет короткую пробу `.ll`; если компилятор не принимает LLVM IR версии `slangc` (например, GCC или Clang 18 при `slang-llvm` на базе LLVM 21), `AUTO` автоматически переключается на прямое `slangc -target host-object-code -llvm-target-triple` (поддерживает x86-64 и AArch64 в официальном релизе `libslang-llvm.so`).

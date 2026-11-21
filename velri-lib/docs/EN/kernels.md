@@ -4,7 +4,7 @@
 
 Rather than maintaining separate GLSL shaders, `#ifdef` matrices, and duplicated handwritten SIMD files for every CPU ISA, `Velri-lib`'s target kernel system is built around **Khronos Slang** (`Apache-2.0 WITH LLVM-exception`) with **pure build-time AOT compilation via `slangc`**.
 
-**Status:** active implementation in `velri-lib/src/kernels/slang/`. `slangc` is required at build time for `VelriLib::cpu` (23 CPU MatOps kernels over `velri_pool`), while `-DVELRI_ENABLE_VULKAN=ON` adds 35 SPIR-V 1.6 shaders in `VelriLib::vulkan`. The earlier handwritten C23/SIMD backend is preserved for historical reference on branch `archive/c23-cpu-legacy`.
+**Status:** active implementation in `velri-lib/src/kernels/slang/`. `slangc` is required at build time for `VelriLib::velri` (23 CPU MatOps kernels over `velri_pool`, including FP64 linear), while `-DVELRI_ENABLE_VULKAN=ON` adds 29 modular SPIR-V 1.6 shaders in `src/kernels/slang/vk/` (plus 6 benchmark-only ceiling shaders under `tools/vk_ceilings.slang` when `VELRI_BUILD_BENCHMARKS=ON`). The earlier handwritten C23/SIMD backend is preserved for historical reference on branch `archive/c23-cpu-legacy`.
 
 ---
 
@@ -68,7 +68,7 @@ Slang supports CPU emission via LLVM (`slang-llvm`: LLVM IR / `.o`) and C++. We 
 4. Hot CPU `GEMM` / `GEMV` requires register tiling, bounded `scratch` panel packing, and hardware dot instructions (`vdpbf16ps`, `vpdpbusd`). Wherever stock Slang CPU codegen falls short, we measure the exact gap and apply targeted Slang CPU backend improvements (clean C-ABI, `fp16`/`bf16`, vector primitives/intrinsics).
 
 ### Verified Slang `2026.22.1` findings and limits
-Slang CPU is always built as `VelriLib::cpu` (`entry_cpu.slang`, verified and benchmarked via `bench_slang_cpu`); Vulkan is opt-in via `-DVELRI_ENABLE_VULKAN=ON` (`entry_vulkan.slang`, `bench_vulkan`). With `slangc 2026.22.1`, both targets are verified from shared `common/` and `ops/` modules:
+Slang CPU is always built into `VelriLib::velri` (`entry_cpu.slang`); Vulkan is opt-in via `-DVELRI_ENABLE_VULKAN=ON` (`vk/*.slang`), and both backends are verified end-to-end by `test_kernels` (with optional `bench_slang_cpu`/`bench_vulkan` under `-DVELRI_BUILD_BENCHMARKS=ON`). With `slangc 2026.22.1`, both targets are verified from shared `common/` modules:
 - **CPU (`VELRI_SLANG_CPU_MODE=AUTO|LLVM_IR|OBJECT`):** zero-runtime C-ABI emission (`[DllExport] export __extern_cpp`); one parameterized `linear_cpu.slang` compiles across all OSes and CPU architectures with zero per-ISA source duplication.
   - **Primary path (`LLVM_IR`, default for compatible Clang):** `slangc -target llvm-ir -O0 -fp-mode fast` emits target-neutral LLVM IR, [strip_ll_target.cmake](../../cmake/strip_ll_target.cmake) removes host `target datalayout` / `target triple` metadata, and CMake's own `Clang` lowers `.ll` → `.o`/`.obj` with the active toolchain's target/ABI/PIC flags. This removes OS/CPU triple hardcoding and supports **Linux (x86-64, AArch64, RISC-V 64 / RVV 1.0)**, **Windows (x86-64, ARM64)**, **Android (`arm64-v8a`, `x86_64`)**, and **macOS** from one source.
   - **Automatic fallback (`OBJECT`, for GCC and older Clang):** CMake runs a quick `.ll` configure probe; if the C compiler cannot parse `slangc`'s LLVM IR version (e.g., GCC or Clang 18 against `slang-llvm` based on LLVM 21), `AUTO` seamlessly falls back to `slangc -target host-object-code -llvm-target-triple` (covering x86-64 and AArch64 in official prebuilt `libslang-llvm.so`).
