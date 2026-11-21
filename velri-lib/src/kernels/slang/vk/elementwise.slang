@@ -140,7 +140,8 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
     if (row >= a.rows) return;
     Ptr<float, Access.Read> xr = a.x + uint64_t(row) * uint64_t(a.x_stride);
     Ptr<float> yr = a.y + uint64_t(row) * uint64_t(a.y_stride);
-    float neg_inf = asfloat(0xFF800000u);
+    static const float kNegInfInit = -3.4028234e38f;
+    static const float kNegInfCutoff = -3.4e38f;
 
     bool aligned = ((a.cols & 3u) == 0u) && is_ptr_aligned16(xr) && is_ptr_aligned16(yr);
     if (aligned && a.cols <= 4096u) {
@@ -149,7 +150,7 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
         Ptr<float4> yr4 = Ptr<float4>(yr);
 
         float4 reg[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
-        float local_max = neg_inf;
+        float local_max = kNegInfInit;
         [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
             uint idx = s * 256u + tid;
             if (idx < n4) {
@@ -159,7 +160,7 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
             }
         }
         float row_max = wg_reduce_max(local_max, tid, 256u);
-        if (!(row_max > neg_inf)) {
+        if (!(row_max > kNegInfCutoff)) {
             [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
                 uint idx = s * 256u + tid;
                 if (idx < n4) store_a16(yr4 + idx, float4(0.0f));
@@ -173,10 +174,10 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
             if (idx < n4) {
                 float4 v = reg[s];
                 float4 e = float4(
-                    (v.x > neg_inf) ? fast_expf(v.x - row_max) : 0.0f,
-                    (v.y > neg_inf) ? fast_expf(v.y - row_max) : 0.0f,
-                    (v.z > neg_inf) ? fast_expf(v.z - row_max) : 0.0f,
-                    (v.w > neg_inf) ? fast_expf(v.w - row_max) : 0.0f);
+                    (v.x > kNegInfCutoff) ? fast_expf(v.x - row_max) : 0.0f,
+                    (v.y > kNegInfCutoff) ? fast_expf(v.y - row_max) : 0.0f,
+                    (v.z > kNegInfCutoff) ? fast_expf(v.z - row_max) : 0.0f,
+                    (v.w > kNegInfCutoff) ? fast_expf(v.w - row_max) : 0.0f);
                 reg[s] = e;
                 local_sum += e.x + e.y + e.z + e.w;
             }
@@ -191,12 +192,12 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
         return;
     }
 
-    float local_max = neg_inf;
+    float local_max = kNegInfInit;
     for (uint c = tid; c < a.cols; c += 256u) {
         local_max = max(local_max, xr[c]);
     }
     float row_max = wg_reduce_max(local_max, tid, 256u);
-    if (!(row_max > neg_inf)) {
+    if (!(row_max > kNegInfCutoff)) {
         for (uint c = tid; c < a.cols; c += 256u) yr[c] = 0.0f;
         return;
     }
@@ -204,7 +205,7 @@ void vk_softmax_f32(uniform SoftmaxArgs a, uint3 gtid : SV_GroupThreadID, uint3 
     float local_sum = 0.0f;
     for (uint c = tid; c < a.cols; c += 256u) {
         float v = xr[c];
-        float e = (v > neg_inf) ? fast_expf(v - row_max) : 0.0f;
+        float e = (v > kNegInfCutoff) ? fast_expf(v - row_max) : 0.0f;
         yr[c] = e;
         local_sum += e;
     }

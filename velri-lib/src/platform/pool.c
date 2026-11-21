@@ -1,5 +1,5 @@
 #include "os.h"
-#include "velri_lib/pool.h"
+#include "pool.h"
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>

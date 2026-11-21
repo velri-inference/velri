@@ -4,10 +4,9 @@
 # Two CPU AOT lowering modes (`VELRI_SLANG_CPU_MODE`):
 #   - LLVM_IR (default for compatible Clang): `slangc -target llvm-ir -O0` emits
 #     target-neutral LLVM IR, stripped of host triple/datalayout, and CMake's own
-#     Clang compiles it to `.o`/`.obj` for ANY OS & CPU architecture (Linux, Windows,
-#     Android, macOS; x86-64, AArch64, RISC-V 64/RVV, etc.) without hardcoding triples.
+#     Clang compiles it to `.o`/`.obj` for ANY OS & CPU architecture without hardcoding triples.
 #   - OBJECT (automatic fallback for GCC or older Clang): `slangc -target host-object-code`
-#     emits machine objects directly via bundled `slang-llvm` (x86-64 & AArch64).
+#     emits machine objects directly via bundled `slang-llvm`.
 
 find_program(VELRI_SLANGC NAMES slangc
     HINTS "$ENV{HOME}/.local/bin" "$ENV{HOME}/.local/opt/slang/bin"
@@ -47,10 +46,7 @@ if(NOT _velri_obj_ext)
     endif()
 endif()
 
-# Collect target/ABI flags from CMake so Clang `.ll -> .o` inherits the exact
-# cross-compilation toolchain target without hardcoding OS or CPU architecture.
-# When x86-64 fat-binary multiversioning is enabled, never leak host `-march=`/`-mcpu=`
-# from CMAKE_C_FLAGS into per-ISA variants (each variant explicitly sets its own ISA).
+# Inherit cross-compilation toolchain flags cleanly without leaking host `-march=` into x86 fat variants.
 set(_velri_clang_target_flags)
 if(CMAKE_C_COMPILER_TARGET)
     list(APPEND _velri_clang_target_flags "--target=${CMAKE_C_COMPILER_TARGET}")
@@ -78,7 +74,6 @@ foreach(_f IN LISTS _velri_c_flag_list)
     endif()
 endforeach()
 
-# Determine CPU lowering mode: AUTO | LLVM_IR | OBJECT
 set(VELRI_SLANG_CPU_MODE "AUTO" CACHE STRING
     "Slang CPU AOT lowering mode: AUTO (LLVM_IR for compatible Clang, OBJECT for GCC/older Clang), LLVM_IR, or OBJECT")
 set_property(CACHE VELRI_SLANG_CPU_MODE PROPERTY STRINGS AUTO LLVM_IR OBJECT)
@@ -86,8 +81,6 @@ set_property(CACHE VELRI_SLANG_CPU_MODE PROPERTY STRINGS AUTO LLVM_IR OBJECT)
 set(_velri_use_llvm_ir OFF)
 if(VELRI_SLANG_CPU_MODE STREQUAL "LLVM_IR" OR
    (VELRI_SLANG_CPU_MODE STREQUAL "AUTO" AND CMAKE_C_COMPILER_ID MATCHES "Clang"))
-    # Probe whether this Clang parses LLVM IR emitted by this `slangc` version
-    # and targets the active toolchain architecture cleanly.
     set(_probe_dir "${VELRI_SLANG_GEN_DIR}/probe")
     file(MAKE_DIRECTORY "${_probe_dir}")
     file(WRITE "${_probe_dir}/probe.slang"
@@ -136,7 +129,6 @@ endif()
 if(_velri_use_llvm_ir)
     message(STATUS "Velri-lib Slang CPU AOT pipeline: target-neutral LLVM IR -> ${CMAKE_C_COMPILER}")
 else()
-    # Fallback (`OBJECT` mode): resolve target triple for `slangc -target host-object-code`.
     set(VELRI_SLANG_TARGET_TRIPLE "" CACHE STRING
         "Explicit LLVM target triple for slangc OBJECT mode (auto-detected when empty)")
     set(_velri_triple "${VELRI_SLANG_TARGET_TRIPLE}")
@@ -178,7 +170,7 @@ else()
 endif()
 
 # ============================================================================
-# 1. Slang AOT CPU Backend — VelriLib::cpu (ONE source compiled per ISA profile)
+# 1. Slang AOT CPU Objects (ONE source compiled per ISA profile)
 # ============================================================================
 set(VELRI_SLANG_CPU_ENTRY "${VELRI_SLANG_DIR}/entry_cpu.slang")
 set(VELRI_SLANG_CPU_OBJS)
@@ -250,19 +242,14 @@ function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_is
     set(VELRI_SLANG_CPU_OBJS ${VELRI_SLANG_CPU_OBJS} "${_obj}" PARENT_SCOPE)
 endfunction()
 
-# Base profile works on ANY CPU architecture and ANY OS without arch hardcoding.
-# Software FP16 on base eliminates external __extendhfsf2/__truncsfhf2 libcalls on
-# targets without mandatory hardware FP16 (x86-64 SSE2, RISC-V rv64gc, Windows MSVC).
 set(_velri_base_mr 3)
 set(_velri_base_defs "VELRI_SOFT_F16=1")
 if(VELRI_TARGET_AARCH64)
-    # ARMv8.0 guarantees 32 NEON registers + native F16 fcvt.
     set(_velri_base_mr 4)
     set(_velri_base_defs "")
 endif()
 velri_add_slang_cpu_variant(base ${_velri_base_mr} 16 8 "" "${VELRI_BASE_FLAGS}" "${_velri_base_defs}")
 
-# Optional x86-64 fat-binary multiversioning (runtime CPUID dispatch across SSE2/AVX2/AVX-512).
 if(VELRI_X86_VARIANTS)
     if(VELRI_MSVC_FRONTEND)
         set(_avx2_cc_flags /arch:AVX2)
@@ -279,54 +266,61 @@ if(VELRI_X86_VARIANTS)
         "${_avx512_cc_flags}" "")
 endif()
 
-add_library(velri_cpu STATIC
-    src/backend/cpu/slang_cpu_dispatch.c
-    ${VELRI_SLANG_CPU_OBJS}
-)
-add_library(VelriLib::cpu ALIAS velri_cpu)
-set_target_properties(velri_cpu PROPERTIES
-    EXPORT_NAME cpu
-    POSITION_INDEPENDENT_CODE ON
-)
-target_include_directories(velri_cpu PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-target_compile_definitions(velri_cpu PRIVATE VELRI_X86_VARIANTS=${VELRI_X86_VARIANTS})
-target_compile_options(velri_cpu PRIVATE ${VELRI_BASE_FLAGS})
-velri_strict_target(velri_cpu)
-target_link_libraries(velri_cpu PUBLIC velri_platform)
-if(UNIX)
-    target_link_libraries(velri_cpu PRIVATE m)
-endif()
-
-if(VELRI_LIB_BUILD_TESTS)
-    add_library(velri_typed_reference STATIC tests/cpu/typed/reference.c)
-    target_include_directories(velri_typed_reference PUBLIC tests/cpu/typed
-        PRIVATE include)
-    if(VELRI_MSVC_FRONTEND)
-        target_compile_options(velri_typed_reference PRIVATE ${VELRI_BASE_FLAGS})
-    else()
-        target_compile_options(velri_typed_reference PRIVATE ${VELRI_BASE_FLAGS} -ffp-contract=off)
-    endif()
-    velri_strict_target(velri_typed_reference)
-    if(UNIX)
-        target_link_libraries(velri_typed_reference PUBLIC m)
-    endif()
-
-    add_executable(bench_slang_cpu tools/bench_slang_cpu.c)
-    target_compile_definitions(bench_slang_cpu PRIVATE VELRI_X86_VARIANTS=${VELRI_X86_VARIANTS})
-    target_compile_options(bench_slang_cpu PRIVATE ${VELRI_BASE_FLAGS})
-    velri_strict_target(bench_slang_cpu)
-    target_link_libraries(bench_slang_cpu PRIVATE velri_cpu velri_typed_reference)
-    add_test(NAME slang_cpu_verify COMMAND bench_slang_cpu --verify-only)
-endif()
-
 # ============================================================================
-# 2. Slang AOT Vulkan Backend — VelriLib::vulkan (SPIR-V 1.6 + spirv-val)
+# 2. Slang AOT Vulkan SPIR-V 1.6 Shaders (optional)
 # ============================================================================
+function(velri_compile_vk_shaders out_header spv_dir header_path spec_list)
+    file(MAKE_DIRECTORY "${spv_dir}")
+    set(_entries)
+    set(_spvs)
+    foreach(_spec IN LISTS spec_list)
+        string(REGEX REPLACE "\\|.*$" "" _src_path "${_spec}")
+        string(REGEX REPLACE "^.*\\|" "" _entry "${_spec}")
+        set(_spv "${spv_dir}/${_entry}.spv")
+        set(_extra_caps)
+        if(_entry STREQUAL "vk_gemm_coopmat_bf16" OR _entry STREQUAL "vk_gemm_coopmat_bf16_64" OR
+           _entry STREQUAL "vk_ceiling_coopmat_bf16")
+            list(APPEND _extra_caps -capability spvBFloat16KHR)
+        endif()
+
+        set(_val_cmd)
+        set(_spv_comment "Slang AOT SPIR-V: ${_entry}.spv")
+        if(VELRI_SPIRV_VAL)
+            set(_val_cmd COMMAND "${VELRI_SPIRV_VAL}" --target-env vulkan1.3 "${_spv}")
+            set(_spv_comment "Slang AOT SPIR-V + spirv-val: ${_entry}.spv")
+        endif()
+        add_custom_command(
+            OUTPUT "${_spv}"
+            COMMAND "${VELRI_SLANGC}" "${_src_path}"
+                -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/vk"
+                -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
+                ${_extra_caps}
+                -entry "${_entry}" -stage compute -o "${_spv}"
+            ${_val_cmd}
+            DEPENDS "${_src_path}" "${VELRI_SLANG_DIR}/vk/vk_common.slang" ${VELRI_SLANG_VK_DEPS}
+            COMMENT "${_spv_comment}"
+            VERBATIM
+        )
+        list(APPEND _entries "${_entry}")
+        list(APPEND _spvs "${_spv}")
+    endforeach()
+
+    string(JOIN ";" _entry_list_arg ${_entries})
+    add_custom_command(
+        OUTPUT "${header_path}"
+        COMMAND "${CMAKE_COMMAND}"
+            "-DINPUT_DIR=${spv_dir}"
+            "-DOUTPUT_HEADER=${header_path}"
+            "-DENTRY_LIST=${_entry_list_arg}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+        DEPENDS ${_spvs} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
+        COMMENT "Embedding SPIR-V shaders -> ${header_path}"
+        VERBATIM
+    )
+    set(${out_header} "${header_path}" PARENT_SCOPE)
+endfunction()
+
 if(VELRI_ENABLE_VULKAN)
-    # Check target sysroot first (e.g. Android NDK), then arch-independent host Vulkan-Headers.
     find_path(VELRI_VULKAN_INCLUDE_DIR vulkan/vulkan.h
         HINTS "$ENV{HOME}/.local/opt/vulkan-headers/include" "$ENV{VULKAN_SDK}/Include"
               /usr/include /usr/local/include)
@@ -341,121 +335,58 @@ if(VELRI_ENABLE_VULKAN)
     endif()
     find_program(VELRI_SPIRV_VAL NAMES spirv-val NO_CMAKE_FIND_ROOT_PATH)
 
-    set(VELRI_VK_SPV_DIR "${VELRI_SLANG_GEN_DIR}/spv")
-    file(MAKE_DIRECTORY "${VELRI_VK_SPV_DIR}")
-
-    set(VELRI_VK_SHADER_SPECS
-        "norm.slang:vk_rmsnorm_f32"
-        "norm.slang:vk_rmsnorm_bf16"
-        "norm.slang:vk_rmsnorm_f16"
-        "norm.slang:vk_fused_add_rmsnorm_f32"
-        "norm.slang:vk_layernorm_f32"
-        "rope.slang:vk_rope_f32"
-        "rope.slang:vk_rope_bf16"
-        "elementwise.slang:vk_activation_silu_f32"
-        "elementwise.slang:vk_activation_gelu_f32"
-        "elementwise.slang:vk_activation_relu2_f32"
-        "elementwise.slang:vk_gated_silu_f32"
-        "elementwise.slang:vk_gated_gelu_f32"
-        "elementwise.slang:vk_vec_axpby_f32"
-        "elementwise.slang:vk_vec_mul_f32"
-        "elementwise.slang:vk_softmax_f32"
-        "elementwise.slang:vk_fwht_f32"
-        "elementwise.slang:vk_quantize_row_f32_i8"
-        "gemv.slang:vk_gemv_f32"
-        "gemv.slang:vk_gemv_f16"
-        "gemv.slang:vk_gemv_bf16"
-        "gemv.slang:vk_gemv_w8a8"
-        "gemm_f32.slang:vk_gemm_f32"
-        "gemm_f32.slang:vk_splitk_reduce"
-        "gemm_coopmat.slang:vk_gemm_coopmat_f16"
-        "gemm_coopmat.slang:vk_gemm_coopmat_bf16"
-        "gemm_coopmat.slang:vk_gemm_coopmat_w8a8"
-        "gemm_coopmat.slang:vk_gemm_coopmat_f16_64"
-        "gemm_coopmat.slang:vk_gemm_coopmat_bf16_64"
-        "gemm_coopmat.slang:vk_gemm_coopmat_w8a8_64"
-        "ceilings.slang:vk_ceiling_bw_f32x4"
-        "ceilings.slang:vk_ceiling_bw_read_f32x4"
-        "ceilings.slang:vk_ceiling_fma_f32"
-        "ceilings.slang:vk_ceiling_coopmat_f16"
-        "ceilings.slang:vk_ceiling_coopmat_bf16"
-        "ceilings.slang:vk_ceiling_coopmat_i8"
+    set(_vk "${VELRI_SLANG_DIR}/vk")
+    set(VELRI_VK_PROD_SPECS
+        "${_vk}/norm.slang|vk_rmsnorm_f32"
+        "${_vk}/norm.slang|vk_rmsnorm_bf16"
+        "${_vk}/norm.slang|vk_rmsnorm_f16"
+        "${_vk}/norm.slang|vk_fused_add_rmsnorm_f32"
+        "${_vk}/norm.slang|vk_layernorm_f32"
+        "${_vk}/rope.slang|vk_rope_f32"
+        "${_vk}/rope.slang|vk_rope_bf16"
+        "${_vk}/elementwise.slang|vk_activation_silu_f32"
+        "${_vk}/elementwise.slang|vk_activation_gelu_f32"
+        "${_vk}/elementwise.slang|vk_activation_relu2_f32"
+        "${_vk}/elementwise.slang|vk_gated_silu_f32"
+        "${_vk}/elementwise.slang|vk_gated_gelu_f32"
+        "${_vk}/elementwise.slang|vk_vec_axpby_f32"
+        "${_vk}/elementwise.slang|vk_vec_mul_f32"
+        "${_vk}/elementwise.slang|vk_softmax_f32"
+        "${_vk}/elementwise.slang|vk_fwht_f32"
+        "${_vk}/elementwise.slang|vk_quantize_row_f32_i8"
+        "${_vk}/gemv.slang|vk_gemv_f32"
+        "${_vk}/gemv.slang|vk_gemv_f16"
+        "${_vk}/gemv.slang|vk_gemv_bf16"
+        "${_vk}/gemv.slang|vk_gemv_w8a8"
+        "${_vk}/gemm_f32.slang|vk_gemm_f32"
+        "${_vk}/gemm_f32.slang|vk_splitk_reduce"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_f16"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_f16_64"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_bf16_64"
+        "${_vk}/gemm_coopmat.slang|vk_gemm_coopmat_w8a8_64"
+    )
+    velri_compile_vk_shaders(VELRI_VK_SHADER_HEADER
+        "${VELRI_SLANG_GEN_DIR}/spv"
+        "${VELRI_SLANG_GEN_DIR}/velri_vk_shaders.h"
+        "${VELRI_VK_PROD_SPECS}"
     )
 
-    set(VELRI_VK_ENTRIES)
-    set(VELRI_VK_SPV_FILES)
-    foreach(_spec IN LISTS VELRI_VK_SHADER_SPECS)
-        string(REGEX REPLACE ":.*$" "" _src_name "${_spec}")
-        string(REGEX REPLACE "^[^:]+:" "" _entry "${_spec}")
-        set(_src_file "${VELRI_SLANG_DIR}/vk/${_src_name}")
-        set(_spv "${VELRI_VK_SPV_DIR}/${_entry}.spv")
-        set(_extra_caps)
-        if(_entry STREQUAL "vk_gemm_coopmat_bf16" OR _entry STREQUAL "vk_gemm_coopmat_bf16_64" OR _entry STREQUAL "vk_ceiling_coopmat_bf16")
-            list(APPEND _extra_caps -capability spvBFloat16KHR)
-        endif()
-
-        set(_val_cmd)
-        set(_spv_comment "Slang AOT SPIR-V: ${_entry}.spv")
-        if(VELRI_SPIRV_VAL)
-            set(_val_cmd COMMAND "${VELRI_SPIRV_VAL}" --target-env vulkan1.3 "${_spv}")
-            set(_spv_comment "Slang AOT SPIR-V + spirv-val: ${_entry}.spv")
-        endif()
-        add_custom_command(
-            OUTPUT "${_spv}"
-            COMMAND "${VELRI_SLANGC}" "${_src_file}"
-                -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/vk"
-                -target spirv -profile spirv_1_6 -Wno-41012 -fvk-use-c-layout -O3
-                ${_extra_caps}
-                -entry "${_entry}" -stage compute -o "${_spv}"
-            ${_val_cmd}
-            DEPENDS "${_src_file}" "${VELRI_SLANG_DIR}/vk/vk_common.slang" ${VELRI_SLANG_VK_DEPS}
-            COMMENT "${_spv_comment}"
-            VERBATIM
+    if(VELRI_BUILD_BENCHMARKS)
+        set(_ceil "${CMAKE_CURRENT_SOURCE_DIR}/tools/vk_ceilings.slang")
+        set(VELRI_VK_CEIL_SPECS
+            "${_ceil}|vk_ceiling_bw_f32x4"
+            "${_ceil}|vk_ceiling_bw_read_f32x4"
+            "${_ceil}|vk_ceiling_fma_f32"
+            "${_ceil}|vk_ceiling_coopmat_f16"
+            "${_ceil}|vk_ceiling_coopmat_bf16"
+            "${_ceil}|vk_ceiling_coopmat_i8"
         )
-        list(APPEND VELRI_VK_ENTRIES "${_entry}")
-        list(APPEND VELRI_VK_SPV_FILES "${_spv}")
-    endforeach()
-
-    set(VELRI_VK_SHADER_HEADER "${VELRI_SLANG_GEN_DIR}/velri_vk_shaders.h")
-    string(JOIN ";" _entry_list_arg ${VELRI_VK_ENTRIES})
-    add_custom_command(
-        OUTPUT "${VELRI_VK_SHADER_HEADER}"
-        COMMAND "${CMAKE_COMMAND}"
-            "-DINPUT_DIR=${VELRI_VK_SPV_DIR}"
-            "-DOUTPUT_HEADER=${VELRI_VK_SHADER_HEADER}"
-            "-DENTRY_LIST=${_entry_list_arg}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
-        DEPENDS ${VELRI_VK_SPV_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spv.cmake"
-        COMMENT "Embedding SPIR-V shaders -> velri_vk_shaders.h"
-        VERBATIM
-    )
-
-    add_library(velri_vulkan STATIC
-        src/backend/vulkan/vk_backend.c
-        "${VELRI_VK_SHADER_HEADER}"
-    )
-    add_library(VelriLib::vulkan ALIAS velri_vulkan)
-    set_target_properties(velri_vulkan PROPERTIES
-        EXPORT_NAME vulkan
-        POSITION_INDEPENDENT_CODE ON
-    )
-    target_include_directories(velri_vulkan PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-    )
-    target_include_directories(velri_vulkan PRIVATE
-        "${VELRI_SLANG_GEN_DIR}"
-        "${VELRI_VULKAN_INCLUDE_DIR}"
-    )
-    target_compile_options(velri_vulkan PRIVATE ${VELRI_BASE_FLAGS})
-    velri_strict_target(velri_vulkan)
-    target_link_libraries(velri_vulkan PUBLIC velri_platform)
-
-    if(VELRI_LIB_BUILD_TESTS)
-        add_executable(bench_vulkan tools/bench_vulkan.c)
-        target_compile_options(bench_vulkan PRIVATE ${VELRI_BASE_FLAGS})
-        velri_strict_target(bench_vulkan)
-        target_link_libraries(bench_vulkan PRIVATE velri_vulkan velri_cpu velri_typed_reference)
-        add_test(NAME vulkan_verify COMMAND bench_vulkan --verify-only)
+        velri_compile_vk_shaders(VELRI_VK_CEILING_HEADER
+            "${VELRI_SLANG_GEN_DIR}/spv_bench"
+            "${VELRI_SLANG_GEN_DIR}/velri_vk_ceilings.h"
+            "${VELRI_VK_CEIL_SPECS}"
+        )
     endif()
 endif()

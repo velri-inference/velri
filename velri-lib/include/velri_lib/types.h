@@ -3,14 +3,13 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 /*
- * Explicit 16-bit floating-point storage representations in standard C23:
+ * Portable C23 primitive types, enums, and CPU ISA queries for Velri-lib.
+ *
+ * Explicit 16-bit floating-point storage representations:
  *   - velri_fp16: IEEE-754 binary16 (1 sign, 5 exponent, 10 fraction bits)
  *   - velri_bf16: Brain Float 16    (1 sign, 8 exponent,  7 fraction bits)
- * Using uint16_t storage keeps public headers portable across x86-64, ARM64,
- * and RISC-V without requiring target-specific _Float16 / __bf16 ABI support.
  */
 typedef uint16_t velri_fp16;
 typedef uint16_t velri_bf16;
@@ -43,6 +42,48 @@ typedef enum {
     VELRI_DTYPE_I32 = 5
 } velri_dtype;
 
+typedef enum {
+    VELRI_ROPE_HALF = 0,
+    VELRI_ROPE_INTERLEAVED = 1
+} velri_rope_mode;
+
+typedef enum {
+    VELRI_ACT_SILU = 0,
+    VELRI_ACT_GELU_TANH = 1,
+    VELRI_ACT_RELU2 = 2
+} velri_act_kind;
+
+/*
+ * Typed Linear operation descriptor:
+ *   Y[rows, M] = X[rows, K] * W[M, K]^T + bias[M] (or scaled W8A8 form).
+ */
+typedef struct {
+    velri_dtype x_dtype;
+    velri_dtype w_dtype;
+    velri_dtype y_dtype;
+    bool has_x_scale; /* Per-row float scale[rows] (for W8A8 -> F32) */
+    bool has_w_scale; /* Per-output float scale[M] (for W8A8 -> F32) */
+} velri_linear_desc;
+
+static inline velri_linear_desc velri_desc_f32(void) {
+    return (velri_linear_desc){VELRI_DTYPE_F32, VELRI_DTYPE_F32, VELRI_DTYPE_F32, false, false};
+}
+static inline velri_linear_desc velri_desc_f64(void) {
+    return (velri_linear_desc){VELRI_DTYPE_F64, VELRI_DTYPE_F64, VELRI_DTYPE_F64, false, false};
+}
+static inline velri_linear_desc velri_desc_f16(velri_dtype y_dtype) {
+    return (velri_linear_desc){VELRI_DTYPE_F16, VELRI_DTYPE_F16, y_dtype, false, false};
+}
+static inline velri_linear_desc velri_desc_bf16(velri_dtype y_dtype) {
+    return (velri_linear_desc){VELRI_DTYPE_BF16, VELRI_DTYPE_BF16, y_dtype, false, false};
+}
+static inline velri_linear_desc velri_desc_f32x_bf16w(void) {
+    return (velri_linear_desc){VELRI_DTYPE_F32, VELRI_DTYPE_BF16, VELRI_DTYPE_F32, false, false};
+}
+static inline velri_linear_desc velri_desc_w8a8_f32(void) {
+    return (velri_linear_desc){VELRI_DTYPE_I8, VELRI_DTYPE_I8, VELRI_DTYPE_F32, true, true};
+}
+
 typedef struct {
     int hardware_threads;
     bool has_avx2;
@@ -70,115 +111,5 @@ velri_cpu_variant velri_cpu_resolve_variant(velri_cpu_variant variant);
 
 /* Return immutable detected CPU ISA capability summary. */
 const velri_cpu_info *velri_get_cpu_info(void);
-
-/* ============================================================================
- * Portable Bit-Exact IEEE-754 Scalar FP16 & BF16 Conversion Helpers
- * ============================================================================ */
-
-static inline uint32_t velri_f32_to_bits(float x) {
-    uint32_t u;
-    memcpy(&u, &x, sizeof(u));
-    return u;
-}
-
-static inline float velri_bits_to_f32(uint32_t u) {
-    float x;
-    memcpy(&x, &u, sizeof(x));
-    return x;
-}
-
-static inline float velri_bf16_to_f32_scalar(velri_bf16 h) {
-    return velri_bits_to_f32((uint32_t)h << 16);
-}
-
-static inline velri_bf16 velri_f32_to_bf16_scalar(float x) {
-    uint32_t u = velri_f32_to_bits(x);
-    uint32_t abs_u = u & UINT32_C(0x7FFFFFFF);
-    if (abs_u > UINT32_C(0x7F800000)) {
-        return (velri_bf16)((u >> 16) | UINT16_C(0x0040));
-    }
-    uint32_t lsb = (u >> 16) & 1U;
-    uint32_t rounded = u + UINT32_C(0x7FFF) + lsb;
-    return (velri_bf16)(rounded >> 16);
-}
-
-static inline float velri_f16_to_f32_scalar(velri_fp16 h) {
-    uint32_t sign = (uint32_t)(h & UINT16_C(0x8000)) << 16;
-    uint32_t exp = (h >> 10) & 0x1FU;
-    uint32_t mant = h & 0x03FFU;
-    if (exp == 0) {
-        if (mant == 0) {
-            return velri_bits_to_f32(sign);
-        }
-        uint32_t e = 127U - 14U;
-        while ((mant & 0x0400U) == 0) {
-            mant <<= 1;
-            --e;
-        }
-        mant &= 0x03FFU;
-        return velri_bits_to_f32(sign | (e << 23) | (mant << 13));
-    }
-    if (exp == 0x1FU) {
-        if (mant == 0) {
-            return velri_bits_to_f32(sign | UINT32_C(0x7F800000));
-        }
-        return velri_bits_to_f32(sign | UINT32_C(0x7FC00000) | (mant << 13));
-    }
-    return velri_bits_to_f32(sign | ((exp + (127U - 15U)) << 23) | (mant << 13));
-}
-
-static inline velri_fp16 velri_f32_to_f16_scalar(float x) {
-    uint32_t u = velri_f32_to_bits(x);
-    uint16_t sign = (uint16_t)((u >> 16) & UINT16_C(0x8000));
-    uint32_t abs_u = u & UINT32_C(0x7FFFFFFF);
-
-    if (abs_u > UINT32_C(0x7F800000)) {
-        uint16_t payload = (uint16_t)((abs_u >> 13) & 0x03FFU);
-        return (velri_fp16)(sign | UINT16_C(0x7E00) | payload);
-    }
-    if (abs_u >= UINT32_C(0x477FF000)) {
-        if (abs_u >= UINT32_C(0x7F800000)) {
-            return (velri_fp16)(sign | UINT16_C(0x7C00));
-        }
-        uint32_t exp = (abs_u >> 23) - 127U + 15U;
-        uint32_t mant = abs_u & UINT32_C(0x007FFFFF);
-        if (exp > 30U) {
-            return (velri_fp16)(sign | UINT16_C(0x7C00));
-        }
-        uint32_t lsb = (mant >> 13) & 1U;
-        uint32_t r = mant + UINT32_C(0x0FFF) + lsb;
-        if (r >= UINT32_C(0x00800000)) {
-            return (velri_fp16)(sign | UINT16_C(0x7C00));
-        }
-        return (velri_fp16)(sign | (uint16_t)(exp << 10) | (uint16_t)(r >> 13));
-    }
-    if (abs_u < UINT32_C(0x33000000)) {
-        return sign;
-    }
-    if (abs_u < UINT32_C(0x38800000)) {
-        uint32_t f_exp = abs_u >> 23;
-        uint32_t sig = (abs_u & UINT32_C(0x007FFFFF)) | UINT32_C(0x00800000);
-        uint32_t shift = 126U - f_exp;
-        uint32_t q = sig >> shift;
-        uint32_t rem = sig & ((UINT32_C(1) << shift) - 1U);
-        uint32_t half = UINT32_C(1) << (shift - 1U);
-        if (rem > half || (rem == half && (q & 1U) != 0U)) {
-            ++q;
-        }
-        return (velri_fp16)(sign | (uint16_t)q);
-    }
-    uint32_t exp = (abs_u >> 23) - (127U - 15U);
-    uint32_t mant = abs_u & UINT32_C(0x007FFFFF);
-    uint32_t lsb = (mant >> 13) & 1U;
-    uint32_t rounded = mant + UINT32_C(0x0FFF) + lsb;
-    if (rounded >= UINT32_C(0x00800000)) {
-        rounded -= UINT32_C(0x00800000);
-        ++exp;
-        if (exp >= 31U) {
-            return (velri_fp16)(sign | UINT16_C(0x7C00));
-        }
-    }
-    return (velri_fp16)(sign | (uint16_t)(exp << 10) | (uint16_t)(rounded >> 13));
-}
 
 #endif /* VELRI_LIB_TYPES_H */

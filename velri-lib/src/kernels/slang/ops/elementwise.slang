@@ -33,7 +33,7 @@ public void gated_mlp_cpu<A : IActivation>(
 }
 
 float row_max_f32_cpu(Ptr<float, Access.Read> xr, uint cols) {
-    float m = asfloat(0xFF800000u); // -INF
+    float m = -3.4028234e38f;
     for (uint c = 0u; c < cols; ++c) {
         float v = xr[c];
         m = select(v > m, v, m);
@@ -46,21 +46,21 @@ public void softmax_rows_cpu(
     Ptr<float> y, uint y_stride,
     uint r0, uint r1, uint cols)
 {
-    float neg_inf = asfloat(0xFF800000u);
+    static const float kNegInfCutoff = -3.4e38f;
     if (cols <= 4096u) {
         float tmp[4096];
         for (uint r = r0; r < r1; ++r) {
             Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
             Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
             float m = row_max_f32_cpu(xr, cols);
-            if (!(m > neg_inf)) {
+            if (!(m > kNegInfCutoff)) {
                 for (uint c = 0u; c < cols; ++c) yr[c] = 0.0f;
                 continue;
             }
             float sum = 0.0f;
             for (uint c = 0u; c < cols; ++c) {
                 float v = xr[c];
-                float e = select(v > neg_inf, fast_expf(v - m), 0.0f);
+                float e = select(v > kNegInfCutoff, fast_expf(v - m), 0.0f);
                 tmp[c] = e;
                 sum += e;
             }
@@ -75,14 +75,14 @@ public void softmax_rows_cpu(
         Ptr<float, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
         Ptr<float> yr = y + uint64_t(r) * uint64_t(y_stride);
         float m = row_max_f32_cpu(xr, cols);
-        if (!(m > neg_inf)) {
+        if (!(m > kNegInfCutoff)) {
             for (uint c = 0u; c < cols; ++c) yr[c] = 0.0f;
             continue;
         }
         float sum = 0.0f;
         for (uint c = 0u; c < cols; ++c) {
             float v = xr[c];
-            float e = select(v > neg_inf, fast_expf(v - m), 0.0f);
+            float e = select(v > kNegInfCutoff, fast_expf(v - m), 0.0f);
             yr[c] = e;
             sum += e;
         }

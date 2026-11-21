@@ -5,9 +5,9 @@
 #include <stdatomic.h>
 
 /*
- * Controllable asynchronous mock backend for Stage 1 contract testing.
+ * Controllable asynchronous mock backend (Contract v2) for core runtime tests.
  * - Exposes one non-host device (`mock_async:0`, isolated device memory).
- * - Supports ONLY `VELRI_OP_VEC_AXPBY` (to verify no silent CPU fallback).
+ * - Supports ONLY `VELRI_OP_VEC_AXPBY` (verifies strict no silent CPU fallback).
  * - Executes work on a real background OS thread with configurable delay,
  *   pre-accept rejection, post-accept failure, and partial-accept error injection.
  */

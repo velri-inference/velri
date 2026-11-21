@@ -9,15 +9,23 @@ static bool validate_vtable(const velri_backend_vtable *vt) {
         return false;
     }
     if (!vt->enumerate_devices || !vt->open_device || !vt->query_caps || !vt->close_device ||
-        !vt->query_mem_req || !vt->alloc || !vt->free || !vt->copy_to_ram || !vt->copy_from_ram ||
-        !vt->query_operation || !vt->prepare_op || !vt->destroy_prepared_op || !vt->submit ||
-        !vt->poll || !vt->wait || !vt->destroy_completion) {
+        !vt->alloc || !vt->free || !vt->copy_to_ram || !vt->copy_from_ram ||
+        !vt->query_operation || !vt->submit) {
+        return false;
+    }
+    /* Optional paired hooks must either both be provided or both be nullptr. */
+    if ((vt->prepare_op != nullptr) != (vt->destroy_prepared_op != nullptr)) {
+        return false;
+    }
+    if ((vt->wait != nullptr) != (vt->destroy_completion != nullptr)) {
         return false;
     }
     return true;
 }
 
-velri_status velri_context_register_backend(velri_context *ctx, const velri_backend_vtable *vtable) {
+static velri_status register_backend_with_cfg(velri_context *ctx,
+                                              const velri_backend_vtable *vtable,
+                                              const void *open_cfg) {
     if (!ctx || !validate_vtable(vtable)) {
         return VELRI_ERR_INVALID;
     }
@@ -42,7 +50,7 @@ velri_status velri_context_register_backend(velri_context *ctx, const velri_back
             break;
         }
         velri_backend_device *dev = nullptr;
-        st = vtable->open_device(idx, &dev);
+        st = vtable->open_device(idx, open_cfg, &dev);
         if (st != VELRI_OK || !dev) {
             for (uint32_t j = start_dev; j < ctx->num_devices; ++j) {
                 ctx->devices[j].vt->close_device(ctx->devices[j].dev);
@@ -71,6 +79,11 @@ velri_status velri_context_register_backend(velri_context *ctx, const velri_back
     return VELRI_OK;
 }
 
+velri_status velri_context_register_backend(velri_context *ctx,
+                                            const velri_backend_vtable *vtable) {
+    return register_backend_with_cfg(ctx, vtable, nullptr);
+}
+
 velri_status velri_context_create(const velri_context_config *cfg, velri_context **out_ctx) {
     if (!out_ctx) {
         return VELRI_ERR_INVALID;
@@ -81,6 +94,8 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
     if (!ctx) {
         return VELRI_ERR_NOMEM;
     }
+    atomic_init(&ctx->refcount, 1U);
+    atomic_init(&ctx->total_allocs, 0U);
     if (cfg) {
         ctx->cfg = *cfg;
     } else {
@@ -89,17 +104,19 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
         ctx->cfg.enable_vulkan = false;
     }
 
-    velri_cpu_backend_set_defaults(ctx->cfg.cpu_workers, ctx->cfg.cpu_variant);
-    velri_status st = velri_context_register_backend(ctx, velri_cpu_backend_vtable());
+    velri_cpu_open_cfg cpu_cfg = {
+        .workers = ctx->cfg.cpu_workers,
+        .variant = ctx->cfg.cpu_variant,
+    };
+    velri_status st = register_backend_with_cfg(ctx, velri_cpu_backend_vtable(), &cpu_cfg);
     if (st != VELRI_OK) {
-        velri_context_destroy(ctx);
+        velri_context_release(ctx);
         return st;
     }
 
 #ifdef VELRI_CORE_HAS_VULKAN
     if (ctx->cfg.enable_vulkan) {
-        /* Vulkan device presence is optional at runtime (driver/GPU may be absent). */
-        (void)velri_context_register_backend(ctx, velri_vulkan_backend_vtable());
+        (void)register_backend_with_cfg(ctx, velri_vulkan_backend_vtable(), nullptr);
     }
 #endif
 
@@ -107,8 +124,17 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
     return VELRI_OK;
 }
 
-void velri_context_destroy(velri_context *ctx) {
+void velri_context_retain(velri_context *ctx) {
+    if (ctx) {
+        atomic_fetch_add_explicit(&ctx->refcount, 1U, memory_order_relaxed);
+    }
+}
+
+void velri_context_release(velri_context *ctx) {
     if (!ctx) {
+        return;
+    }
+    if (atomic_fetch_sub_explicit(&ctx->refcount, 1U, memory_order_acq_rel) != 1U) {
         return;
     }
     for (uint32_t i = ctx->num_devices; i > 0U; --i) {
@@ -120,14 +146,24 @@ void velri_context_destroy(velri_context *ctx) {
     free(ctx);
 }
 
+void velri_context_destroy(velri_context *ctx) { velri_context_release(ctx); }
+
+velri_status velri_device_alloc_tracked(velri_context *ctx, velri_device_id dev_id, size_t bytes,
+                                        size_t align, void **out_handle) {
+    velri_device_entry *de = &ctx->devices[dev_id];
+    velri_status st = de->vt->alloc(de->dev, bytes, align, out_handle);
+    if (st == VELRI_OK) {
+        atomic_fetch_add_explicit(&ctx->total_allocs, 1U, memory_order_relaxed);
+    }
+    return st;
+}
+
 uint32_t velri_context_device_count(const velri_context *ctx) {
     return ctx ? ctx->num_devices : 0U;
 }
 
-velri_status velri_context_device_caps(
-    const velri_context *ctx,
-    velri_device_id device_id,
-    velri_device_caps *out_caps) {
+velri_status velri_context_device_caps(const velri_context *ctx, velri_device_id device_id,
+                                       velri_device_caps *out_caps) {
     if (!ctx || !out_caps || device_id >= ctx->num_devices) {
         return VELRI_ERR_INVALID;
     }
@@ -135,11 +171,8 @@ velri_status velri_context_device_caps(
     return VELRI_OK;
 }
 
-velri_status velri_context_find_device(
-    const velri_context *ctx,
-    const char *backend_name,
-    uint32_t local_index,
-    velri_device_id *out_device_id) {
+velri_status velri_context_find_device(const velri_context *ctx, const char *backend_name,
+                                       uint32_t local_index, velri_device_id *out_device_id) {
     if (!ctx || !backend_name || !out_device_id) {
         return VELRI_ERR_INVALID;
     }

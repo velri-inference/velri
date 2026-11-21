@@ -25,12 +25,9 @@ else()
     find_package(VelriLib 0.1.0 EXACT CONFIG REQUIRED)
 endif()
 
-# Only an integration check exists; the engine runtime and graph are not ready.
+# Integration check against VelriLib's public C23 API (`VelriLib::velri`).
 if(BUILD_TESTING)
     add_executable(test_velri_lib tests/integration/velri_lib.c)
-    if(MSVC OR CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-        target_compile_options(test_velri_lib PRIVATE /std:clatest)
-    endif()
-    target_link_libraries(test_velri_lib PRIVATE VelriLib::core)
+    target_link_libraries(test_velri_lib PRIVATE VelriLib::velri)
     add_test(NAME velri_lib_integration COMMAND test_velri_lib)
 endif()

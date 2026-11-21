@@ -1,4 +1,4 @@
-// Hardware Ceiling Calibration Shaders (used only by bench_vulkan).
+// Hardware Ceiling Calibration Shaders (compiled ONLY when VELRI_BUILD_BENCHMARKS=ON).
 import vk_common;
 
 struct CeilingBwArgs {

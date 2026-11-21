@@ -1,11 +1,99 @@
 #ifndef VELRI_TEST_REFERENCE_H
 #define VELRI_TEST_REFERENCE_H
 
-#include "velri_lib/kernels.h"
+#include "velri_lib/velri_lib.h"
+#include <string.h>
 
-/* Deterministic PRNG for reproducible tests */
+/* Portable software IEEE-754 binary16 / bfloat16 converters (test & reference helpers). */
+static inline float velri_bf16_to_f32_scalar(velri_bf16 h) {
+    uint32_t u = ((uint32_t)h) << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+
+static inline velri_bf16 velri_f32_to_bf16_scalar(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7FFFFFFFU) > 0x7F800000U) {
+        return (velri_bf16)((u >> 16) | 0x0040U);
+    }
+    uint32_t lsb = (u >> 16) & 1U;
+    uint32_t bias = 0x7FFFU + lsb;
+    return (velri_bf16)((u + bias) >> 16);
+}
+
+static inline float velri_f16_to_f32_scalar(velri_fp16 h) {
+    uint32_t sign = ((uint32_t)h & 0x8000U) << 16;
+    uint32_t exp = (h >> 10) & 0x1FU;
+    uint32_t mant = h & 0x03FFU;
+    uint32_t out;
+    if (exp == 0U) {
+        if (mant == 0U) {
+            out = sign;
+        } else {
+            uint32_t e = 127U - 14U;
+            while ((mant & 0x0400U) == 0U) {
+                mant <<= 1;
+                e--;
+            }
+            mant &= 0x03FFU;
+            out = sign | (e << 23) | (mant << 13);
+        }
+    } else if (exp == 31U) {
+        out = sign | 0x7F800000U | (mant ? ((mant << 13) | 0x00400000U) : 0U);
+    } else {
+        out = sign | ((exp + (127U - 15U)) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
+static inline velri_fp16 velri_f32_to_f16_scalar(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    uint32_t sign = (u >> 16) & 0x8000U;
+    uint32_t abs_u = u & 0x7FFFFFFFU;
+    if (abs_u > 0x7F800000U) {
+        return (velri_fp16)(sign | 0x7E00U | ((u >> 13) & 0x03FFU));
+    }
+    if (abs_u >= 0x47800000U) {
+        return (velri_fp16)(sign | 0x7C00U);
+    }
+    if (abs_u < 0x38800000U) {
+        if (abs_u < 0x33000000U) {
+            return (velri_fp16)sign;
+        }
+        uint32_t exp = abs_u >> 23;
+        uint32_t mant = (abs_u & 0x007FFFFFU) | 0x00800000U;
+        uint32_t shift = 113U - exp + 13U;
+        uint32_t half_bit = 1U << (shift - 1U);
+        uint32_t mask = (1U << shift) - 1U;
+        uint32_t rem = mant & mask;
+        uint32_t res = mant >> shift;
+        if (rem > half_bit || (rem == half_bit && (res & 1U))) {
+            res++;
+        }
+        return (velri_fp16)(sign | res);
+    }
+    uint32_t exp = (abs_u >> 23) - 112U;
+    uint32_t mant = abs_u & 0x007FFFFFU;
+    uint32_t rem = mant & 0x1FFFU;
+    uint32_t res = (exp << 10) | (mant >> 13);
+    if (rem > 0x1000U || (rem == 0x1000U && (res & 1U))) {
+        res++;
+    }
+    return (velri_fp16)(sign | res);
+}
+
+/* Deterministic PRNG & shared tensor fill/diff utilities */
 uint32_t velri_test_rng(uint64_t *state);
 float velri_test_rand_f32(uint64_t *state, float lo, float hi);
+void velri_test_fill_dtype(velri_dtype dt, void *buf, size_t n, uint64_t *rng, float scale);
+double velri_test_load_f64(velri_dtype dt, const void *p, size_t idx);
+double velri_test_max_abs_diff_2d(velri_dtype dt, const void *a, const void *b, size_t rows,
+                                  size_t cols, size_t stride);
 
 /* Pure FP64 / int64 reference implementations */
 void ref_linear_run(const velri_linear_desc *desc, size_t rows, size_t m, size_t k, const void *x,
