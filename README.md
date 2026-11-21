@@ -10,9 +10,11 @@ Documentation: **[English](docs/EN/README.md)** · **[Русский](docs/RU/RE
 
 ## Current Status
 
-- **`VelriLib::cpu` (Slang AOT) and `VelriLib::vulkan` (SPIR-V 1.6, opt-in) are implemented and verified in `velri-lib/`:** 23 modular CPU MatOps kernels (`GEMV`/`GEMM` across `F64`/`F32`/`F16`/`BF16`/`W8A8`/`W8A32`, `RMSNorm`, `Add+RMSNorm`, `LayerNorm`, `RoPE`, activations, `GatedMLP`, `Softmax`, `FWHT`, `QuantRow`, format conversions) compiled from shared Slang modules (`common/` + `ops/`) alongside 35 `spirv-val`-verified Vulkan shaders (including `CoopMat` and `Split-K`) and persistent `velri_pool` ([Kernels](velri-lib/docs/EN/kernels.md)).
+- **`VelriLib::core`, `VelriLib::cpu` (Slang AOT), and `VelriLib::vulkan` (SPIR-V 1.6, opt-in) are implemented and verified in `velri-lib/`:**
+  - Core library (`<velri_lib/velri_lib.h>`): `Storage` / `TensorView` + explicit K/V roles, operation registry, graph builder, liveness scratch memory planner, UMA-aware memory report, 6-group backend contract, static registry, cross-backend RAM transfer bus, and independent concurrent execution slots (`core_contract` passes with 2 concurrent slots, mock async backend, cancellation/error drain, and hybrid CPU↔Vulkan).
+  - MatOps kernels: 23 modular CPU kernels (`GEMV`/`GEMM`, norms, RoPE, activations, `GatedMLP`, `Softmax`, `FWHT`, `QuantRow`) compiled from shared Slang modules (`common/` + `ops/`) alongside 35 `spirv-val`-verified Vulkan shaders (`CoopMat`, `Split-K`) and persistent `velri_pool` ([Kernels](velri-lib/docs/EN/kernels.md)).
 - The earlier handwritten C23/SIMD CPU backend and deprecated `VelriLib::cpu_linear` target are preserved for reference on branch `archive/c23-cpu-legacy`.
-- The compute graph, backend registry, model loaders, and full inference engine are active development work ([Roadmap](docs/EN/roadmap.md)).
+- Model blocks (`Attention`, `TransformerLayer`), `Model`/`Program`/`Session`, weight loading, and full inference are next ([Roadmap](docs/EN/roadmap.md)).
 
 ## Quick Build & Test
 

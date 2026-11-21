@@ -13,13 +13,11 @@ This stage built the initial handwritten C23/SIMD CPU suite (`VelriLib::cpu` and
 
 ---
 
-### Stage 1 — Minimal `velri-lib` Core and Backend Contract
-Build the library core ([velri-lib/docs/EN/architecture.md](../../velri-lib/docs/EN/architecture.md)):
-- `TensorView` / `Storage`, operation registry, graph builder, and memory planner (with explicit K/V roles);
-- internal C backend contract (`query_operation`, `prepare`, `submit`, `poll`, `wait`), static registration, and RAM transfer bus;
-- thin CPU adapter wrapping `VelriLib::cpu` plus a small async mock backend (one op + controllable completion delay).
-
-**Acceptance:** a standalone client builds a graph, prepares a plan, and runs two independent execution slots with zero engine code; shared contract tests verify pre-accept rejection, post-accept failure, cancellation, RAM transfers, and slot isolation.
+### Stage 1 *(Completed)* — Minimal `velri-lib` Core and Backend Contract
+Implemented the `VelriLib::core` library core ([velri-lib/docs/EN/architecture.md](../../velri-lib/docs/EN/architecture.md)):
+- `Storage` / `TensorView`, explicit K/V roles (`VELRI_KV_SEPARATE` / `SHARED` / `DERIVED`), central operation registry, graph builder, and liveness-based scratch arena memory planner with UMA-aware reporting;
+- 6-group C backend contract (`query_operation`, `prepare_op`, `submit`, `poll`, `wait`), static registration, and automatic `Device A → RAM staging → Device B` transfers;
+- thin CPU adapter over `VelriLib::cpu`, optional Vulkan adapter (`-DVELRI_ENABLE_VULKAN=ON`), and controllable `mock_async` backend (`tests/core/test_core_contract.c`: 2 concurrent SwiGLU MLP slots, pre-accept rejection, post-accept/partial-accept drain, 3-window cancellation, RAM bus transfers, and hybrid CPU↔Vulkan).
 
 ---
 

@@ -34,3 +34,17 @@ if(VELRI_ENABLE_VULKAN)
     target_compile_definitions(velri_core PRIVATE VELRI_CORE_HAS_VULKAN=1)
     target_link_libraries(velri_core PRIVATE velri_vulkan)
 endif()
+
+if(VELRI_LIB_BUILD_TESTS)
+    add_executable(test_core_contract
+        tests/core/test_core_contract.c
+        tests/core/mock_async_backend.c
+    )
+    target_compile_options(test_core_contract PRIVATE ${VELRI_BASE_FLAGS})
+    if(VELRI_ENABLE_VULKAN)
+        target_compile_definitions(test_core_contract PRIVATE VELRI_CORE_HAS_VULKAN=1)
+    endif()
+    velri_strict_target(test_core_contract)
+    target_link_libraries(test_core_contract PRIVATE velri_core velri_typed_reference)
+    add_test(NAME core_contract COMMAND test_core_contract)
+endif()

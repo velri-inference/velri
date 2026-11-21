@@ -4,7 +4,7 @@
 
 This document defines the execution model of `Velri-lib`: what runs during preparation, how CPU and Vulkan cooperate, how memory visibility is synchronized, and how errors and cancellation behave. For overall library boundaries see [architecture.md](architecture.md); for kernels see [kernels.md](kernels.md).
 
-**Status:** target specification. Today `Velri-lib` implements synchronous Slang AOT CPU operations over the persistent `velri_pool` worker pool plus opt-in Vulkan SPIR-V 1.6 MatOps ([kernels.md](kernels.md)).
+**Status:** the core execution model (`velri_plan_prepare`, scratch arena packing, RAM transfer bus, independent `velri_slot` execution, completion draining, and cancellation) is implemented and verified by `core_contract` across CPU, `mock_async`, and optional Vulkan ([architecture.md](architecture.md)); advanced Vulkan async sync (timeline semaphores / command reuse) and disk staging (PLE) follow in later stages.
 
 ---
 

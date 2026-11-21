@@ -4,7 +4,7 @@
 
 Этот документ описывает модель исполнения в `Velri-lib`: что происходит при подготовке плана, как взаимодействуют CPU и Vulkan, как синхронизируется память и как обрабатываются ошибки и отмена. Общая структура библиотеки — в [architecture.md](architecture.md), система кернелов — в [kernels.md](kernels.md).
 
-**Статус:** целевая спецификация. Сейчас в `Velri-lib` реализованы синхронные Slang AOT CPU-операции поверх постоянного пула `velri_pool` и опциональные Vulkan SPIR-V 1.6 MatOps ([kernels.md](kernels.md)).
+**Статус:** базовое ядро исполнения (`velri_plan_prepare`, упаковка `scratch`, обмен через RAM, независимые слоты `velri_slot`, дренаж завершений и отмена) реализовано и покрыто тестами `core_contract` для CPU, `mock_async` и опционального Vulkan ([architecture.md](architecture.md)); расширенная асинхронная синхронизация Vulkan (timeline semaphores / command reuse) и дисковый staging (PLE) — последующие этапы.
 
 ---
 

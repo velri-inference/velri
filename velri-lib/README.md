@@ -8,10 +8,10 @@ Documentation: **[English](docs/EN/architecture.md)** · **[Русский](docs
 
 ## What Works Today
 
-- **`VelriLib::cpu`** (`<velri_lib/kernels.h>`, alias `VelriLib::slang_cpu`): Slang AOT CPU kernels (`entry_cpu.slang` compiled via `slangc` into native `.o` variants `base`, `avx2`, `avx512` on x86-64 with zero per-ISA source duplication) dispatched over persistent `velri_pool`. Covers typed `Linear` (`F64`, `FP32`, `FP16`, `BF16`, `W8A8`, `W8A32`, mixed modes), `RMSNorm`, fused `Add+RMSNorm`, `LayerNorm`, `RoPE`, activations (`SiLU`, `GELU_tanh`, `ReLU2`), `GatedMLP`, `Softmax`, `FWHT`, format conversions, and per-row `INT8` quantization, verified against independent C23 FP64/INT64 references (`bench_slang_cpu --verify-only`).
-- **`VelriLib::vulkan`** (`-DVELRI_ENABLE_VULKAN=ON`, `<velri_lib/vulkan.h>`): opt-in Vulkan 1.3 / SPIR-V 1.6 compute backend with 35 `spirv-val`-verified Slang shaders (including `CoopMat` `FP16`/`BF16`/`W8A8`, `Split-K` `FP32` GEMM, GEMV, norms, RoPE, activations, softmax, FWHT, and quantization), verified via `bench_vulkan --verify-only`.
-- The earlier handwritten C23/SIMD CPU backend and deprecated `VelriLib::cpu_linear` target are archived on branch `archive/c23-cpu-legacy`.
-- The compute graph, backend registry, and memory/placement planner are active work ([architecture.md](docs/EN/architecture.md)). Public C headers are experimental and do not promise a stable binary ABI yet.
+- **`VelriLib::core`** (`<velri_lib/velri_lib.h>`): `Storage` / `TensorView` (zero-copy subviews, explicit K/V roles), operation registry, device-agnostic graph builder, liveness scratch arena packer, UMA-aware memory budget report, 6-group backend contract & static registry (CPU adapter + optional Vulkan adapter), automatic `Device A -> RAM staging -> Device B` transfers, and concurrent isolated `velri_slot` execution with `0 B` hot-path allocations, verified by `test_core_contract`.
+- **`VelriLib::cpu`** (`<velri_lib/kernels.h>`, alias `VelriLib::slang_cpu`): Slang AOT CPU kernels (`entry_cpu.slang` compiled via `slangc` into target-neutral LLVM IR → Clang or native `.o` variants `base`, `avx2`, `avx512` with zero per-ISA source duplication) dispatched over persistent `velri_pool`, verified via `bench_slang_cpu --verify-only`.
+- **`VelriLib::vulkan`** (`-DVELRI_ENABLE_VULKAN=ON`, `<velri_lib/vulkan.h>`): opt-in Vulkan 1.3 / SPIR-V 1.6 compute backend with 35 `spirv-val`-verified Slang shaders (`CoopMat` `FP16`/`BF16`/`W8A8`, `Split-K` `FP32` GEMM, GEMV, norms, RoPE, activations, softmax, FWHT, and quantization), verified via `bench_vulkan --verify-only` and hybrid CPU↔Vulkan graph tests.
+- The earlier handwritten C23/SIMD CPU backend and deprecated `VelriLib::cpu_linear` target are archived on branch `archive/c23-cpu-legacy`. Public C headers are experimental and do not promise a stable binary ABI yet.
 
 ---
 
