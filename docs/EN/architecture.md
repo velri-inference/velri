@@ -4,7 +4,7 @@
 
 **Velri** owns the model and inference layer: loading model files and weights, composing architectures from reusable blocks, resolving placement rules, and managing sessions and generation. All computation, kernel launch graphs, and device backends live inside **`velri-lib/`** ([velri-lib/docs/EN/architecture.md](../../velri-lib/docs/EN/architecture.md)).
 
-**Status:** `VelriLib::velri` (CPU Slang AOT + opt-in Vulkan 1.3), streaming C23 JSON + cascading placement (`src/format/json.{h,c}`, `src/config/placement.{h,c}`), and engine layer/architecture composition (`src/model/`) are implemented and tested. The public engine runtime (`include/velri/`, `src/runtime/`) and `.vtq` / CLI apps follow in [roadmap.md](roadmap.md).
+**Status:** `VelriLib::velri` (CPU Slang AOT + opt-in Vulkan 1.3 with DAG barrier elision, persistent captured decode graphs, FlashDecoding Split-KV, and shared cross-plan WEIGHT/STATE arenas), streaming C23 JSON + cascading placement (`src/format/json.{h,c}`, `src/config/placement.{h,c}`), engine layer/architecture composition (`src/model/`: GPT-2, Llama/Qwen2), and the public C23 engine runtime (`include/velri/velri.h`, `src/runtime/`) are implemented and tested. `.vtq` weight loading, tokenizers, and CLI/HTTP apps follow in [roadmap.md](roadmap.md).
 
 ---
 
@@ -32,9 +32,10 @@ flowchart TD
 
 | Project / Directory | Status | Responsibility |
 | :--- | :--- | :--- |
-| Velri: `include/velri/` | Planned | Public C23 engine API (`Context`, `Model`, `Program`, `Session`) |
-| Velri: `src/model/`, `src/config/`, `src/format/` | Active (in progress) | Family adapters, engine layer helpers, cascading JSON placement, streaming JSON scanner, weight format readers |
-| Velri: `src/runtime/`, `apps/` | Planned | Sessions, batching, sampling, tokenization, CLI, and HTTP/SSE server |
+| Velri: `include/velri/` | Implemented | Public C23 engine API (`Context`, `Model`, `Program`, `Session`, `Cancel`) |
+| Velri: `src/model/`, `src/config/`, `src/format/` | Active (in progress) | Family adapters (`gpt2`, `llama`), engine layer helpers, cascading JSON placement, streaming JSON scanner, weight format readers |
+| Velri: `src/runtime/` | Implemented (core) | Dual-plan zero-duplication runtime, sessions, chunked prefill, zero-alloc deterministic sampling |
+| Velri: `apps/` | Planned | Tokenization, chat templates, CLI (`inspect`, `run`, `chat`, `bench`), and optional HTTP/SSE server |
 | Velri: `tests/integration/` | Implemented | Public C API consumer check and installed `VelriLib` package test |
 | `velri-lib/` | Partially implemented | Tensors, graph, Slang AOT kernels, CPU/Vulkan backends, `velri_pool` ([details](../../velri-lib/docs/EN/architecture.md)) |
 

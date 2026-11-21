@@ -165,9 +165,12 @@ struct velri_plan {
     uint32_t num_storages;
 
     velri_plan_weight_binding *weight_bindings; /* Shared immutable WEIGHT bindings [num_user_storages] */
+    velri_plan *weight_owner;                   /* Optional retained peer plan owning WEIGHT slabs/bindings */
+    uint32_t *weight_peer_sid;                  /* [num_user_storages] -> owner storage_id when borrowed */
 
     void *weight_slabs[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
     size_t weight_slab_bytes[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
+    size_t weight_slab_align[VELRI_MAX_DEVICES][VELRI_MAX_WEIGHT_SLABS];
     uint32_t num_weight_slabs[VELRI_MAX_DEVICES];
 
     size_t slot_arena_bytes[VELRI_SLOT_ARENA_COUNT][VELRI_MAX_DEVICES];

@@ -166,14 +166,12 @@ static velri_status select_node_device(velri_context *ctx, const velri_resolved_
     return VELRI_ERR_UNSUPPORTED;
 }
 
-static velri_status pack_weight_slabs(velri_plan *plan) {
+static velri_status pack_weight_slabs(velri_plan *plan, bool allocate_slabs) {
     velri_context *ctx = plan->ctx;
     for (uint32_t d = 0U; d < ctx->num_devices; ++d) {
         if (ctx->devices[d].caps.is_host_memory) {
             continue;
         }
-        size_t slab_align[VELRI_MAX_WEIGHT_SLABS];
-        memset(slab_align, 0, sizeof(slab_align));
         uint32_t cur_slab = 0U;
         arena_cursor cur = {.offset = 0U, .max_align = effective_align(ctx, d, 0U)};
 
@@ -190,7 +188,7 @@ static velri_status pack_weight_slabs(velri_plan *plan) {
             }
             if (cur.offset > 0U && peek_end > VELRI_WEIGHT_SLAB_LIMIT) {
                 velri_status st = finalize_arena(&cur, &plan->weight_slab_bytes[d][cur_slab],
-                                                 &slab_align[cur_slab]);
+                                                 &plan->weight_slab_align[d][cur_slab]);
                 if (st != VELRI_OK) {
                     return st;
                 }
@@ -214,19 +212,93 @@ static velri_status pack_weight_slabs(velri_plan *plan) {
 
         if (cur.offset > 0U) {
             velri_status st = finalize_arena(&cur, &plan->weight_slab_bytes[d][cur_slab],
-                                             &slab_align[cur_slab]);
+                                             &plan->weight_slab_align[d][cur_slab]);
             if (st != VELRI_OK) {
                 return st;
             }
             plan->num_weight_slabs[d] = cur_slab + 1U;
         }
 
-        for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
-            velri_status st = velri_device_alloc_tracked(ctx, d, plan->weight_slab_bytes[d][s],
-                                                         slab_align[s], &plan->weight_slabs[d][s]);
-            if (st != VELRI_OK) {
-                return st;
+        if (allocate_slabs) {
+            for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+                velri_status st = velri_device_alloc_tracked(
+                    ctx, d, plan->weight_slab_bytes[d][s], plan->weight_slab_align[d][s],
+                    &plan->weight_slabs[d][s]);
+                if (st != VELRI_OK) {
+                    return st;
+                }
             }
+        }
+    }
+    return VELRI_OK;
+}
+
+static velri_status bind_shared_weights_from_owner(velri_plan *plan, velri_plan *owner) {
+    if (!plan || !owner || plan->ctx != owner->ctx) {
+        return VELRI_ERR_INVALID;
+    }
+    if (plan->num_user_storages > 0U) {
+        size_t map_bytes = 0U;
+        if (velri_mul_overflow_size((size_t)plan->num_user_storages, sizeof(uint32_t), &map_bytes)) {
+            return VELRI_ERR_OVERFLOW;
+        }
+        plan->weight_peer_sid = (uint32_t *)malloc(map_bytes);
+        if (!plan->weight_peer_sid) {
+            return VELRI_ERR_NOMEM;
+        }
+        for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
+            plan->weight_peer_sid[i] = UINT32_MAX;
+        }
+    }
+
+    for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
+        if (plan->num_weight_slabs[d] != owner->num_weight_slabs[d]) {
+            return VELRI_ERR_INVALID;
+        }
+        for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+            if (plan->weight_slab_bytes[d][s] != owner->weight_slab_bytes[d][s] ||
+                plan->weight_slab_align[d][s] > owner->weight_slab_align[d][s]) {
+                return VELRI_ERR_INVALID;
+            }
+        }
+
+        uint32_t j = 0U;
+        for (uint32_t i = 0U; i < plan->num_user_storages; ++i) {
+            const velri_plan_storage *ps = &plan->storages[i];
+            if (ps->kind != VELRI_STORAGE_WEIGHT || ps->device_id != d) {
+                continue;
+            }
+            while (j < owner->num_user_storages &&
+                   (owner->storages[j].kind != VELRI_STORAGE_WEIGHT ||
+                    owner->storages[j].device_id != d)) {
+                j++;
+            }
+            if (j >= owner->num_user_storages) {
+                return VELRI_ERR_INVALID;
+            }
+            const velri_plan_storage *ops = &owner->storages[j];
+            if (ps->dtype != ops->dtype || ps->byte_size != ops->byte_size ||
+                ps->arena_kind != ops->arena_kind || ps->slab_idx != ops->slab_idx ||
+                ps->arena_offset != ops->arena_offset) {
+                return VELRI_ERR_INVALID;
+            }
+            plan->weight_peer_sid[i] = j;
+            j++;
+        }
+        while (j < owner->num_user_storages) {
+            if (owner->storages[j].kind == VELRI_STORAGE_WEIGHT &&
+                owner->storages[j].device_id == d) {
+                return VELRI_ERR_INVALID;
+            }
+            j++;
+        }
+    }
+
+    velri_plan_retain(owner);
+    plan->weight_owner = owner;
+    for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
+        for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+            plan->weight_slabs[d][s] = owner->weight_slabs[d][s];
         }
     }
     return VELRI_OK;
@@ -982,7 +1054,9 @@ static void compute_memory_report(velri_plan *plan) {
         velri_device_memory_report *dr = &rep->devices[ps->device_id];
         switch (ps->kind) {
         case VELRI_STORAGE_WEIGHT:
-            dr->weight_bytes = velri_sat_add_size(dr->weight_bytes, ps->byte_size);
+            if (!plan->weight_owner) {
+                dr->weight_bytes = velri_sat_add_size(dr->weight_bytes, ps->byte_size);
+            }
             break;
         case VELRI_STORAGE_INPUT:
         case VELRI_STORAGE_OUTPUT:
@@ -1002,12 +1076,14 @@ static void compute_memory_report(velri_plan *plan) {
         velri_device_memory_report *dr = &rep->devices[d];
         size_t ovh = 0U;
         if (!plan->ctx->devices[d].caps.is_host_memory) {
-            size_t packed_w = 0U;
-            for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
-                packed_w = velri_sat_add_size(packed_w, plan->weight_slab_bytes[d][s]);
-            }
-            if (packed_w > dr->weight_bytes) {
-                ovh = velri_sat_add_size(ovh, packed_w - dr->weight_bytes);
+            if (!plan->weight_owner) {
+                size_t packed_w = 0U;
+                for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+                    packed_w = velri_sat_add_size(packed_w, plan->weight_slab_bytes[d][s]);
+                }
+                if (packed_w > dr->weight_bytes) {
+                    ovh = velri_sat_add_size(ovh, packed_w - dr->weight_bytes);
+                }
             }
             size_t io_bytes = plan->slot_arena_bytes[VELRI_SLOT_ARENA_IO][d];
             if (io_bytes > dr->input_output_bytes) {
@@ -1015,9 +1091,12 @@ static void compute_memory_report(velri_plan *plan) {
             }
         }
         size_t st_bytes = plan->slot_arena_bytes[VELRI_SLOT_ARENA_STATE][d];
+        size_t st_ovh = 0U;
         if (st_bytes > dr->state_bytes) {
-            ovh = velri_sat_add_size(ovh, st_bytes - dr->state_bytes);
+            st_ovh = st_bytes - dr->state_bytes;
+            ovh = velri_sat_add_size(ovh, st_ovh);
         }
+        dr->state_overhead_bytes = st_ovh;
         dr->allocator_overhead_bytes = ovh;
     }
 
@@ -1047,6 +1126,14 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
     *out_plan = nullptr;
 
     bool allow_cpu_fallback = opts ? opts->allow_cpu_fallback : false;
+    velri_plan *share_owner = nullptr;
+    if (opts && opts->share_weights_from) {
+        share_owner = opts->share_weights_from->weight_owner ? opts->share_weights_from->weight_owner
+                                                             : opts->share_weights_from;
+        if (share_owner->ctx != ctx) {
+            return VELRI_ERR_INVALID;
+        }
+    }
 
     for (uint32_t i = 0U; i < graph->num_storages; ++i) {
         if (graph->storages[i].device_id >= ctx->num_devices) {
@@ -1074,11 +1161,13 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
         }
         plan->storages = (velri_plan_storage *)buf;
 
-        plan->weight_bindings = (velri_plan_weight_binding *)calloc(
-            graph->num_storages, sizeof(*plan->weight_bindings));
-        if (!plan->weight_bindings) {
-            velri_plan_release(plan);
-            return VELRI_ERR_NOMEM;
+        if (!share_owner) {
+            plan->weight_bindings = (velri_plan_weight_binding *)calloc(
+                graph->num_storages, sizeof(*plan->weight_bindings));
+            if (!plan->weight_bindings) {
+                velri_plan_release(plan);
+                return VELRI_ERR_NOMEM;
+            }
         }
     }
 
@@ -1089,8 +1178,11 @@ velri_status velri_plan_prepare(velri_context *ctx, const velri_graph *graph,
         return st;
     }
 
-    /* Pack & allocate shared non-host WEIGHT slabs, plus STATE/IO arena layouts. */
-    st = pack_weight_slabs(plan);
+    /* Pack & allocate (or alias) shared non-host WEIGHT slabs, plus STATE/IO arena layouts. */
+    st = pack_weight_slabs(plan, share_owner == nullptr);
+    if (st == VELRI_OK && share_owner != nullptr) {
+        st = bind_shared_weights_from_owner(plan, share_owner);
+    }
     if (st == VELRI_OK) {
         st = pack_state_and_io_arenas(plan);
     }
@@ -1196,16 +1288,22 @@ void velri_plan_release(velri_plan *plan) {
                 }
             }
         }
-        for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
-            velri_device_entry *de = &plan->ctx->devices[d];
-            for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
-                if (plan->weight_slabs[d][s]) {
-                    de->vt->free(de->dev, plan->weight_slabs[d][s]);
+        if (!plan->weight_owner) {
+            for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
+                velri_device_entry *de = &plan->ctx->devices[d];
+                for (uint32_t s = 0U; s < plan->num_weight_slabs[d]; ++s) {
+                    if (plan->weight_slabs[d][s]) {
+                        de->vt->free(de->dev, plan->weight_slabs[d][s]);
+                    }
                 }
             }
         }
+        if (plan->weight_owner) {
+            velri_plan_release(plan->weight_owner);
+        }
         velri_context_release(plan->ctx);
     }
+    free(plan->weight_peer_sid);
     free(plan->weight_bindings);
     free(plan->steps);
     free(plan->storages);

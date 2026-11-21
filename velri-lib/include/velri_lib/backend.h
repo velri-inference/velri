@@ -187,6 +187,9 @@ typedef struct {
 static inline void velri_cancel_init(velri_cancel_token *tok) {
     if (tok) atomic_init(&tok->cancelled, false);
 }
+static inline void velri_cancel_clear(velri_cancel_token *tok) {
+    if (tok) atomic_store_explicit(&tok->cancelled, false, memory_order_release);
+}
 static inline void velri_cancel_request(velri_cancel_token *tok) {
     if (tok) atomic_store_explicit(&tok->cancelled, true, memory_order_release);
 }

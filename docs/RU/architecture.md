@@ -4,7 +4,7 @@
 
 **Velri** отвечает за уровень моделей и инференса: загрузку файлов модели и весов, сборку архитектур из переиспользуемых блоков, применение правил размещения, управление сеансами и генерацией. Все вычисления, граф запуска кернелов и бэкенды устройств инкапсулированы в библиотеке **`velri-lib/`** ([velri-lib/docs/RU/architecture.md](../../velri-lib/docs/RU/architecture.md)).
 
-**Статус:** реализованы и протестированы `VelriLib::velri` (CPU Slang AOT + опциональный Vulkan 1.3), потоковый C23 JSON и каскадное размещение (`src/format/json.{h,c}`, `src/config/placement.{h,c}`), а также слой моделей (`src/model/`). Публичный рантайм движка (`include/velri/`, `src/runtime/`), загрузчик `.vtq` и приложения запланированы в [roadmap.md](roadmap.md).
+**Статус:** реализованы и протестированы `VelriLib::velri` (CPU Slang AOT + опциональный Vulkan 1.3 с DAG-анализом барьеров, захватом командных буферов decode, FlashDecoding Split-KV и общими WEIGHT/STATE-аренами), потоковый C23 JSON и каскадное размещение (`src/format/json.{h,c}`, `src/config/placement.{h,c}`), слой моделей (`src/model/`: GPT-2, Llama/Qwen2), а также публичный C23 рантайм движка (`include/velri/velri.h`, `src/runtime/`). Загрузчик `.vtq`, токенизаторы и CLI/HTTP-приложения запланированы в [roadmap.md](roadmap.md).
 
 ---
 
@@ -32,9 +32,10 @@ flowchart TD
 
 | Проект / каталог | Статус | Ответственность |
 | :--- | :--- | :--- |
-| Velri: `include/velri/` | План | Публичный C23 API движка (`Context`, `Model`, `Program`, `Session`) |
-| Velri: `src/model/`, `src/config/`, `src/format/` | Активно (в работе) | Адаптеры семейств, хелперы слоёв, каскадный JSON-конфиг, потоковый JSON-сканер, чтение форматов весов |
-| Velri: `src/runtime/`, `apps/` | План | Сеансы, батчинг, семплирование, токенизация, CLI и HTTP/SSE-сервер |
+| Velri: `include/velri/` | Есть | Публичный C23 API движка (`Context`, `Model`, `Program`, `Session`, `Cancel`) |
+| Velri: `src/model/`, `src/config/`, `src/format/` | Активно (в работе) | Адаптеры семейств (`gpt2`, `llama`), хелперы слоёв, каскадный JSON-конфиг, потоковый JSON-сканер, чтение форматов весов |
+| Velri: `src/runtime/` | Есть (база) | Единый и двухплановый рантайм без дублирования памяти, сеансы, чанковый prefill, семплирование без аллокаций |
+| Velri: `apps/` | План | Токенизация, чат-шаблоны, CLI (`inspect`, `run`, `chat`, `bench`) и опциональный HTTP/SSE-сервер |
 | Velri: `tests/integration/` | Есть | Проверка подключения публичного C API и CMake-пакета `VelriLib` |
 | `velri-lib/` | Частично есть | Тензоры, граф, Slang AOT-кернелы, бэкенды CPU/Vulkan, `velri_pool` ([подробнее](../../velri-lib/docs/RU/architecture.md)) |
 

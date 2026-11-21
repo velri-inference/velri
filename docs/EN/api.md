@@ -4,7 +4,7 @@
 
 This document defines the target public **C23 engine API** (`include/velri/`) and planned applications built on top of it. Internal computation, backends, and graphs belong to `velri-lib` ([velri-lib/docs/EN/architecture.md](../../velri-lib/docs/EN/architecture.md)); `Velri` owns models, sessions, and generation.
 
-**Status:** interface proposal. Public `include/velri/` headers and CLI applications are not implemented yet.
+**Status:** the core public C23 engine API ([`include/velri/velri.h`](../../include/velri/velri.h)) and runtime (`src/runtime/engine.c`, `src/runtime/sampler.{h,c}`) — covering `Context`, `Model`, single/dual-plan zero-duplication `Program`, `Session`, cancellation, and zero-allocation sampling — are implemented and verified by `engine_runtime`. Real `.vtq` weight loading, tokenizers, chat templates, and CLI/HTTP applications remain planned.
 
 ---
 

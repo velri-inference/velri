@@ -29,10 +29,10 @@ Implemented the `VelriLib::core` library core ([velri-lib/docs/EN/architecture.m
 
 ---
 
-### Stage 3 — End-to-End Synthetic CPU Decoder
-Assemble initial reusable blocks, `Model`, `Program`, and `Session` in `Velri` ([blocks-and-config.md](blocks-and-config.md), [api.md](api.md)).
+### Stage 3 *(Completed)* — End-to-End Synthetic Decoder & Engine Skeleton (CPU + Vulkan + Hybrid)
+Assembled reusable blocks (`velri-lib/include/velri_lib/blocks.h`), streaming C23 JSON & cascading placement (`src/format/json.{h,c}`, `src/config/placement.{h,c}`), declarative GPT-2 and Llama/Qwen2 architectures (`src/model/arch/{gpt2,llama}.c`), DAG barrier elision + persistent Vulkan decode graph capture + FlashDecoding Split-KV, and the public C23 runtime (`include/velri/velri.h`: `Context`, `Model`, single/dual-plan zero-duplication `Program`, `Session`, zero-alloc sampler).
 
-**Acceptance:** synthetic `prefill` and `decode` match independent fixtures across arbitrary step splits; shared storage and derived K/V allocate no redundant buffers; session isolation and cancellation are verified.
+**Verified:** synthetic `prefill` and `decode` match independent fixtures across chunked/single-token splits, CPU, Vulkan, and hybrid `prefill-compute != compute` dual-plan placements with 0 weight/KV duplication, `0 B` hot-path allocations, multi-session isolation, and safe cancellation/reset (`gpt2_blocks`, `config_placement`, `engine_runtime`, `core_contract`).
 
 ---
 
@@ -44,7 +44,7 @@ Add block-level and quantized Slang CPU kernels, close the recorded `slang-llvm`
 ---
 
 ### Stage 5 — Real Model Loading
-Implement JSON configuration (`yyjson`), weight-format loading, initial dense family adapters (`Llama` / `Qwen3`), tokenizer, chat templates, and CLI `inspect` / `run`.
+Implement `.vtq` weight-format loading (using the built-in streaming C23 JSON footer scanner), real weight binding for dense family adapters (`GPT-2` / `Llama` / `Qwen`), tokenizer, chat templates, and CLI `inspect` / `run`.
 
 **Acceptance:** full-model `token IDs` and logits match an independent reference; `inspect` accurately reports devices, resolved placement, and memory budgets.
 
