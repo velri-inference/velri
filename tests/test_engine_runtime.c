@@ -78,107 +78,63 @@ static void bind_w(velri_model *m, weight_pool *p, const char *name, size_t elem
     CHECK_RC(velri_model_bind_weight(m, name, w, elems * sizeof(float)), name);
 }
 
+static void bind_wf(velri_model *m, weight_pool *p, uint32_t *seed, float scale, float bias,
+                    size_t elems, const char *fmt, uint32_t layer) {
+    char name[128];
+    snprintf(name, sizeof(name), fmt, layer);
+    bind_w(m, p, name, elems, (*seed)++, scale, bias);
+}
+
 static void populate_gpt2_weights(velri_model *m, const velri_model_desc *d, weight_pool *p) {
-    uint32_t V = d->vocab_size;
-    uint32_t P = d->max_position_embeddings;
-    uint32_t D = d->hidden_size;
-    uint32_t I = d->intermediate_size;
-    uint32_t seed = 100U;
+    uint32_t V = d->vocab_size, P = d->max_position_embeddings;
+    uint32_t D = d->hidden_size, I = d->intermediate_size, seed = 100U;
 
     bind_w(m, p, "transformer.wte.weight", (size_t)V * D, seed++, 0.12f, 0.0f);
     bind_w(m, p, "transformer.wpe.weight", (size_t)P * D, seed++, 0.04f, 0.0f);
-
     for (uint32_t l = 0U; l < d->num_hidden_layers; ++l) {
-        char name[128];
-        snprintf(name, sizeof(name), "transformer.h.%u.ln_1.weight", l);
-        bind_w(m, p, name, D, seed++, 0.05f, 1.0f);
-        snprintf(name, sizeof(name), "transformer.h.%u.ln_1.bias", l);
-        bind_w(m, p, name, D, seed++, 0.02f, 0.0f);
-
-        snprintf(name, sizeof(name), "transformer.h.%u.attn.c_attn.weight", l);
-        bind_w(m, p, name, (size_t)(3U * D) * D, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "transformer.h.%u.attn.c_attn.bias", l);
-        bind_w(m, p, name, 3U * D, seed++, 0.02f, 0.0f);
-
-        snprintf(name, sizeof(name), "transformer.h.%u.attn.c_proj.weight", l);
-        bind_w(m, p, name, (size_t)D * D, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "transformer.h.%u.attn.c_proj.bias", l);
-        bind_w(m, p, name, D, seed++, 0.02f, 0.0f);
-
-        snprintf(name, sizeof(name), "transformer.h.%u.ln_2.weight", l);
-        bind_w(m, p, name, D, seed++, 0.05f, 1.0f);
-        snprintf(name, sizeof(name), "transformer.h.%u.ln_2.bias", l);
-        bind_w(m, p, name, D, seed++, 0.02f, 0.0f);
-
-        snprintf(name, sizeof(name), "transformer.h.%u.mlp.c_fc.weight", l);
-        bind_w(m, p, name, (size_t)I * D, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "transformer.h.%u.mlp.c_fc.bias", l);
-        bind_w(m, p, name, I, seed++, 0.02f, 0.0f);
-
-        snprintf(name, sizeof(name), "transformer.h.%u.mlp.c_proj.weight", l);
-        bind_w(m, p, name, (size_t)D * I, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "transformer.h.%u.mlp.c_proj.bias", l);
-        bind_w(m, p, name, D, seed++, 0.02f, 0.0f);
+        bind_wf(m, p, &seed, 0.05f, 1.0f, D,                "transformer.h.%u.ln_1.weight", l);
+        bind_wf(m, p, &seed, 0.02f, 0.0f, D,                "transformer.h.%u.ln_1.bias", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)3U*D*D,   "transformer.h.%u.attn.c_attn.weight", l);
+        bind_wf(m, p, &seed, 0.02f, 0.0f, 3U * D,           "transformer.h.%u.attn.c_attn.bias", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)D * D,    "transformer.h.%u.attn.c_proj.weight", l);
+        bind_wf(m, p, &seed, 0.02f, 0.0f, D,                "transformer.h.%u.attn.c_proj.bias", l);
+        bind_wf(m, p, &seed, 0.05f, 1.0f, D,                "transformer.h.%u.ln_2.weight", l);
+        bind_wf(m, p, &seed, 0.02f, 0.0f, D,                "transformer.h.%u.ln_2.bias", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)I * D,    "transformer.h.%u.mlp.c_fc.weight", l);
+        bind_wf(m, p, &seed, 0.02f, 0.0f, I,                "transformer.h.%u.mlp.c_fc.bias", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)D * I,    "transformer.h.%u.mlp.c_proj.weight", l);
+        bind_wf(m, p, &seed, 0.02f, 0.0f, D,                "transformer.h.%u.mlp.c_proj.bias", l);
     }
-
     bind_w(m, p, "transformer.ln_f.weight", D, seed++, 0.05f, 1.0f);
     bind_w(m, p, "transformer.ln_f.bias", D, seed++, 0.02f, 0.0f);
-    if (!d->tie_word_embeddings) {
-        bind_w(m, p, "lm_head.weight", (size_t)V * D, seed++, 0.08f, 0.0f);
-    }
+    if (!d->tie_word_embeddings) bind_w(m, p, "lm_head.weight", (size_t)V * D, seed++, 0.08f, 0.0f);
 }
 
 static void populate_llama_weights(velri_model *m, const velri_model_desc *d, weight_pool *p) {
-    uint32_t V = d->vocab_size;
-    uint32_t D = d->hidden_size;
-    uint32_t I = d->intermediate_size;
-    uint32_t nh = d->num_attention_heads;
-    uint32_t nkvh = d->num_key_value_heads ? d->num_key_value_heads : nh;
+    uint32_t V = d->vocab_size, D = d->hidden_size, I = d->intermediate_size;
+    uint32_t nh = d->num_attention_heads, nkvh = d->num_key_value_heads ? d->num_key_value_heads : nh;
     uint32_t hd = d->head_dim ? d->head_dim : (D / nh);
-    uint32_t q_dim = nh * hd;
-    uint32_t kv_dim = nkvh * hd;
-    uint32_t seed = 500U;
+    uint32_t q_dim = nh * hd, kv_dim = nkvh * hd, seed = 500U;
 
     bind_w(m, p, "model.embed_tokens.weight", (size_t)V * D, seed++, 0.12f, 0.0f);
-
     for (uint32_t l = 0U; l < d->num_hidden_layers; ++l) {
-        char name[128];
-        snprintf(name, sizeof(name), "model.layers.%u.input_layernorm.weight", l);
-        bind_w(m, p, name, D, seed++, 0.05f, 1.0f);
-
-        snprintf(name, sizeof(name), "model.layers.%u.self_attn.q_proj.weight", l);
-        bind_w(m, p, name, (size_t)q_dim * D, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "model.layers.%u.self_attn.k_proj.weight", l);
-        bind_w(m, p, name, (size_t)kv_dim * D, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "model.layers.%u.self_attn.v_proj.weight", l);
-        bind_w(m, p, name, (size_t)kv_dim * D, seed++, 0.08f, 0.0f);
+        bind_wf(m, p, &seed, 0.05f, 1.0f, D,                 "model.layers.%u.input_layernorm.weight", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)q_dim*D,   "model.layers.%u.self_attn.q_proj.weight", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)kv_dim*D,  "model.layers.%u.self_attn.k_proj.weight", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)kv_dim*D,  "model.layers.%u.self_attn.v_proj.weight", l);
         if (d->qkv_bias) {
-            snprintf(name, sizeof(name), "model.layers.%u.self_attn.q_proj.bias", l);
-            bind_w(m, p, name, q_dim, seed++, 0.02f, 0.0f);
-            snprintf(name, sizeof(name), "model.layers.%u.self_attn.k_proj.bias", l);
-            bind_w(m, p, name, kv_dim, seed++, 0.02f, 0.0f);
-            snprintf(name, sizeof(name), "model.layers.%u.self_attn.v_proj.bias", l);
-            bind_w(m, p, name, kv_dim, seed++, 0.02f, 0.0f);
+            bind_wf(m, p, &seed, 0.02f, 0.0f, q_dim,         "model.layers.%u.self_attn.q_proj.bias", l);
+            bind_wf(m, p, &seed, 0.02f, 0.0f, kv_dim,        "model.layers.%u.self_attn.k_proj.bias", l);
+            bind_wf(m, p, &seed, 0.02f, 0.0f, kv_dim,        "model.layers.%u.self_attn.v_proj.bias", l);
         }
-
-        snprintf(name, sizeof(name), "model.layers.%u.self_attn.o_proj.weight", l);
-        bind_w(m, p, name, (size_t)D * q_dim, seed++, 0.08f, 0.0f);
-
-        snprintf(name, sizeof(name), "model.layers.%u.post_attention_layernorm.weight", l);
-        bind_w(m, p, name, D, seed++, 0.05f, 1.0f);
-
-        snprintf(name, sizeof(name), "model.layers.%u.mlp.gate_proj.weight", l);
-        bind_w(m, p, name, (size_t)I * D, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "model.layers.%u.mlp.up_proj.weight", l);
-        bind_w(m, p, name, (size_t)I * D, seed++, 0.08f, 0.0f);
-        snprintf(name, sizeof(name), "model.layers.%u.mlp.down_proj.weight", l);
-        bind_w(m, p, name, (size_t)D * I, seed++, 0.08f, 0.0f);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)D*q_dim,   "model.layers.%u.self_attn.o_proj.weight", l);
+        bind_wf(m, p, &seed, 0.05f, 1.0f, D,                 "model.layers.%u.post_attention_layernorm.weight", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)I * D,     "model.layers.%u.mlp.gate_proj.weight", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)I * D,     "model.layers.%u.mlp.up_proj.weight", l);
+        bind_wf(m, p, &seed, 0.08f, 0.0f, (size_t)D * I,     "model.layers.%u.mlp.down_proj.weight", l);
     }
-
     bind_w(m, p, "model.norm.weight", D, seed++, 0.05f, 1.0f);
-    if (!d->tie_word_embeddings) {
-        bind_w(m, p, "lm_head.weight", (size_t)V * D, seed++, 0.08f, 0.0f);
-    }
+    if (!d->tie_word_embeddings) bind_w(m, p, "lm_head.weight", (size_t)V * D, seed++, 0.08f, 0.0f);
 }
 
 static float max_abs_diff(const float *a, const float *b, uint32_t n) {

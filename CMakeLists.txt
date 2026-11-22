@@ -29,11 +29,17 @@ endif()
 add_library(velri_engine STATIC
     src/format/json.c
     src/config/placement.c
+    src/config/placement_resolve.c
+    src/config/placement_inspect.c
     src/model/layers.c
     src/model/arch/gpt2.c
     src/model/arch/llama.c
+    src/model/arch_registry.c
     src/runtime/sampler.c
-    src/runtime/engine.c
+    src/runtime/context.c
+    src/runtime/model.c
+    src/runtime/program.c
+    src/runtime/session.c
 )
 target_include_directories(velri_engine
     PUBLIC  "${CMAKE_CURRENT_SOURCE_DIR}/include"

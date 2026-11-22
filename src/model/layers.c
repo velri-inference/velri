@@ -1,4 +1,5 @@
 #include "model/layers.h"
+#include "config/placement_scopes.h"
 
 #include <math.h>
 
@@ -16,7 +17,7 @@ velri_tensor velri_layer_embedding(velri_builder *b, const velri_model_params *p
         return VELRI_TENSOR_NONE;
     }
     const velri_embedding_spec spec = {
-        .scope = "input-layer",
+        .scope = VELRI_SCOPE_INPUT_LAYER,
         .token_weight = token_weight,
         .pos_weight = pos_weight,
         .vocab_size = p->vocab_size,
@@ -44,9 +45,9 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
     }
 
     const velri_layer_spec spec = {
-        .scope = "hidden-layers",
-        .attn_scope = "attention",
-        .mlp_scope = "dense-mlp",
+        .scope = VELRI_SCOPE_HIDDEN_LAYERS,
+        .attn_scope = VELRI_SCOPE_KEY_ATTENTION,
+        .mlp_scope = VELRI_SCOPE_KEY_DENSE_MLP,
         .norm1_name = desc->norm1,
         .norm2_name = desc->norm2,
         .norm = {
@@ -57,7 +58,7 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
         },
         .attn = {
             .scope = nullptr,
-            .kv_cache_scope = "kv-cache",
+            .kv_cache_scope = VELRI_SCOPE_KEY_KV_CACHE,
             .state_prefix = desc->state_prefix,
             .qkv_name = desc->qkv,
             .q_name = desc->q_proj,
@@ -78,8 +79,8 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
                 .enabled = desc->has_rope,
                 .rotary_dim = p->rotary_dim,
                 .mode = p->rope_mode,
-                .cos_name = "model.rope.cos",
-                .sin_name = "model.rope.sin",
+                .cos_name = VELRI_WEIGHT_ROPE_COS,
+                .sin_name = VELRI_WEIGHT_ROPE_SIN,
             },
             .dtype = p->dtype,
         },
@@ -116,7 +117,7 @@ velri_tensor velri_layer_lm_head(velri_builder *b, velri_tensor x, const velri_m
         return VELRI_TENSOR_NONE;
     }
     const velri_lm_head_spec spec = {
-        .scope = "lm-head",
+        .scope = VELRI_SCOPE_LM_HEAD,
         .norm_name = desc->norm_name,
         .norm = {
             .kind = desc->norm_kind,

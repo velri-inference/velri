@@ -186,6 +186,14 @@ velri_status velri_placement_resolve(const velri_placement_plan *plan, const cha
 bool velri_placement_has_distinct_prefill(const velri_placement_plan *plan,
                                           uint32_t num_hidden_layers);
 
+/* Scope-filtered distinct prefill check for concrete model architectures. */
+bool velri_placement_has_distinct_prefill_for_scopes(const velri_placement_plan *plan,
+                                                     const char *const *root_scopes,
+                                                     uint32_t num_root_scopes,
+                                                     const char *const *layer_scopes,
+                                                     uint32_t num_layer_scopes,
+                                                     uint32_t num_hidden_layers);
+
 /* `velri_placement_resolve_fn` callback for `velri_b_init`. `user` is `velri_placement_builder_adapter*`. */
 void velri_placement_builder_cb(const char *scope_path, int32_t layer_idx, void *user,
                                 velri_device_id *out_store, velri_device_id *out_compute);
@@ -194,5 +202,10 @@ void velri_placement_builder_cb(const char *scope_path, int32_t layer_idx, void 
 size_t velri_placement_format_inspect(const velri_placement_plan *plan, uint32_t num_hidden_layers,
                                       const velri_memory_report *mem_report, char *out_buf,
                                       size_t out_cap);
+
+/* Format ONLY the device/backend/placement sections (without Memory Plan), for engine-level reports. */
+size_t velri_placement_format_inspect_placement(const velri_placement_plan *plan,
+                                                uint32_t num_hidden_layers, char *out_buf,
+                                                size_t out_cap);
 
 #endif /* VELRI_CONFIG_PLACEMENT_H */

@@ -244,8 +244,9 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
         if (m == 0U) {
             valid &= ~UINT64_C(1); /* slot 0 is caller */
         }
-        if ((m + 1U) * 64U > nw) {
-            size_t rem = nw - m * 64U;
+        size_t base = m * 64U;
+        if (nw > base && nw - base < 64U) {
+            size_t rem = nw - base;
             valid &= (UINT64_C(1) << rem) - UINT64_C(1);
         }
         uint64_t pm = atomic_load_explicit(&pool->parked_mask[m], memory_order_relaxed) & valid;

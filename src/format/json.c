@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ---- Internal Cursor & Diagnostic Helpers ---- */
+/* ---- Internal Cursor, UTF-8 & Escape Helpers ---- */
 
 static velri_status json_fail(velri_json_reader *r, velri_status st, const char *msg) {
     if (r && r->err_msg[0] == '\0') {
@@ -17,33 +17,35 @@ static velri_status json_fail(velri_json_reader *r, velri_status st, const char 
     return st;
 }
 
-static inline void advance_byte(velri_json_reader *r) {
-    if (r->pos < r->len) {
-        if (r->data[r->pos] == '\n') {
+static inline void advance_n(velri_json_reader *r, size_t n) {
+    while (n-- > 0U && r->pos < r->len) {
+        if (r->data[r->pos++] == '\n') {
             r->line++;
             r->col = 1U;
         } else {
             r->col++;
         }
-        r->pos++;
     }
 }
 
 static void skip_ws(velri_json_reader *r) {
     while (r->pos < r->len) {
         char c = r->data[r->pos];
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            advance_byte(r);
-        } else {
-            break;
-        }
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') break;
+        advance_n(r, 1U);
     }
 }
 
 static int hex_val(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (c - 'A');
+    }
     return -1;
 }
 
@@ -60,88 +62,136 @@ static bool parse_hex4(const char *p, uint32_t *out) {
     return true;
 }
 
-static bool append_utf8(uint32_t cp, char *dst, size_t dst_cap, size_t *pos) {
-    char tmp[4];
-    size_t n = 0U;
+static size_t encode_utf8(uint32_t cp, char out[4]) {
     if (cp <= 0x7FU) {
-        tmp[0] = (char)cp;
-        n = 1U;
-    } else if (cp <= 0x7FFU) {
-        tmp[0] = (char)(0xC0U | (cp >> 6U));
-        tmp[1] = (char)(0x80U | (cp & 0x3FU));
-        n = 2U;
-    } else if (cp <= 0xFFFFU) {
-        tmp[0] = (char)(0xE0U | (cp >> 12U));
-        tmp[1] = (char)(0x80U | ((cp >> 6U) & 0x3FU));
-        tmp[2] = (char)(0x80U | (cp & 0x3FU));
-        n = 3U;
-    } else if (cp <= 0x10FFFFU) {
-        tmp[0] = (char)(0xF0U | (cp >> 18U));
-        tmp[1] = (char)(0x80U | ((cp >> 12U) & 0x3FU));
-        tmp[2] = (char)(0x80U | ((cp >> 6U) & 0x3FU));
-        tmp[3] = (char)(0x80U | (cp & 0x3FU));
-        n = 4U;
-    } else {
-        return false;
+        out[0] = (char)cp;
+        return 1U;
     }
-    if (*pos + n >= dst_cap) {
-        return false;
+    if (cp <= 0x7FFU) {
+        out[0] = (char)(0xC0U | (cp >> 6U));
+        out[1] = (char)(0x80U | (cp & 0x3FU));
+        return 2U;
     }
-    memcpy(dst + *pos, tmp, n);
-    *pos += n;
-    return true;
+    if (cp <= 0xFFFFU) {
+        out[0] = (char)(0xE0U | (cp >> 12U));
+        out[1] = (char)(0x80U | ((cp >> 6U) & 0x3FU));
+        out[2] = (char)(0x80U | (cp & 0x3FU));
+        return 3U;
+    }
+    if (cp <= 0x10FFFFU) {
+        out[0] = (char)(0xF0U | (cp >> 18U));
+        out[1] = (char)(0x80U | ((cp >> 12U) & 0x3FU));
+        out[2] = (char)(0x80U | ((cp >> 6U) & 0x3FU));
+        out[3] = (char)(0x80U | (cp & 0x3FU));
+        return 4U;
+    }
+    return 0U;
 }
 
-/* Scan and strictly validate a RFC 8259 number token starting at r->pos (after skip_ws). */
+/* Decode one raw byte or escape sequence (incl. UTF-16 surrogate pair) into 1..4 UTF-8 bytes. */
+static bool decode_next_unit(const char *s, size_t len, size_t *pos, char out[4], size_t *out_n,
+                             bool reject_nul) {
+    char c = s[(*pos)++];
+    if (c != '\\') {
+        out[0] = c;
+        *out_n = 1U;
+        return true;
+    }
+    if (*pos >= len) return false;
+    char esc = s[(*pos)++];
+    switch (esc) {
+    case '"':  out[0] = '"';  *out_n = 1U; return true;
+    case '\\': out[0] = '\\'; *out_n = 1U; return true;
+    case '/':  out[0] = '/';  *out_n = 1U; return true;
+    case 'b':  out[0] = '\b'; *out_n = 1U; return true;
+    case 'f':  out[0] = '\f'; *out_n = 1U; return true;
+    case 'n':  out[0] = '\n'; *out_n = 1U; return true;
+    case 'r':  out[0] = '\r'; *out_n = 1U; return true;
+    case 't':  out[0] = '\t'; *out_n = 1U; return true;
+    case 'u': {
+        uint32_t u1 = 0U;
+        if (len - *pos < 4U || !parse_hex4(s + *pos, &u1)) return false;
+        *pos += 4U;
+        uint32_t cp = u1;
+        if (u1 >= 0xD800U && u1 <= 0xDBFFU) {
+            uint32_t u2 = 0U;
+            if (len - *pos < 6U || s[*pos] != '\\' || s[*pos + 1U] != 'u' ||
+                !parse_hex4(s + *pos + 2U, &u2) || u2 < 0xDC00U || u2 > 0xDFFFU) {
+                return false;
+            }
+            *pos += 6U;
+            cp = 0x10000U + (((u1 - 0xD800U) << 10U) | (u2 - 0xDC00U));
+        } else if (u1 >= 0xDC00U && u1 <= 0xDFFFU) {
+            return false;
+        }
+        if (reject_nul && cp == 0U) return false;
+        *out_n = encode_utf8(cp, out);
+        return *out_n > 0U;
+    }
+    default:
+        return false;
+    }
+}
+
+/* Validate RFC 3629 multi-byte UTF-8 sequence starting at `p[0]` (lead >= 0x80); returns 0 on error. */
+static size_t valid_utf8_len(const unsigned char *p, size_t avail) {
+    unsigned char c = p[0];
+    if (c >= 0xC2U && c <= 0xDFU) {
+        return (avail >= 2U && (p[1] & 0xC0U) == 0x80U) ? 2U : 0U;
+    }
+    if (c >= 0xE0U && c <= 0xEFU) {
+        if (avail < 3U || (p[1] & 0xC0U) != 0x80U || (p[2] & 0xC0U) != 0x80U) return 0U;
+        if ((c == 0xE0U && p[1] < 0xA0U) || (c == 0xEDU && p[1] >= 0xA0U)) return 0U;
+        return 3U;
+    }
+    if (c >= 0xF0U && c <= 0xF4U) {
+        if (avail < 4U || (p[1] & 0xC0U) != 0x80U || (p[2] & 0xC0U) != 0x80U ||
+            (p[3] & 0xC0U) != 0x80U) {
+            return 0U;
+        }
+        if ((c == 0xF0U && p[1] < 0x90U) || (c == 0xF4U && p[1] > 0x8FU)) return 0U;
+        return 4U;
+    }
+    return 0U;
+}
+
 static velri_status scan_number(velri_json_reader *r, size_t *out_start, size_t *out_len,
                                 bool *out_is_float) {
     skip_ws(r);
     size_t start = r->pos;
     bool is_float = false;
 
-    if (r->pos < r->len && r->data[r->pos] == '-') {
-        advance_byte(r);
-    }
-    if (r->pos >= r->len) {
-        return json_fail(r, VELRI_ERR_INVALID, "unexpected end of input in number");
-    }
+    if (r->pos < r->len && r->data[r->pos] == '-') advance_n(r, 1U);
+    if (r->pos >= r->len) return json_fail(r, VELRI_ERR_INVALID, "unexpected end of input in number");
+
     if (r->data[r->pos] == '0') {
-        advance_byte(r);
+        advance_n(r, 1U);
         if (r->pos < r->len && r->data[r->pos] >= '0' && r->data[r->pos] <= '9') {
             return json_fail(r, VELRI_ERR_INVALID, "leading zero in number");
         }
     } else if (r->data[r->pos] >= '1' && r->data[r->pos] <= '9') {
-        advance_byte(r);
-        while (r->pos < r->len && r->data[r->pos] >= '0' && r->data[r->pos] <= '9') {
-            advance_byte(r);
-        }
+        while (r->pos < r->len && r->data[r->pos] >= '0' && r->data[r->pos] <= '9') advance_n(r, 1U);
     } else {
         return json_fail(r, VELRI_ERR_INVALID, "expected number");
     }
 
     if (r->pos < r->len && r->data[r->pos] == '.') {
         is_float = true;
-        advance_byte(r);
+        advance_n(r, 1U);
         if (r->pos >= r->len || r->data[r->pos] < '0' || r->data[r->pos] > '9') {
             return json_fail(r, VELRI_ERR_INVALID, "expected digit after decimal point");
         }
-        while (r->pos < r->len && r->data[r->pos] >= '0' && r->data[r->pos] <= '9') {
-            advance_byte(r);
-        }
+        while (r->pos < r->len && r->data[r->pos] >= '0' && r->data[r->pos] <= '9') advance_n(r, 1U);
     }
 
     if (r->pos < r->len && (r->data[r->pos] == 'e' || r->data[r->pos] == 'E')) {
         is_float = true;
-        advance_byte(r);
-        if (r->pos < r->len && (r->data[r->pos] == '+' || r->data[r->pos] == '-')) {
-            advance_byte(r);
-        }
+        advance_n(r, 1U);
+        if (r->pos < r->len && (r->data[r->pos] == '+' || r->data[r->pos] == '-')) advance_n(r, 1U);
         if (r->pos >= r->len || r->data[r->pos] < '0' || r->data[r->pos] > '9') {
             return json_fail(r, VELRI_ERR_INVALID, "expected digit in exponent");
         }
-        while (r->pos < r->len && r->data[r->pos] >= '0' && r->data[r->pos] <= '9') {
-            advance_byte(r);
-        }
+        while (r->pos < r->len && r->data[r->pos] >= '0' && r->data[r->pos] <= '9') advance_n(r, 1U);
     }
 
     if (out_start) *out_start = start;
@@ -150,12 +200,144 @@ static velri_status scan_number(velri_json_reader *r, size_t *out_start, size_t 
     return VELRI_OK;
 }
 
+static velri_status begin_container(velri_json_reader *r, velri_json_iter *it, char open_ch,
+                                    const char *err_msg) {
+    if (!r || !it || !r->data) return VELRI_ERR_INVALID;
+    skip_ws(r);
+    if (r->pos >= r->len || r->data[r->pos] != open_ch) {
+        return json_fail(r, VELRI_ERR_INVALID, err_msg);
+    }
+    if (r->depth >= VELRI_JSON_MAX_DEPTH) {
+        return json_fail(r, VELRI_ERR_OVERFLOW, "maximum JSON nesting depth exceeded");
+    }
+    advance_n(r, 1U);
+    r->depth++;
+    it->first = true;
+    it->done = false;
+    return VELRI_OK;
+}
+
+static velri_status next_container_item(velri_json_reader *r, velri_json_iter *it, char close_ch,
+                                        bool *out_has_more) {
+    if (!r || !it || !out_has_more || it->done) return VELRI_ERR_INVALID;
+    skip_ws(r);
+    if (r->pos >= r->len) return json_fail(r, VELRI_ERR_INVALID, "unexpected end of input in container");
+    if (r->data[r->pos] == close_ch) {
+        advance_n(r, 1U);
+        if (r->depth > 0U) r->depth--;
+        it->done = true;
+        *out_has_more = false;
+        return VELRI_OK;
+    }
+    if (!it->first) {
+        if (r->data[r->pos] != ',') return json_fail(r, VELRI_ERR_INVALID, "expected ',' or closing delimiter");
+        advance_n(r, 1U);
+        skip_ws(r);
+        if (r->pos >= r->len || r->data[r->pos] == close_ch) {
+            return json_fail(r, VELRI_ERR_INVALID, "trailing comma in container");
+        }
+    }
+    it->first = false;
+    *out_has_more = true;
+    return VELRI_OK;
+}
+
+/* Locale-independent ASCII decimal-to-IEEE-754 double parser (immune to LC_NUMERIC). */
+static velri_status parse_ascii_f64(const char *s, size_t nlen, double *out) {
+    size_t i = 0U;
+    bool neg = (i < nlen && s[i] == '-');
+    if (neg) i++;
+
+    uint64_t sig = 0U;
+    uint32_t sig_digits = 0U;
+    int64_t exp10 = 0;
+    bool in_frac = false;
+
+    while (i < nlen) {
+        char c = s[i];
+        if (c == '.') {
+            in_frac = true;
+            i++;
+            continue;
+        }
+        if (c < '0' || c > '9') break;
+        uint32_t d = (uint32_t)(c - '0');
+        i++;
+        if (sig == 0U && d == 0U) {
+            if (in_frac && exp10 > -1000000) exp10--;
+            continue;
+        }
+        if (sig_digits < 19U) {
+            sig = sig * 10U + (uint64_t)d;
+            sig_digits++;
+            if (in_frac && exp10 > -1000000) exp10--;
+        } else if (!in_frac && exp10 < 1000000) {
+            exp10++;
+        }
+    }
+
+    if (i < nlen && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        bool eneg = (i < nlen && s[i] == '-');
+        if (i < nlen && (s[i] == '+' || s[i] == '-')) i++;
+        int64_t eval = 0;
+        while (i < nlen && s[i] >= '0' && s[i] <= '9') {
+            if (eval < 1000000) eval = eval * 10 + (int64_t)(s[i] - '0');
+            i++;
+        }
+        exp10 += eneg ? -eval : eval;
+    }
+
+    if (sig == 0U) {
+        *out = neg ? -0.0 : 0.0;
+        return VELRI_OK;
+    }
+    int64_t sci_exp = exp10 + (int64_t)sig_digits - 1;
+    if (sci_exp > 309) return VELRI_ERR_OVERFLOW;
+    if (sci_exp < -326) {
+        *out = neg ? -0.0 : 0.0;
+        return VELRI_OK;
+    }
+
+    double v = (double)sig;
+    if (exp10 > 300) {
+        v = v * pow(10.0, (double)(exp10 - 300)) * 1e300;
+    } else if (exp10 > 0) {
+        v *= pow(10.0, (double)exp10);
+    } else if (exp10 >= -22) {
+        v /= pow(10.0, (double)(-exp10));
+    } else if (exp10 < -300) {
+        v = v * pow(10.0, (double)(exp10 + 300)) * 1e-300;
+    } else {
+        v *= pow(10.0, (double)exp10);
+    }
+
+    if (!isfinite(v)) return VELRI_ERR_OVERFLOW;
+    *out = neg ? -v : v;
+    return VELRI_OK;
+}
+
+static velri_status read_int_buf(velri_json_reader *r, bool allow_neg, char buf[64],
+                                 size_t *out_len) {
+    size_t start = 0U, nlen = 0U;
+    bool is_float = false;
+    velri_status st = scan_number(r, &start, &nlen, &is_float);
+    if (st != VELRI_OK) return st;
+    if (is_float || (!allow_neg && r->data[start] == '-')) {
+        return json_fail(r, VELRI_ERR_INVALID,
+                         allow_neg ? "expected integer" : "expected non-negative integer");
+    }
+    if (nlen >= 64U) return json_fail(r, VELRI_ERR_OVERFLOW, "integer literal too long");
+    memcpy(buf, r->data + start, nlen);
+    buf[nlen] = '\0';
+    *out_len = nlen;
+    return VELRI_OK;
+}
+
 /* ---- Public API ---- */
 
 void velri_json_init(velri_json_reader *r, const char *data, size_t len) {
-    if (!r) {
-        return;
-    }
+    if (!r) return;
     memset(r, 0, sizeof(*r));
     r->data = data;
     r->len = data ? len : 0U;
@@ -164,13 +346,9 @@ void velri_json_init(velri_json_reader *r, const char *data, size_t len) {
 }
 
 velri_json_type velri_json_peek(velri_json_reader *r) {
-    if (!r || !r->data) {
-        return VELRI_JSON_INVALID;
-    }
+    if (!r || !r->data) return VELRI_JSON_INVALID;
     skip_ws(r);
-    if (r->pos >= r->len) {
-        return VELRI_JSON_INVALID;
-    }
+    if (r->pos >= r->len) return VELRI_JSON_INVALID;
     char c = r->data[r->pos];
     if (c == '{') return VELRI_JSON_OBJECT;
     if (c == '[') return VELRI_JSON_ARRAY;
@@ -182,127 +360,43 @@ velri_json_type velri_json_peek(velri_json_reader *r) {
 }
 
 velri_status velri_json_begin_object(velri_json_reader *r, velri_json_iter *it) {
-    if (!r || !it || !r->data) {
-        return VELRI_ERR_INVALID;
-    }
-    skip_ws(r);
-    if (r->pos >= r->len || r->data[r->pos] != '{') {
-        return json_fail(r, VELRI_ERR_INVALID, "expected '{'");
-    }
-    if (r->depth >= VELRI_JSON_MAX_DEPTH) {
-        return json_fail(r, VELRI_ERR_OVERFLOW, "maximum JSON nesting depth exceeded");
-    }
-    advance_byte(r);
-    r->depth++;
-    it->first = true;
-    it->done = false;
-    return VELRI_OK;
+    return begin_container(r, it, '{', "expected '{'");
+}
+
+velri_status velri_json_begin_array(velri_json_reader *r, velri_json_iter *it) {
+    return begin_container(r, it, '[', "expected '['");
 }
 
 velri_status velri_json_next_member(velri_json_reader *r, velri_json_iter *it,
                                     velri_json_str *out_key, bool *out_has_more) {
-    if (!r || !it || !out_key || !out_has_more || it->done) {
-        return VELRI_ERR_INVALID;
-    }
-    skip_ws(r);
-    if (r->pos >= r->len) {
-        return json_fail(r, VELRI_ERR_INVALID, "unexpected end of input inside object");
-    }
-    if (r->data[r->pos] == '}') {
-        advance_byte(r);
-        if (r->depth > 0U) {
-            r->depth--;
-        }
-        it->done = true;
-        *out_has_more = false;
+    if (!out_key) return VELRI_ERR_INVALID;
+    velri_status st = next_container_item(r, it, '}', out_has_more);
+    if (st != VELRI_OK || !*out_has_more) {
         memset(out_key, 0, sizeof(*out_key));
-        return VELRI_OK;
-    }
-    if (!it->first) {
-        if (r->data[r->pos] != ',') {
-            return json_fail(r, VELRI_ERR_INVALID, "expected ',' or '}' in object");
-        }
-        advance_byte(r);
-        skip_ws(r);
-        if (r->pos >= r->len || r->data[r->pos] == '}') {
-            return json_fail(r, VELRI_ERR_INVALID, "trailing comma in object");
-        }
-    }
-    it->first = false;
-
-    velri_status st = velri_json_read_string(r, out_key);
-    if (st != VELRI_OK) {
         return st;
     }
+    st = velri_json_read_string(r, out_key);
+    if (st != VELRI_OK) return st;
     skip_ws(r);
     if (r->pos >= r->len || r->data[r->pos] != ':') {
         return json_fail(r, VELRI_ERR_INVALID, "expected ':' after object key");
     }
-    advance_byte(r);
+    advance_n(r, 1U);
     skip_ws(r);
-    *out_has_more = true;
-    return VELRI_OK;
-}
-
-velri_status velri_json_begin_array(velri_json_reader *r, velri_json_iter *it) {
-    if (!r || !it || !r->data) {
-        return VELRI_ERR_INVALID;
-    }
-    skip_ws(r);
-    if (r->pos >= r->len || r->data[r->pos] != '[') {
-        return json_fail(r, VELRI_ERR_INVALID, "expected '['");
-    }
-    if (r->depth >= VELRI_JSON_MAX_DEPTH) {
-        return json_fail(r, VELRI_ERR_OVERFLOW, "maximum JSON nesting depth exceeded");
-    }
-    advance_byte(r);
-    r->depth++;
-    it->first = true;
-    it->done = false;
     return VELRI_OK;
 }
 
 velri_status velri_json_next_elem(velri_json_reader *r, velri_json_iter *it, bool *out_has_more) {
-    if (!r || !it || !out_has_more || it->done) {
-        return VELRI_ERR_INVALID;
-    }
-    skip_ws(r);
-    if (r->pos >= r->len) {
-        return json_fail(r, VELRI_ERR_INVALID, "unexpected end of input inside array");
-    }
-    if (r->data[r->pos] == ']') {
-        advance_byte(r);
-        if (r->depth > 0U) {
-            r->depth--;
-        }
-        it->done = true;
-        *out_has_more = false;
-        return VELRI_OK;
-    }
-    if (!it->first) {
-        if (r->data[r->pos] != ',') {
-            return json_fail(r, VELRI_ERR_INVALID, "expected ',' or ']' in array");
-        }
-        advance_byte(r);
-        skip_ws(r);
-        if (r->pos >= r->len || r->data[r->pos] == ']') {
-            return json_fail(r, VELRI_ERR_INVALID, "trailing comma in array");
-        }
-    }
-    it->first = false;
-    *out_has_more = true;
-    return VELRI_OK;
+    return next_container_item(r, it, ']', out_has_more);
 }
 
 velri_status velri_json_read_string(velri_json_reader *r, velri_json_str *out) {
-    if (!r || !r->data) {
-        return VELRI_ERR_INVALID;
-    }
+    if (!r || !r->data) return VELRI_ERR_INVALID;
     skip_ws(r);
     if (r->pos >= r->len || r->data[r->pos] != '"') {
         return json_fail(r, VELRI_ERR_INVALID, "expected string");
     }
-    advance_byte(r);
+    advance_n(r, 1U);
     size_t start = r->pos;
     bool has_escapes = false;
 
@@ -310,7 +404,7 @@ velri_status velri_json_read_string(velri_json_reader *r, velri_json_str *out) {
         unsigned char c = (unsigned char)r->data[r->pos];
         if (c == '"') {
             size_t slen = r->pos - start;
-            advance_byte(r);
+            advance_n(r, 1U);
             if (out) {
                 out->ptr = r->data + start;
                 out->len = slen;
@@ -318,113 +412,33 @@ velri_status velri_json_read_string(velri_json_reader *r, velri_json_str *out) {
             }
             return VELRI_OK;
         }
-        if (c < 0x20U) {
-            return json_fail(r, VELRI_ERR_INVALID, "unescaped control character in string");
-        }
+        if (c < 0x20U) return json_fail(r, VELRI_ERR_INVALID, "unescaped control character in string");
         if (c == '\\') {
             has_escapes = true;
-            advance_byte(r);
-            if (r->pos >= r->len) {
-                return json_fail(r, VELRI_ERR_INVALID, "unterminated escape in string");
+            size_t before = r->pos;
+            char tmp[4];
+            size_t tn = 0U;
+            size_t cur = before;
+            if (!decode_next_unit(r->data, r->len, &cur, tmp, &tn, false)) {
+                return json_fail(r, VELRI_ERR_INVALID, "invalid escape sequence in string");
             }
-            char esc = r->data[r->pos];
-            switch (esc) {
-            case '"':
-            case '\\':
-            case '/':
-            case 'b':
-            case 'f':
-            case 'n':
-            case 'r':
-            case 't':
-                advance_byte(r);
-                break;
-            case 'u': {
-                advance_byte(r);
-                if (r->len - r->pos < 4U) {
-                    return json_fail(r, VELRI_ERR_INVALID, "truncated \\u escape");
-                }
-                uint32_t u1 = 0U;
-                if (!parse_hex4(r->data + r->pos, &u1)) {
-                    return json_fail(r, VELRI_ERR_INVALID, "invalid hex in \\u escape");
-                }
-                for (int i = 0; i < 4; ++i) advance_byte(r);
-                if (u1 >= 0xD800U && u1 <= 0xDBFFU) {
-                    if (r->len - r->pos < 6U || r->data[r->pos] != '\\' ||
-                        r->data[r->pos + 1U] != 'u') {
-                        return json_fail(r, VELRI_ERR_INVALID, "missing low surrogate after high");
-                    }
-                    uint32_t u2 = 0U;
-                    if (!parse_hex4(r->data + r->pos + 2U, &u2) || u2 < 0xDC00U || u2 > 0xDFFFU) {
-                        return json_fail(r, VELRI_ERR_INVALID, "invalid low surrogate");
-                    }
-                    for (int i = 0; i < 6; ++i) advance_byte(r);
-                } else if (u1 >= 0xDC00U && u1 <= 0xDFFFU) {
-                    return json_fail(r, VELRI_ERR_INVALID, "unexpected lone low surrogate");
-                }
-                break;
-            }
-            default:
-                return json_fail(r, VELRI_ERR_INVALID, "invalid escape sequence");
-            }
+            advance_n(r, cur - before);
         } else if (c >= 0x80U) {
-            /* Strict RFC 8259 / RFC 3629 UTF-8 sequence validation. */
-            size_t avail = r->len - r->pos;
-            if (c >= 0xC2U && c <= 0xDFU) {
-                if (avail < 2U || ((unsigned char)r->data[r->pos + 1U] & 0xC0U) != 0x80U) {
-                    return json_fail(r, VELRI_ERR_INVALID, "invalid 2-byte UTF-8 sequence");
-                }
-                advance_byte(r);
-                advance_byte(r);
-            } else if (c >= 0xE0U && c <= 0xEFU) {
-                if (avail < 3U) {
-                    return json_fail(r, VELRI_ERR_INVALID, "truncated 3-byte UTF-8 sequence");
-                }
-                unsigned char c1 = (unsigned char)r->data[r->pos + 1U];
-                unsigned char c2 = (unsigned char)r->data[r->pos + 2U];
-                if ((c1 & 0xC0U) != 0x80U || (c2 & 0xC0U) != 0x80U ||
-                    (c == 0xE0U && c1 < 0xA0U) || (c == 0xEDU && c1 >= 0xA0U)) {
-                    return json_fail(r, VELRI_ERR_INVALID, "invalid 3-byte UTF-8 sequence");
-                }
-                advance_byte(r);
-                advance_byte(r);
-                advance_byte(r);
-            } else if (c >= 0xF0U && c <= 0xF4U) {
-                if (avail < 4U) {
-                    return json_fail(r, VELRI_ERR_INVALID, "truncated 4-byte UTF-8 sequence");
-                }
-                unsigned char c1 = (unsigned char)r->data[r->pos + 1U];
-                unsigned char c2 = (unsigned char)r->data[r->pos + 2U];
-                unsigned char c3 = (unsigned char)r->data[r->pos + 3U];
-                if ((c1 & 0xC0U) != 0x80U || (c2 & 0xC0U) != 0x80U || (c3 & 0xC0U) != 0x80U ||
-                    (c == 0xF0U && c1 < 0x90U) || (c == 0xF4U && c1 > 0x8FU)) {
-                    return json_fail(r, VELRI_ERR_INVALID, "invalid 4-byte UTF-8 sequence");
-                }
-                advance_byte(r);
-                advance_byte(r);
-                advance_byte(r);
-                advance_byte(r);
-            } else {
-                return json_fail(r, VELRI_ERR_INVALID, "invalid UTF-8 lead byte");
-            }
+            size_t ulen = valid_utf8_len((const unsigned char *)(r->data + r->pos), r->len - r->pos);
+            if (ulen == 0U) return json_fail(r, VELRI_ERR_INVALID, "invalid UTF-8 sequence");
+            advance_n(r, ulen);
         } else {
-            advance_byte(r);
+            advance_n(r, 1U);
         }
     }
     return json_fail(r, VELRI_ERR_INVALID, "unterminated string");
 }
 
 velri_status velri_json_str_decode(velri_json_str s, char *dst, size_t dst_cap, size_t *out_len) {
-    if (!dst || dst_cap == 0U || (!s.ptr && s.len > 0U)) {
-        return VELRI_ERR_INVALID;
-    }
+    if (!dst || dst_cap == 0U || (!s.ptr && s.len > 0U)) return VELRI_ERR_INVALID;
     if (!s.has_escapes) {
-        if (s.len >= dst_cap) {
-            return VELRI_ERR_OVERFLOW;
-        }
-        if (s.len > 0U) {
-            memcpy(dst, s.ptr, s.len);
-        }
+        if (s.len >= dst_cap) return VELRI_ERR_OVERFLOW;
+        if (s.len > 0U) memcpy(dst, s.ptr, s.len);
         dst[s.len] = '\0';
         if (out_len) *out_len = s.len;
         return VELRI_OK;
@@ -432,51 +446,12 @@ velri_status velri_json_str_decode(velri_json_str s, char *dst, size_t dst_cap, 
 
     size_t i = 0U, out = 0U;
     while (i < s.len) {
-        char c = s.ptr[i++];
-        if (c != '\\') {
-            if (out + 1U >= dst_cap) return VELRI_ERR_OVERFLOW;
-            dst[out++] = c;
-            continue;
-        }
-        if (i >= s.len) return VELRI_ERR_INVALID;
-        char esc = s.ptr[i++];
-        char plain = 0;
-        switch (esc) {
-        case '"':  plain = '"'; break;
-        case '\\': plain = '\\'; break;
-        case '/':  plain = '/'; break;
-        case 'b':  plain = '\b'; break;
-        case 'f':  plain = '\f'; break;
-        case 'n':  plain = '\n'; break;
-        case 'r':  plain = '\r'; break;
-        case 't':  plain = '\t'; break;
-        case 'u': {
-            if (s.len - i < 4U) return VELRI_ERR_INVALID;
-            uint32_t u1 = 0U;
-            if (!parse_hex4(s.ptr + i, &u1)) return VELRI_ERR_INVALID;
-            i += 4U;
-            uint32_t cp = u1;
-            if (u1 >= 0xD800U && u1 <= 0xDBFFU) {
-                if (s.len - i < 6U || s.ptr[i] != '\\' || s.ptr[i + 1U] != 'u') {
-                    return VELRI_ERR_INVALID;
-                }
-                uint32_t u2 = 0U;
-                if (!parse_hex4(s.ptr + i + 2U, &u2) || u2 < 0xDC00U || u2 > 0xDFFFU) {
-                    return VELRI_ERR_INVALID;
-                }
-                i += 6U;
-                cp = 0x10000U + (((u1 - 0xD800U) << 10U) | (u2 - 0xDC00U));
-            } else if (u1 >= 0xDC00U && u1 <= 0xDFFFU) {
-                return VELRI_ERR_INVALID;
-            }
-            if (!append_utf8(cp, dst, dst_cap, &out)) return VELRI_ERR_OVERFLOW;
-            continue;
-        }
-        default:
-            return VELRI_ERR_INVALID;
-        }
-        if (out + 1U >= dst_cap) return VELRI_ERR_OVERFLOW;
-        dst[out++] = plain;
+        char unit[4];
+        size_t un = 0U;
+        if (!decode_next_unit(s.ptr, s.len, &i, unit, &un, false)) return VELRI_ERR_INVALID;
+        if (un >= dst_cap - out) return VELRI_ERR_OVERFLOW;
+        memcpy(dst + out, unit, un);
+        out += un;
     }
     dst[out] = '\0';
     if (out_len) *out_len = out;
@@ -484,68 +459,21 @@ velri_status velri_json_str_decode(velri_json_str s, char *dst, size_t dst_cap, 
 }
 
 bool velri_json_str_eq(velri_json_str s, const char *lit) {
-    if (!lit || (!s.ptr && s.len > 0U)) {
-        return false;
-    }
+    if (!lit || (!s.ptr && s.len > 0U)) return false;
     size_t lit_len = strlen(lit);
     if (!s.has_escapes) {
         return s.len == lit_len && (lit_len == 0U || memcmp(s.ptr, lit, lit_len) == 0);
     }
 
-    /* Streaming escape-aware comparison (0 B heap allocs, no fixed length cap). */
     size_t i = 0U, lpos = 0U;
     while (i < s.len) {
-        char chunk[4];
-        size_t clen = 0U;
-        char c = s.ptr[i++];
-        if (c != '\\') {
-            chunk[0] = c;
-            clen = 1U;
-        } else {
-            if (i >= s.len) return false;
-            char esc = s.ptr[i++];
-            switch (esc) {
-            case '"':  chunk[0] = '"'; clen = 1U; break;
-            case '\\': chunk[0] = '\\'; clen = 1U; break;
-            case '/':  chunk[0] = '/'; clen = 1U; break;
-            case 'b':  chunk[0] = '\b'; clen = 1U; break;
-            case 'f':  chunk[0] = '\f'; clen = 1U; break;
-            case 'n':  chunk[0] = '\n'; clen = 1U; break;
-            case 'r':  chunk[0] = '\r'; clen = 1U; break;
-            case 't':  chunk[0] = '\t'; clen = 1U; break;
-            case 'u': {
-                if (s.len - i < 4U) return false;
-                uint32_t u1 = 0U;
-                if (!parse_hex4(s.ptr + i, &u1)) return false;
-                i += 4U;
-                uint32_t cp = u1;
-                if (u1 >= 0xD800U && u1 <= 0xDBFFU) {
-                    if (s.len - i < 6U || s.ptr[i] != '\\' || s.ptr[i + 1U] != 'u') return false;
-                    uint32_t u2 = 0U;
-                    if (!parse_hex4(s.ptr + i + 2U, &u2) || u2 < 0xDC00U || u2 > 0xDFFFU) {
-                        return false;
-                    }
-                    i += 6U;
-                    cp = 0x10000U + (((u1 - 0xD800U) << 10U) | (u2 - 0xDC00U));
-                } else if (u1 >= 0xDC00U && u1 <= 0xDFFFU) {
-                    return false;
-                }
-                if (cp == 0U) return false; /* NUL cannot match a C-string literal */
-                char tmp[5];
-                size_t tlen = 0U;
-                if (!append_utf8(cp, tmp, sizeof(tmp), &tlen)) return false;
-                memcpy(chunk, tmp, tlen);
-                clen = tlen;
-                break;
-            }
-            default:
-                return false;
-            }
-        }
-        if (clen > lit_len - lpos || memcmp(lit + lpos, chunk, clen) != 0) {
+        char unit[4];
+        size_t un = 0U;
+        if (!decode_next_unit(s.ptr, s.len, &i, unit, &un, true) || un > lit_len - lpos ||
+            memcmp(lit + lpos, unit, un) != 0) {
             return false;
         }
-        lpos += clen;
+        lpos += un;
     }
     return lpos == lit_len;
 }
@@ -554,35 +482,17 @@ velri_status velri_json_read_string_buf(velri_json_reader *r, char *dst, size_t 
                                         size_t *out_len) {
     velri_json_str s;
     velri_status st = velri_json_read_string(r, &s);
-    if (st != VELRI_OK) {
-        return st;
-    }
+    if (st != VELRI_OK) return st;
     st = velri_json_str_decode(s, dst, dst_cap, out_len);
-    if (st != VELRI_OK) {
-        return json_fail(r, st, "string exceeds destination buffer");
-    }
-    return VELRI_OK;
+    return (st == VELRI_OK) ? VELRI_OK : json_fail(r, st, "string exceeds destination buffer");
 }
 
 velri_status velri_json_read_i64(velri_json_reader *r, int64_t *out) {
-    if (!r || !out) {
-        return VELRI_ERR_INVALID;
-    }
-    size_t start = 0U, nlen = 0U;
-    bool is_float = false;
-    velri_status st = scan_number(r, &start, &nlen, &is_float);
-    if (st != VELRI_OK) {
-        return st;
-    }
-    if (is_float) {
-        return json_fail(r, VELRI_ERR_INVALID, "expected integer, got floating-point number");
-    }
-    if (nlen >= 64U) {
-        return json_fail(r, VELRI_ERR_OVERFLOW, "integer literal too long");
-    }
+    if (!r || !out) return VELRI_ERR_INVALID;
     char buf[64];
-    memcpy(buf, r->data + start, nlen);
-    buf[nlen] = '\0';
+    size_t nlen = 0U;
+    velri_status st = read_int_buf(r, true, buf, &nlen);
+    if (st != VELRI_OK) return st;
     errno = 0;
     char *endp = nullptr;
     long long v = strtoll(buf, &endp, 10);
@@ -594,24 +504,11 @@ velri_status velri_json_read_i64(velri_json_reader *r, int64_t *out) {
 }
 
 velri_status velri_json_read_u64(velri_json_reader *r, uint64_t *out) {
-    if (!r || !out) {
-        return VELRI_ERR_INVALID;
-    }
-    size_t start = 0U, nlen = 0U;
-    bool is_float = false;
-    velri_status st = scan_number(r, &start, &nlen, &is_float);
-    if (st != VELRI_OK) {
-        return st;
-    }
-    if (is_float || r->data[start] == '-') {
-        return json_fail(r, VELRI_ERR_INVALID, "expected non-negative integer");
-    }
-    if (nlen >= 64U) {
-        return json_fail(r, VELRI_ERR_OVERFLOW, "unsigned integer literal too long");
-    }
+    if (!r || !out) return VELRI_ERR_INVALID;
     char buf[64];
-    memcpy(buf, r->data + start, nlen);
-    buf[nlen] = '\0';
+    size_t nlen = 0U;
+    velri_status st = read_int_buf(r, false, buf, &nlen);
+    if (st != VELRI_OK) return st;
     errno = 0;
     char *endp = nullptr;
     unsigned long long v = strtoull(buf, &endp, 10);
@@ -622,137 +519,25 @@ velri_status velri_json_read_u64(velri_json_reader *r, uint64_t *out) {
     return VELRI_OK;
 }
 
-/* Locale-independent ASCII decimal-to-IEEE-754 double parser (immune to LC_NUMERIC,
- * preserves IEEE-754 subnormals down to DBL_TRUE_MIN and underflow-to-zero cleanly). */
-static velri_status parse_ascii_f64(const char *s, size_t nlen, double *out) {
-    size_t i = 0U;
-    bool neg = false;
-    if (i < nlen && s[i] == '-') {
-        neg = true;
-        i++;
-    }
-
-    uint64_t sig = 0U;
-    uint32_t sig_digits = 0U;
-    int64_t exp10 = 0;
-
-    while (i < nlen && s[i] >= '0' && s[i] <= '9') {
-        uint32_t d = (uint32_t)(s[i++] - '0');
-        if (sig == 0U && d == 0U) {
-            continue;
-        }
-        if (sig_digits < 19U) {
-            sig = sig * 10U + (uint64_t)d;
-            sig_digits++;
-        } else if (exp10 < 1000000) {
-            exp10++;
-        }
-    }
-
-    if (i < nlen && s[i] == '.') {
-        i++;
-        while (i < nlen && s[i] >= '0' && s[i] <= '9') {
-            uint32_t d = (uint32_t)(s[i++] - '0');
-            if (sig == 0U && d == 0U) {
-                if (exp10 > -1000000) {
-                    exp10--;
-                }
-                continue;
-            }
-            if (sig_digits < 19U) {
-                sig = sig * 10U + (uint64_t)d;
-                sig_digits++;
-                if (exp10 > -1000000) {
-                    exp10--;
-                }
-            }
-        }
-    }
-
-    if (i < nlen && (s[i] == 'e' || s[i] == 'E')) {
-        i++;
-        bool eneg = false;
-        if (i < nlen && (s[i] == '+' || s[i] == '-')) {
-            eneg = (s[i++] == '-');
-        }
-        int64_t eval = 0;
-        while (i < nlen && s[i] >= '0' && s[i] <= '9') {
-            if (eval < 1000000) {
-                eval = eval * 10 + (int64_t)(s[i] - '0');
-            }
-            i++;
-        }
-        exp10 += eneg ? -eval : eval;
-    }
-
-    if (sig == 0U) {
-        *out = neg ? -0.0 : 0.0;
-        return VELRI_OK;
-    }
-
-    int64_t sci_exp = exp10 + (int64_t)sig_digits - 1;
-    if (sci_exp > 309) {
-        return VELRI_ERR_OVERFLOW;
-    }
-    if (sci_exp < -326) {
-        *out = neg ? -0.0 : 0.0;
-        return VELRI_OK;
-    }
-
-    double v = (double)sig;
-    if (exp10 > 0) {
-        if (exp10 > 300) {
-            v *= pow(10.0, (double)(exp10 - 300));
-            v *= 1e300;
-        } else {
-            v *= pow(10.0, (double)exp10);
-        }
-    } else if (exp10 < 0) {
-        if (exp10 >= -22) {
-            v /= pow(10.0, (double)(-exp10));
-        } else if (exp10 < -300) {
-            v *= pow(10.0, (double)(exp10 + 300));
-            v *= 1e-300;
-        } else {
-            v *= pow(10.0, (double)exp10);
-        }
-    }
-
-    if (!isfinite(v)) {
-        return VELRI_ERR_OVERFLOW;
-    }
-    *out = neg ? -v : v;
-    return VELRI_OK;
-}
-
 velri_status velri_json_read_f64(velri_json_reader *r, double *out) {
-    if (!r || !out) {
-        return VELRI_ERR_INVALID;
-    }
+    if (!r || !out) return VELRI_ERR_INVALID;
     size_t start = 0U, nlen = 0U;
     velri_status st = scan_number(r, &start, &nlen, nullptr);
-    if (st != VELRI_OK) {
-        return st;
-    }
+    if (st != VELRI_OK) return st;
     st = parse_ascii_f64(r->data + start, nlen, out);
-    if (st != VELRI_OK) {
-        return json_fail(r, st, "number out of IEEE-754 double range");
-    }
-    return VELRI_OK;
+    return (st == VELRI_OK) ? VELRI_OK : json_fail(r, st, "number out of IEEE-754 double range");
 }
 
 velri_status velri_json_read_bool(velri_json_reader *r, bool *out) {
-    if (!r || !r->data || !out) {
-        return VELRI_ERR_INVALID;
-    }
+    if (!r || !r->data || !out) return VELRI_ERR_INVALID;
     skip_ws(r);
     if (r->len - r->pos >= 4U && memcmp(r->data + r->pos, "true", 4U) == 0) {
-        for (int i = 0; i < 4; ++i) advance_byte(r);
+        advance_n(r, 4U);
         *out = true;
         return VELRI_OK;
     }
     if (r->len - r->pos >= 5U && memcmp(r->data + r->pos, "false", 5U) == 0) {
-        for (int i = 0; i < 5; ++i) advance_byte(r);
+        advance_n(r, 5U);
         *out = false;
         return VELRI_OK;
     }
@@ -760,108 +545,64 @@ velri_status velri_json_read_bool(velri_json_reader *r, bool *out) {
 }
 
 velri_status velri_json_read_null(velri_json_reader *r) {
-    if (!r || !r->data) {
-        return VELRI_ERR_INVALID;
-    }
+    if (!r || !r->data) return VELRI_ERR_INVALID;
     skip_ws(r);
     if (r->len - r->pos >= 4U && memcmp(r->data + r->pos, "null", 4U) == 0) {
-        for (int i = 0; i < 4; ++i) advance_byte(r);
+        advance_n(r, 4U);
         return VELRI_OK;
     }
     return json_fail(r, VELRI_ERR_INVALID, "expected null");
 }
 
 velri_status velri_json_skip(velri_json_reader *r) {
-    if (!r || !r->data) {
-        return VELRI_ERR_INVALID;
-    }
+    if (!r || !r->data) return VELRI_ERR_INVALID;
     typedef struct {
         bool is_object;
         velri_json_iter it;
     } skip_frame;
-
     skip_frame stack[VELRI_JSON_MAX_DEPTH];
     uint32_t sp = 0U;
 
     for (;;) {
         velri_json_type t = velri_json_peek(r);
         velri_status st = VELRI_OK;
-        switch (t) {
-        case VELRI_JSON_OBJECT: {
+        if (t == VELRI_JSON_OBJECT || t == VELRI_JSON_ARRAY) {
             if (sp >= VELRI_JSON_MAX_DEPTH) {
                 return json_fail(r, VELRI_ERR_OVERFLOW, "maximum JSON nesting depth exceeded");
             }
-            stack[sp].is_object = true;
-            st = velri_json_begin_object(r, &stack[sp].it);
+            stack[sp].is_object = (t == VELRI_JSON_OBJECT);
+            st = stack[sp].is_object ? velri_json_begin_object(r, &stack[sp].it)
+                                     : velri_json_begin_array(r, &stack[sp].it);
             if (st != VELRI_OK) return st;
             sp++;
-            goto next_in_container;
-        }
-        case VELRI_JSON_ARRAY: {
-            if (sp >= VELRI_JSON_MAX_DEPTH) {
-                return json_fail(r, VELRI_ERR_OVERFLOW, "maximum JSON nesting depth exceeded");
-            }
-            stack[sp].is_object = false;
-            st = velri_json_begin_array(r, &stack[sp].it);
+        } else {
+            bool b = false;
+            if (t == VELRI_JSON_STRING)      st = velri_json_read_string(r, nullptr);
+            else if (t == VELRI_JSON_NUMBER) st = scan_number(r, nullptr, nullptr, nullptr);
+            else if (t == VELRI_JSON_BOOL)   st = velri_json_read_bool(r, &b);
+            else if (t == VELRI_JSON_NULL)   st = velri_json_read_null(r);
+            else return json_fail(r, VELRI_ERR_INVALID, "unexpected token");
             if (st != VELRI_OK) return st;
-            sp++;
-            goto next_in_container;
-        }
-        case VELRI_JSON_STRING:
-            st = velri_json_read_string(r, nullptr);
-            break;
-        case VELRI_JSON_NUMBER:
-            st = scan_number(r, nullptr, nullptr, nullptr);
-            break;
-        case VELRI_JSON_BOOL: {
-            bool dummy = false;
-            st = velri_json_read_bool(r, &dummy);
-            break;
-        }
-        case VELRI_JSON_NULL:
-            st = velri_json_read_null(r);
-            break;
-        default:
-            return json_fail(r, VELRI_ERR_INVALID, "expected JSON value");
-        }
-        if (st != VELRI_OK) {
-            return st;
         }
 
-    next_in_container:
         while (sp > 0U) {
-            skip_frame *f = &stack[sp - 1U];
-            bool has_more = false;
-            if (f->is_object) {
-                velri_json_str key;
-                st = velri_json_next_member(r, &f->it, &key, &has_more);
-            } else {
-                st = velri_json_next_elem(r, &f->it, &has_more);
-            }
-            if (st != VELRI_OK) {
-                return st;
-            }
-            if (has_more) {
-                break; /* Parse the member value / array element on the next outer iteration. */
-            }
+            bool more = false;
+            velri_json_str k;
+            st = stack[sp - 1U].is_object
+                     ? velri_json_next_member(r, &stack[sp - 1U].it, &k, &more)
+                     : velri_json_next_elem(r, &stack[sp - 1U].it, &more);
+            if (st != VELRI_OK) return st;
+            if (more) break;
             sp--;
         }
-        if (sp == 0U) {
-            return VELRI_OK;
-        }
+        if (sp == 0U) return VELRI_OK;
     }
 }
 
 velri_status velri_json_finish(velri_json_reader *r) {
-    if (!r) {
-        return VELRI_ERR_INVALID;
-    }
+    if (!r || !r->data) return VELRI_ERR_INVALID;
     skip_ws(r);
-    if (r->depth != 0U) {
-        return json_fail(r, VELRI_ERR_INVALID, "unclosed JSON container at end of input");
-    }
-    if (r->pos != r->len) {
-        return json_fail(r, VELRI_ERR_INVALID, "unexpected trailing content after JSON root");
-    }
+    if (r->pos != r->len) return json_fail(r, VELRI_ERR_INVALID, "unexpected trailing data after JSON");
+    if (r->depth != 0U) return json_fail(r, VELRI_ERR_INVALID, "unclosed JSON container");
     return VELRI_OK;
 }

@@ -3,6 +3,10 @@
 
 #include <velri_lib/velri_lib.h>
 
+/* Canonical synthetic/precomputed RoPE table weight names shared between layers & runtime. */
+#define VELRI_WEIGHT_ROPE_COS "model.rope.cos"
+#define VELRI_WEIGHT_ROPE_SIN "model.rope.sin"
+
 /*
  * Velri Engine Model Metadata Parameters, Placement Scope Conventions, and
  * Metadata-Driven Layer Composition Helpers.
