@@ -31,7 +31,7 @@ velri_tensor velri_layer_embedding(velri_builder *b, const velri_model_params *p
 
 velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
                                           const velri_model_params *p,
-                                          const velri_pre_norm_layer_desc *desc) {
+                                          const velri_pre_norm_layer_desc *desc, bool last_row_only) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
@@ -44,7 +44,7 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
         return VELRI_TENSOR_NONE;
     }
 
-    const velri_layer_spec spec = {
+    velri_layer_spec spec = {
         .scope = VELRI_SCOPE_HIDDEN_LAYERS,
         .attn_scope = VELRI_SCOPE_KEY_ATTENTION,
         .mlp_scope = VELRI_SCOPE_KEY_DENSE_MLP,
@@ -75,6 +75,7 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
             .qkv_bias = desc->qkv_bias,
             .o_bias = desc->o_bias,
             .latent_kv = p->latent_kv,
+            .f16_kv = p->f16_kv,
             .rope = {
                 .enabled = desc->has_rope,
                 .rotary_dim = p->rotary_dim,
@@ -99,6 +100,7 @@ velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
     };
 
     for (uint32_t i = 0U; i < p->num_hidden_layers; ++i) {
+        spec.last_row_only = last_row_only && i + 1U == p->num_hidden_layers && p->max_seq_len > 1U;
         x = velri_layer_pre_norm(b, x, desc->prefix, i, &spec);
         if (b->err != VELRI_OK) {
             return VELRI_TENSOR_NONE;

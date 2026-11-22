@@ -235,6 +235,8 @@ static void test_example_configs_and_cascade(velri_context *ctx, velri_device_id
     CHECK(dense_cfg.cpu_backend.threads == 16U && dense_cfg.cpu_backend.reserve_cores == 1U,
           "dense cpu backend cfg");
     CHECK(dense_cfg.vulkan_backend.prefill_chunk_size == 512U, "dense vk chunk");
+    CHECK(dense_cfg.vulkan_backend.prefill_matmul_bits == 0U, "default matmul precision");
+    CHECK(dense_cfg.vulkan_backend.prefill_attention_bits == 0U, "default attention precision");
     CHECK(dense_cfg.kv_k_bits == 8U && dense_cfg.kv_v_bits == 5U, "dense kv quant");
     CHECK(dense_cfg.attn_mechanism == VELRI_ATTN_MECH_FLASH, "dense attn mech");
     CHECK(fabsf(dense_cfg.sampling.temperature - 0.6f) < 1e-5f && dense_cfg.sampling.top_k == 20U,
@@ -414,6 +416,8 @@ static void test_placement_validation_errors(velri_context *ctx, velri_device_id
         {"{\"unknown-top\":{}}", "unknown top-level"},
         {"{}", "missing required"},
         {"{\"model\":{},\"backends\":{\"cpu\":{\"affinity\":\"bogus\"}}}", "affinity"},
+        {"{\"model\":{},\"backends\":{\"vulkan\":{\"prefill-matmul-bits\":24}}}", "16 or 32"},
+        {"{\"model\":{},\"backends\":{\"vulkan\":{\"prefill-attention-bits\":24}}}", "16 or 32"},
     };
     for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); ++i) {
         velri_engine_config cfg;
@@ -424,6 +428,18 @@ static void test_placement_validation_errors(velri_context *ctx, velri_device_id
         CHECK(st == VELRI_ERR_INVALID, "invalid config must return VELRI_ERR_INVALID");
         CHECK(strstr(err, cases[i].expected_substr) != nullptr,
               "diagnostic message must explain the error clearly");
+        velri_engine_config_destroy(&cfg);
+    }
+
+    for (unsigned bits = 16U; bits <= 32U; bits += 16U) {
+        char json[128], error[VELRI_CFG_ERR_MAX];
+        snprintf(json, sizeof(json), "{\"model\":{},\"backends\":{\"vulkan\":{"
+                 "\"prefill-matmul-bits\":%u,\"prefill-attention-bits\":%u}}}", bits, 48U - bits);
+        velri_engine_config cfg;
+        velri_engine_config_init(&cfg);
+        CHECK_OK(velri_engine_config_parse(json, strlen(json), &cfg, error, sizeof(error)), "parse matmul precision");
+        CHECK(cfg.vulkan_backend.prefill_matmul_bits == bits, "configured matmul precision");
+        CHECK(cfg.vulkan_backend.prefill_attention_bits == 48U - bits, "independent attention precision");
         velri_engine_config_destroy(&cfg);
     }
 

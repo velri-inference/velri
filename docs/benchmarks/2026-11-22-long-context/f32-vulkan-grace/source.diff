@@ -1,0 +1,24 @@
+--- harness/llama-gpu.cpp
++++ f32-vulkan-grace/llama-vulkan-grace.cpp
+@@ -4,0 +5 @@
++#include <unistd.h>
+@@ -203,0 +205,6 @@
++    std::fflush(stdout);
++    std::fprintf(stderr, "diagnostic outputs closed, entering explicit llama_synchronize\n");
++    llama_synchronize(ctx);
++    std::fprintf(stderr, "diagnostic synchronized, waiting 5s with all resources live\n");
++    sleep(5);
++    std::fprintf(stderr,"diagnostic before llama_batch_ext_free(batch);\n");
+@@ -204,0 +212,2 @@
++    std::fprintf(stderr,"diagnostic after llama_batch_ext_free(batch);\n");
++    std::fprintf(stderr,"diagnostic before llama_free(ctx);\n");
+@@ -205,0 +215,2 @@
++    std::fprintf(stderr,"diagnostic after llama_free(ctx);\n");
++    std::fprintf(stderr,"diagnostic before llama_model_free(model);\n");
+@@ -206,0 +218,2 @@
++    std::fprintf(stderr,"diagnostic after llama_model_free(model);\n");
++    std::fprintf(stderr,"diagnostic before llama_backend_free();\n");
+@@ -208 +221,2 @@
+-}
++    std::fprintf(stderr,"diagnostic after llama_backend_free();\n");
++}

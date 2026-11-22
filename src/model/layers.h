@@ -41,6 +41,7 @@ typedef struct {
     uint32_t max_seq_len;
     uint32_t max_ctx;
     bool latent_kv; /* Cache single latent input H_cache + exact W_K/W_V absorption (no RoPE, d_lat <= 2048). */
+    bool f16_kv;
 } velri_model_params;
 
 typedef struct {
@@ -85,7 +86,7 @@ velri_tensor velri_layer_embedding(velri_builder *b, const velri_model_params *p
 
 velri_tensor velri_layers_pre_norm_repeat(velri_builder *b, velri_tensor x,
                                           const velri_model_params *p,
-                                          const velri_pre_norm_layer_desc *desc);
+                                          const velri_pre_norm_layer_desc *desc, bool last_row_only);
 
 velri_tensor velri_layer_lm_head(velri_builder *b, velri_tensor x, const velri_model_params *p,
                                  const velri_lm_head_desc *desc);

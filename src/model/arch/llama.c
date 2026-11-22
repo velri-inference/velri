@@ -36,7 +36,7 @@ velri_status velri_arch_llama_build(velri_builder *b, const velri_model_params *
     };
 
     velri_tensor x = velri_layer_embedding(b, p, "model.embed_tokens.weight", nullptr);
-    x = velri_layers_pre_norm_repeat(b, x, p, &layer_desc);
+    x = velri_layers_pre_norm_repeat(b, x, p, &layer_desc, !k_llama_lm_head.full_seq_logits);
     (void)velri_layer_lm_head(b, x, p, &k_llama_lm_head);
     return velri_b_status(b);
 }

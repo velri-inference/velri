@@ -728,6 +728,7 @@ typedef struct {
     uint32_t min_v;
     uint32_t max_v;
     const char *path;
+    bool endpoints_only; /* Discrete choice between min_v and max_v. */
 } u32_obj_field;
 
 static velri_status parse_u32_object(velri_json_reader *r, const char *obj_name,
@@ -751,6 +752,12 @@ static velri_status parse_u32_object(velri_json_reader *r, const char *obj_name,
                 }
                 st = read_u32_range(r, fields[i].target, fields[i].min_v, fields[i].max_v,
                                     fields[i].path, err_msg, err_cap);
+                if (st == VELRI_OK && fields[i].endpoints_only &&
+                    *fields[i].target != fields[i].min_v && *fields[i].target != fields[i].max_v) {
+                    velri_cfg_set_errf(err_msg, err_cap, "%s must be %u or %u", fields[i].path,
+                                       fields[i].min_v, fields[i].max_v);
+                    return VELRI_ERR_INVALID;
+                }
                 hit = true;
                 break;
             }
@@ -1024,7 +1031,11 @@ static velri_status parse_backends_object(velri_json_reader *r, velri_engine_con
     }
     const u32_obj_field vk_fields[] = {
         {"prefill-chunk-size", &cfg->vulkan_backend.prefill_chunk_size, 1U, UINT32_MAX,
-         "backends.vulkan.prefill-chunk-size"},
+         "backends.vulkan.prefill-chunk-size", false},
+        {"prefill-matmul-bits", &cfg->vulkan_backend.prefill_matmul_bits, 16U, 32U,
+         "backends.vulkan.prefill-matmul-bits", true},
+        {"prefill-attention-bits", &cfg->vulkan_backend.prefill_attention_bits, 16U, 32U,
+         "backends.vulkan.prefill-attention-bits", true},
     };
     uint32_t seen = 0U;
     bool more = false;
@@ -1130,15 +1141,15 @@ static velri_status parse_config(const char *json_data, size_t json_len, bool re
     }
 
     const u32_obj_field ctx_fields[] = {
-        {"size", &tmp.context_size, 1U, UINT32_MAX, "context.size"},
-        {"max-seq-len", &tmp.max_seq_len, 1U, UINT32_MAX, "context.max-seq-len"},
+        {"size", &tmp.context_size, 1U, UINT32_MAX, "context.size", false},
+        {"max-seq-len", &tmp.max_seq_len, 1U, UINT32_MAX, "context.max-seq-len", false},
     };
     const u32_obj_field kvq_fields[] = {
-        {"k-bits", &tmp.kv_k_bits, 1U, 16U, "kv-quantization.k-bits"},
-        {"v-bits", &tmp.kv_v_bits, 1U, 16U, "kv-quantization.v-bits"},
+        {"k-bits", &tmp.kv_k_bits, 1U, 16U, "kv-quantization.k-bits", false},
+        {"v-bits", &tmp.kv_v_bits, 1U, 16U, "kv-quantization.v-bits", false},
     };
     const u32_obj_field disk_fields[] = {
-        {"io-threads", &tmp.disk_io_threads, 1U, UINT32_MAX, "disk.io-threads"},
+        {"io-threads", &tmp.disk_io_threads, 1U, UINT32_MAX, "disk.io-threads", false},
     };
 
     uint32_t seen_top = 0U;

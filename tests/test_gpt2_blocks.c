@@ -684,7 +684,7 @@ static void test_builder_and_layer_contracts(velri_device_id cpu_dev,
             .up_proj = "mlp.up_proj",
             .down_proj = "mlp.down_proj",
         };
-        velri_tensor out = velri_layers_pre_norm_repeat(&b, x, &bad_meta, &rope_desc);
+        velri_tensor out = velri_layers_pre_norm_repeat(&b, x, &bad_meta, &rope_desc, false);
         CHECK(!out.valid && velri_b_status(&b) == VELRI_ERR_UNSUPPORTED,
               "has_rope=true && latent_kv=true must fail cleanly with VELRI_ERR_UNSUPPORTED");
 

@@ -1,0 +1,47 @@
+{
+  "cpu": "AMD Ryzen 9 9950X",
+  "gpu": "NVIDIA GeForce RTX 5070 Ti",
+  "driver": "620.70.06",
+  "linux": "7.0.0-43-generic",
+  "cuda": "13.3.73",
+  "llama.cpp_revision": "8d60873dfb8619f2b5ed31adfbab07cccb40db5c",
+  "velri_base_revision": "f3cb46cbb6b9f0e26fc64b3de8e9e89086db1a2d",
+  "clock_policy": "normal driver policy; benchmark did not lock clocks",
+  "gguf_sha256": "e0e76115155be432eb30ab5e623d8acc9b4ab6b97f47ad2cda3eb2ea19ed8453",
+  "cpu_affinity": "0-15",
+  "actual_gpu_info": "NVIDIA GeForce RTX 5070 Ti, 620.70.06",
+  "platform": "Linux-7.0.0-43-generic-x86_64-with-glibc2.43",
+  "cpu_workers": {
+    "cpu": 16,
+    "gpu": 1
+  },
+  "measurement_monitor_logical_cpu": 31,
+  "system_memtotal_kib": 64322300,
+  "device_total_vram_mib": 16303,
+  "benchmark_lock": "/tmp/velri-gap-gpu.lock",
+  "weights_bytes": 251710464,
+  "parameter_count": 62927616,
+  "model": {
+    "layers": 8,
+    "embedding": 768,
+    "q_heads": 12,
+    "kv_heads": 4,
+    "head_dim": 64,
+    "ffn": 2048,
+    "vocabulary": 8192,
+    "n_ctx_train": 9216,
+    "rope_base": 10000,
+    "rope_scaling": "none"
+  },
+  "runtime_capacity": "prompt + 256",
+  "long_benchmark_inputs": "(37 * position + 11) % 8192 for prompt and 32 forced decode inputs",
+  "benchmark_worktree": "Release, local worktree based on velri_base_revision, with the Vulkan improvements under test",
+  "binaries": {
+    "cpu/velri": "a8285bf30b3402151de74d4a532575199ef2cf12b658535862599bc60f507417",
+    "cpu/llama": "c08d97e024a22f49fdfba11a804ea0670e69f787ce589a1d85391e4837960a68",
+    "gpu/velri-mixed": "b7f348fff657a17bb601b08e358ad1e68684b52895fb1a61387b6d05d024df0f",
+    "gpu/velri-f32": "22c1497433df2f714d4212029e6754cface1dd5ced397c5cfaf2a9dc3aed0bbd",
+    "gpu/llama-cuda": "ee5d4d7456030bbed0ea617a7941e3ee66f369f60d0802c431713a8494b5b94e",
+    "gpu/llama-vulkan": "c6acdcdfb2a85852c42ead0f5cdce62076cc8dcbf1d6ef1330883038bdc0f47f"
+  }
+}

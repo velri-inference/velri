@@ -36,9 +36,10 @@ static velri_rc program_parse_and_validate_config(velri_program *prog,
         }
     }
 
-    if (prog->cfg.kv_k_bits != 0U || prog->cfg.kv_v_bits != 0U) {
+    bool custom_kv = prog->cfg.kv_k_bits != 0U || prog->cfg.kv_v_bits != 0U;
+    if (custom_kv && (prog->cfg.kv_k_bits != 16U || prog->cfg.kv_v_bits != 16U)) {
         velri_rt_ctx_set_error(
-            ctx, "program_prepare: kv-quantization (k-bits=%u, v-bits=%u) is not yet supported",
+            ctx, "program_prepare: kv-quantization requires k-bits=16 and v-bits=16 (got %u, %u)",
             prog->cfg.kv_k_bits, prog->cfg.kv_v_bits);
         return VELRI_RC_ERR_UNSUPPORTED;
     }
@@ -126,6 +127,8 @@ static velri_rc build_program_graph(velri_program *prog, bool is_prefill, uint32
     velri_builder b;
     velri_b_init_checked(&b, g, out_manifest, prog->placement.default_store_dev,
                          prog->placement.default_compute_dev, velri_placement_builder_cb, &ad);
+    b.allow_f16_attention_matmul = prog->cfg.vulkan_backend.prefill_attention_bits == 16U;
+    b.allow_f16_matmul = prog->cfg.vulkan_backend.prefill_matmul_bits == 16U;
 
     const velri_model *m = prog->model;
     const velri_model_desc *d = &m->desc;
@@ -150,6 +153,7 @@ static velri_rc build_program_graph(velri_program *prog, bool is_prefill, uint32
         .max_seq_len = max_seq_len,
         .max_ctx = prog->max_ctx,
         .latent_kv = latent_kv,
+        .f16_kv = prog->cfg.kv_k_bits == 16U,
     };
 
     const char *phase = is_prefill ? "prefill" : "decode";

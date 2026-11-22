@@ -31,6 +31,8 @@ Weights are registered by canonical name. A bind takes exclusive access to the r
 
 ## 2. Buffer Ownership, Synchronicity, and Concurrency
 
+The caller can bind weights directly from an immutable, read-only file mapping and keep the mapping alive until the model and its programs are destroyed. On Linux, after a successful GPU upload, the caller can use `madvise(MADV_DONTNEED)` on page-aligned regions of that clean mapping to drop the resident host pages. A later preparation can fault them back from the same file. Apply this only to regions owned by the caller that are no longer needed for immediate CPU computation.
+
 - Every buffer parameter explicitly documents ownership and lifetime.
 - **Initial `step` is synchronous:** caller input buffers live until the call returns; borrowed output views remain valid until the next mutating call on that session or session destruction. Inside a synchronous step, `velri-lib` backends may still execute asynchronously.
 - Any future asynchronous `step` API will introduce an explicit completion handle and dedicated buffer-retention rules.

@@ -124,6 +124,43 @@ velri_rc velri_sampler_validate_params(const velri_sampling_params *params) {
     return VELRI_RC_OK;
 }
 
+/* Independent lane maxima vectorize without relaxing floating-point semantics.
+ * A second scan returns the first matching index, including signed-zero ties. */
+static uint32_t first_maximum(const float *logits, uint32_t count) {
+    enum { width = 8 };
+    float peaks[width];
+    for (uint32_t j = 0U; j < width; ++j) peaks[j] = -INFINITY;
+
+    bool valid = true;
+    uint32_t i = 0U;
+    for (; count - i >= width; i += width) {
+        for (uint32_t j = 0U; j < width; ++j) {
+            float v = logits[i + j];
+            valid &= v < INFINITY;
+            if (v > peaks[j]) peaks[j] = v;
+        }
+    }
+    float peak = -INFINITY;
+    for (uint32_t j = 0U; j < width; ++j) {
+        if (peaks[j] > peak) peak = peaks[j];
+    }
+    for (; i < count; ++i) {
+        float v = logits[i];
+        valid &= v < INFINITY;
+        if (v > peak) peak = v;
+    }
+    if (!valid || peak == -INFINITY) return UINT32_MAX;
+
+    i = 0U;
+    for (; count - i >= width; i += width) {
+        bool found = false;
+        for (uint32_t j = 0U; j < width; ++j) found |= logits[i + j] == peak;
+        if (found) break;
+    }
+    while (logits[i] != peak) ++i;
+    return i;
+}
+
 velri_rc velri_sampler_sample(velri_sampler *s, const float *logits,
                               const velri_sampling_params *params, int32_t *out_token) {
     if (!s || !s->scratch || s->vocab_size == 0U || !logits || !params || !out_token) {
@@ -137,22 +174,11 @@ velri_rc velri_sampler_sample(velri_sampler *s, const float *logits,
         return vrc;
     }
 
-    /* Pass 1: find maximum logit and reject NaN, +Inf, or all--Inf outputs BEFORE mutating RNG. */
-    float max_logit = -INFINITY;
-    uint32_t best_idx = UINT32_MAX;
-    for (uint32_t i = 0U; i < s->vocab_size; ++i) {
-        float v = logits[i];
-        if (isnan(v) || (isinf(v) && v > 0.0f)) {
-            return VELRI_RC_ERR_EXEC;
-        }
-        if (isfinite(v) && (best_idx == UINT32_MAX || v > max_logit)) {
-            max_logit = v;
-            best_idx = i;
-        }
-    }
+    uint32_t best_idx = first_maximum(logits, s->vocab_size);
     if (best_idx == UINT32_MAX) {
         return VELRI_RC_ERR_EXEC;
     }
+    float max_logit = logits[best_idx];
 
     if (params->reseed) {
         s->rng_state = params->seed;

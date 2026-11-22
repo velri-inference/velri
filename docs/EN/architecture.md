@@ -59,7 +59,7 @@ cmake --build build-lib
 ctest --test-dir build-lib --output-on-failure
 ```
 
-To verify the consumer boundary against an installed `VelriLib 0.2.0 EXACT` package:
+To verify the consumer boundary against an installed `VelriLib 0.4.0 EXACT` package:
 
 ```sh
 cmake --install build/velri-lib --prefix /tmp/velri-lib-install

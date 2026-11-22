@@ -28,7 +28,7 @@ static const velri_lm_head_desc k_gpt2_lm_head = {
 
 velri_status velri_arch_gpt2_build(velri_builder *b, const velri_model_params *p) {
     velri_tensor x = velri_layer_embedding(b, p, "transformer.wte.weight", "transformer.wpe.weight");
-    x = velri_layers_pre_norm_repeat(b, x, p, &k_gpt2_layer);
+    x = velri_layers_pre_norm_repeat(b, x, p, &k_gpt2_layer, !k_gpt2_lm_head.full_seq_logits);
     (void)velri_layer_lm_head(b, x, p, &k_gpt2_lm_head);
     return velri_b_status(b);
 }

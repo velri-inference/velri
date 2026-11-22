@@ -136,3 +136,11 @@ Backend-specific options sit at the top level under `backends.<name>`, do not in
 
 ### Separating parsing from capability checks
 Valid JSON syntax does not imply that a device supports every required op, dtype, or transfer path. Capability, transfer, and memory-budget checks run during `prepare`. Unknown backends, disabled-at-build backends, and missing hardware produce distinct diagnostics; `inspect` prints requested placement, resolved placement, and rule provenance.
+
+### Vulkan KV cache and prefill precision
+
+For dense attention, set the top-level JSON member `"kv-quantization": {"k-bits": 16, "v-bits": 16}` to store keys and values in IEEE binary16. With F32 weights this halves KV state bytes. Attention inputs and outputs remain F32. Omitting the member preserves the original precision. Both prefill and decode use the selected format. The Vulkan backend requires 16-bit storage and shader arithmetic. Program preparation returns `VELRI_RC_ERR_UNSUPPORTED` for attention on CPU, latent KV and unsupported bit-width combinations.
+
+The independent setting `"backends": {"vulkan": {"prefill-matmul-bits": 16}}` allows large F32 linear projections to round operands to binary16 and accumulate in F32. Weights stay in their original storage. The default value is 32. The backend uses F32 for single-token decode, small projections and devices without the required cooperative matrix support. Choose 16 for models whose operands fit the binary16 range and validate accuracy on representative prompts.
+
+With F16 KV, `"backends": {"vulkan": {"prefill-attention-bits": 16}}` additionally permits dense prefill attention to round the normalized query and softmax weights to binary16 for its matrix products. Scores, softmax and the accumulated output stay in F32. On capable devices the cooperative kernel handles aligned 64-channel heads with at least 128 active query rows. For 64–127 rows it becomes eligible after 256 tokens of history. This setting is independent of `prefill-matmul-bits`. Omitting it or choosing 32 keeps the compensated attention path on supported devices. Single-token decode keeps its existing computation.

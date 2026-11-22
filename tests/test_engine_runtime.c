@@ -162,6 +162,22 @@ static void test_sampler_unit(void) {
     CHECK_RC(velri_sampler_sample(&s1, tied, &greedy, &tok), "greedy sample");
     CHECK(tok == 1, "greedy breaks ties to smallest index");
 
+    velri_sampler large;
+    float blocks[131];
+    CHECK_RC(velri_sampler_init(&large, 131U, 12345ULL), "multi-block sampler");
+    for (size_t i = 0; i < 131U; ++i) blocks[i] = -INFINITY;
+    blocks[63] = -0.0f;
+    blocks[64] = 0.0f;
+    CHECK_RC(velri_sampler_sample(&large, blocks, &greedy, &tok), "signed-zero tie");
+    CHECK(tok == 63, "first maximum across blocks");
+    blocks[130] = NAN;
+    CHECK(velri_sampler_sample(&large, blocks, &greedy, &tok) == VELRI_RC_ERR_EXEC,
+          "invalid final logit after a maximum");
+    blocks[130] = 1.0f;
+    CHECK_RC(velri_sampler_sample(&large, blocks, &greedy, &tok), "partial final block");
+    CHECK(tok == 130, "maximum in final block");
+    velri_sampler_destroy(&large);
+
     /* Reject NaN, +Inf, and all--Inf logits, and verify `reseed` is NOT applied on error! */
     const float nan_logits[8] = {0.0f, NAN, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     CHECK(velri_sampler_sample(&s1, nan_logits, &greedy, &tok) == VELRI_RC_ERR_EXEC,
@@ -632,6 +648,18 @@ static void test_llama_auto_rope_and_cancellation(void) {
                                           .placement_json_len = strlen(kvq_json)};
         CHECK(velri_program_prepare(ctx, model, &kvq_opts, &bad_p) == VELRI_RC_ERR_UNSUPPORTED,
               "unsupported kv-quantization rejected explicitly");
+        const char *cpu_f16_kv =
+            "{\"model\":{\"compute\":\"cpu:0\"},\"kv-quantization\":{\"k-bits\":16,\"v-bits\":16}}";
+        kvq_opts.placement_json = cpu_f16_kv;
+        kvq_opts.placement_json_len = strlen(cpu_f16_kv);
+        CHECK(velri_program_prepare(ctx, model, &kvq_opts, &bad_p) == VELRI_RC_ERR_UNSUPPORTED &&
+                  bad_p == nullptr,
+              "CPU attention rejects a half-precision cache before session creation");
+        const char *partial_kv = "{\"model\":{},\"kv-quantization\":{\"k-bits\":16}}";
+        kvq_opts.placement_json = partial_kv;
+        kvq_opts.placement_json_len = strlen(partial_kv);
+        CHECK(velri_program_prepare(ctx, model, &kvq_opts, &bad_p) == VELRI_RC_ERR_UNSUPPORTED,
+              "unsupported asymmetric K/V precision rejected");
 
         const char *aff_json =
             "{\"model\": {\"store\": \"cpu:0\", \"compute\": \"cpu:0\"},"
@@ -772,6 +800,51 @@ static void test_llama_auto_rope_and_cancellation(void) {
 }
 
 /* ---- Test 5: Dual-Plan `prefill-compute != compute` (0 Duplication + Vulkan Graph Replay) ---- */
+
+static void check_f16_kv(velri_ctx *ctx, velri_model *model, velri_program *reference,
+                         uint32_t vk_dev_id, size_t reference_state_bytes) {
+    const char json[] = "{\"model\":{\"store\":\"vulkan:0\",\"compute\":\"vulkan:0\"},"
+                        "\"kv-quantization\":{\"k-bits\":16,\"v-bits\":16}}";
+    velri_program_options options = {.max_ctx = 32U, .prefill_chunk_size = 4U,
+                                     .placement_json = json, .placement_json_len = sizeof(json) - 1U};
+    velri_program *compact = nullptr;
+    velri_rc rc = velri_program_prepare(ctx, model, &options, &compact);
+    if (rc == VELRI_RC_ERR_UNSUPPORTED) {
+        puts("  [SKIP] F16 KV storage unavailable on this Vulkan device.");
+        return;
+    }
+    CHECK_RC(rc, "F16 KV prepare");
+    velri_program_mem_report memory;
+    CHECK_RC(velri_program_memory_report(compact, &memory), "F16 KV report");
+    CHECK(memory.devices[vk_dev_id].state_bytes * 2U == reference_state_bytes, "F16 KV state size");
+
+    velri_session *a = nullptr, *b = nullptr;
+    CHECK_RC(velri_session_create(reference, nullptr, &a), "F32 KV reference");
+    CHECK_RC(velri_session_create(compact, nullptr, &b), "F16 KV session");
+    const int32_t prompt[] = {1, 9, 23, 41, 52, 7};
+    const velri_sampling_params greedy = {.temperature = 0.0f};
+    for (unsigned repeat = 0; repeat < 2; ++repeat) {
+        int32_t next = 0;
+        for (unsigned step = 0; step < 5; ++step) {
+            const int32_t *tokens = step ? &next : prompt;
+            uint32_t count = step ? 1U : 6U;
+            velri_step_result ref, got;
+            CHECK_RC(velri_session_step(a, tokens, count, &greedy, nullptr, &ref), "F32 reference step");
+            CHECK_RC(velri_session_step(b, tokens, count, &greedy, nullptr, &got), "F16 KV step");
+            CHECK(got.kv_len == ref.kv_len && got.last_step_allocs == 0U, "F16 KV step contract");
+            for (uint32_t i = 0; i < got.vocab_size; ++i) {
+                CHECK(isfinite(got.logits[i]) && fabsf(got.logits[i] - ref.logits[i]) < 0.01f,
+                      "F16 KV prefill/decode logits");
+            }
+            next = ref.sampled_token;
+        }
+        CHECK_RC(velri_session_reset(b), "F16 KV reset");
+        CHECK_RC(velri_session_reset(a), "F32 reference reset");
+    }
+    CHECK_RC(velri_session_destroy(b), "destroy F16 KV session");
+    CHECK_RC(velri_session_destroy(a), "destroy F32 reference");
+    CHECK_RC(velri_program_destroy(compact), "destroy F16 KV program");
+}
 
 static void test_dual_plan_prefill_compute_and_vulkan(void) {
     velri_ctx *ctx = nullptr;
@@ -920,6 +993,7 @@ static void test_dual_plan_prefill_compute_and_vulkan(void) {
     velri_program_mem_report ref_rep, dual_rep;
     CHECK_RC(velri_program_memory_report(ref_prog, &ref_rep), "ref mem report");
     CHECK_RC(velri_program_memory_report(dual_prog, &dual_rep), "dual mem report");
+    check_f16_kv(ctx, model, ref_prog, vk_dev_id, ref_rep.devices[vk_dev_id].state_bytes);
     CHECK(!ref_rep.has_distinct_prefill_plan && dual_rep.has_distinct_prefill_plan,
           "mem report flags dual plan");
     CHECK(dual_rep.devices[vk_dev_id].weight_bytes == ref_rep.devices[vk_dev_id].weight_bytes &&

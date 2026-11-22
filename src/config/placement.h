@@ -68,6 +68,8 @@ typedef struct {
 
 typedef struct {
     uint32_t prefill_chunk_size; /* 0 => default */
+    uint32_t prefill_attention_bits; /* 0 or 32 => retain full precision. */
+    uint32_t prefill_matmul_bits; /* 0 or 32 => F32. 16 permits F16 operands for F32 GEMM. */
 } velri_vulkan_backend_cfg;
 
 typedef struct {

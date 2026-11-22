@@ -1,0 +1,4 @@
+prompt_tokens,successful_runs,runs,median_prefill_tok_s,median_decode_tok_s,median_rss_peak_mib,median_vram_sampled_peak_mib
+16384,3,3,22665.073,395.431,389.164,1419.281
+32768,3,3,9831.91,236.629,555.586,4081.781
+65536,3,3,4737.571,131.447,809.918,7878.781
