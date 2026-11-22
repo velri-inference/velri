@@ -939,18 +939,30 @@ static velri_status analyze_dag_barriers_and_batches(velri_plan *plan) {
                plan->steps[run_end].u.op.device_id == dev) {
             run_end++;
         }
-        uint32_t batch_len =
-            (plan->ctx->devices[dev].vt->submit_batch != nullptr) ? (run_end - s) : 1U;
+        const velri_backend_vtable *vt = plan->ctx->devices[dev].vt;
+        uint32_t batch_len = vt->submit_batch ? run_end - s : 1U;
         if (batch_len > plan->max_batch_len) {
             plan->max_batch_len = batch_len;
         }
 
         r_cnt = 0U;
         w_cnt = 0U;
+        velri_launch_batch *batch = nullptr;
         for (uint32_t idx = s; idx < run_end; ++idx) {
             velri_launch_step *step = &plan->steps[idx];
             const velri_resolved_op *op = &step->u.op.resolved;
             plan->dag_total_ops++;
+            if (idx == s || batch_len == 1U) {
+                batch = &step->u.op.batch;
+                batch->count = batch_len;
+                batch->static_t1 = true;
+                if (vt->capture_graph) {
+                    batch->capture_index = plan->num_capture_batches++;
+                }
+            }
+            if (velri_op_is_dynamic_seq(op) && velri_op_static_rows(op) != 1U) {
+                batch->static_t1 = false;
+            }
 
             phys_span op_r[VELRI_OP_MAX_INPUTS];
             phys_span op_w[VELRI_OP_MAX_OUTPUTS];

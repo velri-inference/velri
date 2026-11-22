@@ -206,6 +206,7 @@ typedef struct {
     bool mem_total_known;   /* False if driver does not report reliable memory size */
     size_t mem_total_bytes; /* 0 if !mem_total_known */
     size_t min_align_bytes; /* Required base allocation alignment */
+    uint32_t cpu_workers;   /* Actual pool size, including the caller; 0 on other devices */
 } velri_device_caps;
 
 typedef struct velri_backend_device velri_backend_device;
@@ -291,6 +292,8 @@ typedef struct {
     size_t cpu_workers;            /* 0 => auto */
     velri_cpu_variant cpu_variant; /* VELRI_CPU_AUTO by default */
     bool enable_vulkan;            /* Try opening Vulkan devices if compiled with Vulkan */
+    bool use_physical_cores;       /* When cpu_workers == 0, count accessible physical cores */
+    uint32_t cpu_reserve_cores;    /* Subtracted in physical-core mode; at least one worker */
 } velri_context_config;
 
 velri_status velri_context_create(const velri_context_config *cfg, velri_context **out_ctx);

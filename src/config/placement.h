@@ -20,7 +20,8 @@ enum {
     VELRI_CFG_BACKEND_NAME_MAX = 32,
     VELRI_CFG_SCOPE_MAX = 128,
     VELRI_CFG_RULE_LABEL_MAX = 160,
-    VELRI_CFG_ERR_MAX = 256
+    VELRI_CFG_ERR_MAX = 256,
+    VELRI_DEFAULT_CPU_RESERVE_CORES = 1
 };
 
 typedef enum {
@@ -61,6 +62,8 @@ typedef struct {
     uint32_t threads;       /* 0 => auto */
     uint32_t reserve_cores; /* default 1 */
     velri_cpu_affinity_mode affinity;
+    bool has_threads;
+    bool has_reserve_cores;
 } velri_cpu_backend_cfg;
 
 typedef struct {
@@ -136,13 +139,11 @@ typedef struct {
     bool has_disk_rules;
 } velri_placement_plan;
 
-/* Adapter passed as `resolve_user` to `velri_b_init(..., velri_placement_builder_cb, &adapter)`.
- * Setting `builder` lets the callback propagate sticky errors directly into `velri_builder`. */
+/* Reports whether compute placements actually requested during graph construction differ. */
 typedef struct {
     const velri_placement_plan *plan;
-    velri_builder *builder; /* Optional; when set, errors call velri_b_set_error(builder, err) */
     bool is_prefill;
-    velri_status err;
+    bool distinct_compute;
     char err_msg[VELRI_CFG_ERR_MAX];
 } velri_placement_builder_adapter;
 
@@ -157,6 +158,10 @@ void velri_engine_config_destroy(velri_engine_config *cfg);
 velri_status velri_engine_config_parse(const char *json_data, size_t json_len,
                                        velri_engine_config *out_cfg, char *err_msg,
                                        size_t err_cap);
+
+/* The same configuration schema before context creation; the model section is optional. */
+velri_status velri_cpu_config_parse(const char *json_data, size_t json_len,
+                                    velri_cpu_backend_cfg *out, char *err_msg, size_t err_cap);
 
 /* Parse a device spec string ("cpu:0", "vulkan:0", "ram:0", "disk"). */
 velri_status velri_device_spec_parse(const char *text, bool allow_store_only,
@@ -182,30 +187,13 @@ velri_status velri_placement_resolve(const velri_placement_plan *plan, const cha
                                      int32_t layer_idx, velri_resolved_placement *out,
                                      char *err_msg, size_t err_cap);
 
-/* Return true if any layer or root component resolves to a distinct prefill vs decode device. */
-bool velri_placement_has_distinct_prefill(const velri_placement_plan *plan,
-                                          uint32_t num_hidden_layers);
-
-/* Scope-filtered distinct prefill check for concrete model architectures. */
-bool velri_placement_has_distinct_prefill_for_scopes(const velri_placement_plan *plan,
-                                                     const char *const *root_scopes,
-                                                     uint32_t num_root_scopes,
-                                                     const char *const *layer_scopes,
-                                                     uint32_t num_layer_scopes,
-                                                     uint32_t num_hidden_layers);
-
-/* `velri_placement_resolve_fn` callback for `velri_b_init`. `user` is `velri_placement_builder_adapter*`. */
-void velri_placement_builder_cb(const char *scope_path, int32_t layer_idx, void *user,
-                                velri_device_id *out_store, velri_device_id *out_compute);
+/* Checked builder callback. Each non-null output is a placement used by the graph. */
+velri_status velri_placement_builder_cb(const char *scope_path, int32_t layer_idx, void *user,
+                                        velri_device_id *out_store, velri_device_id *out_compute);
 
 /* Format a human-readable `inspect` report (devices, resolved placement + provenance, optional mem report). */
 size_t velri_placement_format_inspect(const velri_placement_plan *plan, uint32_t num_hidden_layers,
                                       const velri_memory_report *mem_report, char *out_buf,
                                       size_t out_cap);
-
-/* Format ONLY the device/backend/placement sections (without Memory Plan), for engine-level reports. */
-size_t velri_placement_format_inspect_placement(const velri_placement_plan *plan,
-                                                uint32_t num_hidden_layers, char *out_buf,
-                                                size_t out_cap);
 
 #endif /* VELRI_CONFIG_PLACEMENT_H */

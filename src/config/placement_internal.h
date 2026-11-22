@@ -15,12 +15,6 @@ typedef struct {
     bool always_show;
 } velri_cfg_layer_scope_meta;
 
-typedef struct {
-    char *buf;
-    size_t cap;
-    size_t pos;
-} velri_cfg_str_buf;
-
 enum { VELRI_CFG_MAX_LAYER_SCOPES = 16 };
 
 extern const velri_cfg_enum_entry velri_cfg_affinity_table[];
@@ -36,6 +30,5 @@ bool velri_cfg_selector_matches_layer(const velri_layer_selector *sel, uint32_t 
 
 const char *velri_cfg_enum_name(const velri_cfg_enum_entry *table, size_t count, int value,
                                 const char *fallback);
-void velri_cfg_sb_appendf(velri_cfg_str_buf *sb, const char *fmt, ...);
 
 #endif /* VELRI_CONFIG_PLACEMENT_INTERNAL_H */

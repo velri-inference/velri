@@ -184,11 +184,13 @@ static velri_status cpu_open_device(uint32_t local_index, const void *cfg,
 
     size_t nw = ocfg ? ocfg->workers : 0U;
     if (nw == 0U) {
-        const velri_cpu_info *ci = velri_get_cpu_info();
-        int hw = ci->hardware_threads > 0 ? ci->hardware_threads : 1;
-        nw = (size_t)(hw > 16 ? hw / 2 : hw);
-        if (nw == 0U) {
-            nw = 1U;
+        if (ocfg && ocfg->use_physical_cores) {
+            uint32_t cores = velri_os_available_physical_cores();
+            nw = cores > ocfg->reserve_cores ? cores - ocfg->reserve_cores : 1U;
+        } else {
+            const velri_cpu_info *ci = velri_get_cpu_info();
+            int hw = ci->hardware_threads > 0 ? ci->hardware_threads : 1;
+            nw = (size_t)(hw > 16 ? hw / 2 : hw);
         }
         if (nw > (size_t)VELRI_POOL_MAX_WORKERS) {
             nw = (size_t)VELRI_POOL_MAX_WORKERS;
@@ -224,6 +226,7 @@ static velri_status cpu_query_caps(const velri_backend_device *dev, velri_device
     out_caps->mem_total_known = false;
     out_caps->mem_total_bytes = 0U;
     out_caps->min_align_bytes = CPU_MIN_ALIGN_BYTES;
+    out_caps->cpu_workers = (uint32_t)dev->workers;
     return VELRI_OK;
 }
 

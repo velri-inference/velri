@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(velri VERSION 0.1.0 LANGUAGES C)
+project(velri VERSION 0.2.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -22,22 +22,25 @@ if(VELRI_LIB_SOURCE_DIR)
     set(VELRI_LIB_BUILD_TESTS ${BUILD_TESTING} CACHE BOOL "Build dependency correctness tests")
     add_subdirectory("${VELRI_LIB_SOURCE_DIR}" velri-lib)
 else()
-    find_package(VelriLib 0.1.0 EXACT CONFIG REQUIRED)
+    find_package(VelriLib 0.2.0 EXACT CONFIG REQUIRED)
 endif()
 
 # Velri engine: public C23 runtime API, sampler, streaming JSON, cascading placement, model layers & architectures.
 add_library(velri_engine STATIC
     src/format/json.c
+    src/format/inspect.c
     src/config/placement.c
     src/config/placement_resolve.c
     src/config/placement_inspect.c
     src/model/layers.c
+    src/model/manifest.c
     src/model/arch/gpt2.c
     src/model/arch/llama.c
     src/model/arch_registry.c
     src/runtime/sampler.c
     src/runtime/context.c
     src/runtime/model.c
+    src/runtime/weights.c
     src/runtime/program.c
     src/runtime/session.c
 )

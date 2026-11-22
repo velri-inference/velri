@@ -140,7 +140,36 @@ bool velri_cancel_triggered(const velri_cancel *cancel) {
 
 /* ---- Context API ---- */
 
-velri_rc velri_ctx_create(const velri_ctx_options *opts, velri_ctx **out_ctx) {
+velri_rc velri_rt_check_cpu_policy(const velri_cpu_backend_cfg *request,
+                                   const velri_cpu_backend_cfg *existing,
+                                   char *err_msg, size_t err_cap) {
+    if (request->affinity == VELRI_AFFINITY_REQUIRED) {
+        if (err_msg && err_cap) {
+            snprintf(err_msg, err_cap,
+                     "backends.cpu.affinity='required': worker pinning is unavailable");
+        }
+        return VELRI_RC_ERR_UNSUPPORTED;
+    }
+    if (existing && request->has_threads && request->threads != existing->threads) {
+        if (err_msg && err_cap) {
+            snprintf(err_msg, err_cap, "backends.cpu.threads=%u conflicts with context cpu_threads=%u",
+                     request->threads, existing->threads);
+        }
+        return VELRI_RC_ERR_INVALID;
+    }
+    if (existing && existing->threads == 0U && request->has_reserve_cores &&
+        request->reserve_cores != existing->reserve_cores) {
+        if (err_msg && err_cap) {
+            snprintf(err_msg, err_cap, "backends.cpu.reserve-cores=%u conflicts with context setting %u",
+                     request->reserve_cores, existing->reserve_cores);
+        }
+        return VELRI_RC_ERR_INVALID;
+    }
+    return VELRI_RC_OK;
+}
+
+static velri_rc create_context(const velri_ctx_options *opts, velri_cpu_backend_cfg cpu,
+                               velri_ctx **out_ctx) {
     if (!out_ctx) {
         return VELRI_RC_ERR_INVALID;
     }
@@ -152,11 +181,14 @@ velri_rc velri_ctx_create(const velri_ctx_options *opts, velri_ctx **out_ctx) {
     atomic_init(&ctx->live_children, 0U);
     atomic_flag_clear(&ctx->err_lock);
     ctx->vulkan_requested = opts ? opts->enable_vulkan : false;
+    ctx->cpu_policy = cpu;
 
     velri_context_config vcfg = {
-        .cpu_workers = opts ? (size_t)opts->cpu_threads : 0U,
+        .cpu_workers = cpu.threads,
         .cpu_variant = VELRI_CPU_AUTO,
         .enable_vulkan = ctx->vulkan_requested,
+        .use_physical_cores = true,
+        .cpu_reserve_cores = cpu.reserve_cores,
     };
     velri_status st = velri_context_create(&vcfg, &ctx->vl_ctx);
     if (st != VELRI_OK) {
@@ -167,13 +199,49 @@ velri_rc velri_ctx_create(const velri_ctx_options *opts, velri_ctx **out_ctx) {
     return VELRI_RC_OK;
 }
 
+velri_rc velri_ctx_create(const velri_ctx_options *opts, velri_ctx **out_ctx) {
+    velri_cpu_backend_cfg cpu = {
+        .threads = opts ? opts->cpu_threads : 0U,
+        .reserve_cores = VELRI_DEFAULT_CPU_RESERVE_CORES,
+    };
+    return create_context(opts, cpu, out_ctx);
+}
+
+velri_rc velri_ctx_create_from_json(const velri_ctx_options *opts, const char *json, size_t json_len,
+                                    velri_ctx **out_ctx, char *err_msg, size_t err_cap) {
+    if (!out_ctx) {
+        return VELRI_RC_ERR_INVALID;
+    }
+    *out_ctx = nullptr;
+    velri_cpu_backend_cfg cpu;
+    velri_status st = velri_cpu_config_parse(json, json_len, &cpu, err_msg, err_cap);
+    if (st != VELRI_OK) {
+        return velri_rt_rc_from_vl(st);
+    }
+    velri_cpu_backend_cfg fixed = {.threads = opts ? opts->cpu_threads : 0U};
+    velri_rc rc = velri_rt_check_cpu_policy(&cpu, fixed.threads ? &fixed : nullptr,
+                                            err_msg, err_cap);
+    if (rc != VELRI_RC_OK) {
+        return rc;
+    }
+    if (fixed.threads) {
+        cpu.threads = fixed.threads;
+    }
+    rc = create_context(opts, cpu, out_ctx);
+    if (rc != VELRI_RC_OK && err_msg && err_cap) {
+        snprintf(err_msg, err_cap, "failed to open context with backends.cpu.threads=%u: %s",
+                 cpu.threads, velri_rc_str(rc));
+    }
+    return rc;
+}
+
 velri_rc velri_ctx_destroy(velri_ctx *ctx) {
     if (!ctx) {
         return VELRI_RC_OK;
     }
-    if (!velri_rt_try_mark_destroying(&ctx->live_children)) {
+    if (!velri_rt_try_acquire_exclusive(&ctx->live_children)) {
         uint32_t lc = atomic_load_explicit(&ctx->live_children, memory_order_acquire) &
-                      ~VELRI_DESTROYING_BIT;
+                      ~VELRI_EXCLUSIVE_BIT;
         velri_rt_ctx_set_error(ctx,
                                "ctx_destroy: cannot destroy context with %u live dependent object(s)",
                                lc);
@@ -215,6 +283,7 @@ velri_rc velri_ctx_device_info(const velri_ctx *ctx, uint32_t device_id,
     snprintf(out_info->backend_name, sizeof(out_info->backend_name), "%s", caps.backend_name);
     snprintf(out_info->device_name, sizeof(out_info->device_name), "%s", caps.device_name);
     out_info->is_host_memory = caps.is_host_memory;
+    out_info->cpu_workers = caps.cpu_workers;
     out_info->is_uma = caps.is_uma;
     out_info->total_memory_bytes = caps.mem_total_known ? caps.mem_total_bytes : 0ULL;
     return VELRI_RC_OK;

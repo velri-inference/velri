@@ -1,25 +1,11 @@
 #include "runtime/runtime_internal.h"
+#include "format/inspect.h"
+#include "model/manifest.h"
 
-#include <stdarg.h>
-#include <stdio.h>
 #include <string.h>
 
 static_assert((uint32_t)VELRI_PROGRAM_MAX_DEVICES == (uint32_t)VELRI_MAX_REPORT_DEVICES,
               "VELRI_PROGRAM_MAX_DEVICES must match VELRI_MAX_REPORT_DEVICES");
-
-static void prog_sb_appendf(char *buf, size_t cap, size_t *pos, const char *fmt, ...) {
-    if (!buf || cap == 0U || *pos >= cap) {
-        return;
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(buf + *pos, cap - *pos, fmt, ap);
-    va_end(ap);
-    if (n > 0) {
-        size_t avail = cap - 1U - *pos;
-        *pos += ((size_t)n < avail) ? (size_t)n : avail;
-    }
-}
 
 /* ---- Config Validation & Limits Resolution Helpers ---- */
 
@@ -56,10 +42,11 @@ static velri_rc program_parse_and_validate_config(velri_program *prog,
             prog->cfg.kv_k_bits, prog->cfg.kv_v_bits);
         return VELRI_RC_ERR_UNSUPPORTED;
     }
-    if (prog->cfg.cpu_backend.affinity == VELRI_AFFINITY_REQUIRED) {
-        velri_rt_ctx_set_error(ctx,
-                               "program_prepare: backends.cpu.affinity='required' is not yet supported");
-        return VELRI_RC_ERR_UNSUPPORTED;
+    velri_rc cpu_rc = velri_rt_check_cpu_policy(&prog->cfg.cpu_backend, &ctx->cpu_policy,
+                                                err_buf, sizeof(err_buf));
+    if (cpu_rc != VELRI_RC_OK) {
+        velri_rt_ctx_set_error(ctx, "program_prepare: %s", err_buf);
+        return cpu_rc;
     }
 
     bool strict_layers = opts ? opts->strict_layer_selectors : false;
@@ -119,20 +106,14 @@ static velri_rc program_resolve_limits(velri_program *prog, const velri_program_
     prog->prefill_chunk_size = chunk;
     prog->default_seed = prog->cfg.sampling.seed;
     prog->has_default_seed = prog->cfg.sampling.has_seed;
-    prog->has_distinct_prefill =
-        (max_ctx > 1U) &&
-        velri_placement_has_distinct_prefill_for_scopes(&prog->placement, ops->root_scopes,
-                                                        ops->num_root_scopes, ops->layer_scopes,
-                                                        ops->num_layer_scopes, d->num_hidden_layers);
     return VELRI_RC_OK;
 }
 
 /* ---- Graph Building & Plan Compilation ---- */
 
-static velri_rc prepare_single_plan(velri_program *prog, bool is_prefill, uint32_t max_seq_len,
-                                    bool latent_kv, bool allow_cpu_fb,
-                                    velri_plan *share_weights_from, velri_manifest *out_manifest,
-                                    velri_plan **out_plan) {
+static velri_rc build_program_graph(velri_program *prog, bool is_prefill, uint32_t max_seq_len,
+                                    bool latent_kv, velri_manifest *out_manifest,
+                                    velri_graph **out_graph, bool *out_distinct_compute) {
     velri_graph *g = nullptr;
     velri_status st = velri_graph_create(&g);
     if (st != VELRI_OK) {
@@ -141,12 +122,10 @@ static velri_rc prepare_single_plan(velri_program *prog, bool is_prefill, uint32
         return velri_rt_rc_from_vl(st);
     }
 
-    velri_manifest_init(out_manifest);
     velri_placement_builder_adapter ad = {.plan = &prog->placement, .is_prefill = is_prefill};
     velri_builder b;
-    velri_b_init(&b, g, out_manifest, prog->placement.default_store_dev,
-                 prog->placement.default_compute_dev, velri_placement_builder_cb, &ad);
-    ad.builder = &b;
+    velri_b_init_checked(&b, g, out_manifest, prog->placement.default_store_dev,
+                         prog->placement.default_compute_dev, velri_placement_builder_cb, &ad);
 
     const velri_model *m = prog->model;
     const velri_model_desc *d = &m->desc;
@@ -176,9 +155,8 @@ static velri_rc prepare_single_plan(velri_program *prog, bool is_prefill, uint32
     const char *phase = is_prefill ? "prefill" : "decode";
     st = m->arch_ops->build_graph(&b, &mp);
     if (st != VELRI_OK) {
-        if (ad.err != VELRI_OK && ad.err_msg[0] != '\0') {
+        if (ad.err_msg[0] != '\0') {
             velri_rt_ctx_set_error(prog->ctx, "program_prepare: %s", ad.err_msg);
-            st = ad.err;
         } else {
             velri_rt_ctx_set_error(prog->ctx, "program_prepare: failed building %s graph (%s)",
                                    phase, velri_rc_str(velri_rt_rc_from_vl(st)));
@@ -194,18 +172,70 @@ static velri_rc prepare_single_plan(velri_program *prog, bool is_prefill, uint32
         return VELRI_RC_ERR_INVALID;
     }
 
+    *out_graph = g;
+    if (out_distinct_compute) {
+        *out_distinct_compute = ad.distinct_compute;
+    }
+    return VELRI_RC_OK;
+}
+
+static velri_rc compile_program_plan(velri_program *prog, velri_graph *g, const char *phase,
+                                     bool allow_cpu_fb, velri_plan *share_weights_from,
+                                     velri_plan **out_plan) {
     velri_plan_options popts = {
         .allow_cpu_fallback = allow_cpu_fb,
         .share_weights_from = share_weights_from,
     };
-    st = velri_plan_prepare(prog->ctx->vl_ctx, g, &popts, out_plan);
-    velri_graph_destroy(g);
+    velri_status st = velri_plan_prepare(prog->ctx->vl_ctx, g, &popts, out_plan);
     if (st != VELRI_OK) {
         velri_rt_ctx_set_error(prog->ctx, "program_prepare: %s plan preparation failed (%s)", phase,
                                velri_rc_str(velri_rt_rc_from_vl(st)));
         return velri_rt_rc_from_vl(st);
     }
     return VELRI_RC_OK;
+}
+
+static velri_rc prepare_program_plans(velri_program *prog, bool latent_kv, bool allow_cpu_fb) {
+    /* Build the chunk-sized graph once. If every requested compute device is also the decode
+     * device, this same graph serves both phases. A single-token context only uses decode. */
+    bool can_prefill = prog->max_ctx > 1U;
+    bool distinct_compute = false;
+    velri_graph *chunk_graph = nullptr;
+    velri_rc rc = build_program_graph(prog, can_prefill, prog->prefill_chunk_size, latent_kv,
+                                      &prog->decode_manifest, &chunk_graph, &distinct_compute);
+    if (rc != VELRI_RC_OK) {
+        return rc;
+    }
+    prog->has_distinct_prefill = can_prefill && distinct_compute;
+    if (prog->has_distinct_prefill) {
+        prog->prefill_manifest = prog->decode_manifest;
+        velri_manifest_init(&prog->decode_manifest);
+        velri_graph *decode_graph = nullptr;
+        rc = build_program_graph(prog, false, 1U, latent_kv, &prog->decode_manifest,
+                                 &decode_graph, nullptr);
+        char err[VELRI_CFG_ERR_MAX];
+        if (rc == VELRI_RC_OK &&
+            !velri_model_check_shared_manifest(&prog->decode_manifest, &prog->prefill_manifest,
+                                               velri_context_device_count(prog->ctx->vl_ctx),
+                                               err, sizeof(err))) {
+            velri_rt_ctx_set_error(prog->ctx, "program_prepare: %s", err);
+            rc = VELRI_RC_ERR_INVALID;
+        }
+        if (rc == VELRI_RC_OK) {
+            rc = compile_program_plan(prog, decode_graph, "decode", allow_cpu_fb, nullptr,
+                                      &prog->decode_plan);
+        }
+        velri_graph_destroy(decode_graph);
+        if (rc == VELRI_RC_OK) {
+            rc = compile_program_plan(prog, chunk_graph, "prefill", allow_cpu_fb, prog->decode_plan,
+                                      &prog->prefill_plan);
+        }
+    } else {
+        rc = compile_program_plan(prog, chunk_graph, "decode", allow_cpu_fb, nullptr,
+                                  &prog->decode_plan);
+    }
+    velri_graph_destroy(chunk_graph);
+    return rc;
 }
 
 /* ---- Weight Binding & Auto-RoPE Synthesis ---- */
@@ -360,17 +390,7 @@ static velri_rc compute_program_memory_report(velri_program *prog) {
     out->ram_staging_bytes = dec_rep.ram_staging_bytes;
 
     for (uint32_t d = 0U; d < out->num_devices; ++d) {
-        const velri_device_memory_report *s = &dec_rep.devices[d];
-        out->devices[d] = (velri_program_device_mem){
-            .device_id = s->device_id,
-            .is_uma = s->is_uma,
-            .weight_bytes = s->weight_bytes,
-            .state_bytes = s->state_bytes,
-            .input_output_bytes = s->input_output_bytes,
-            .scratch_packed_bytes = s->scratch_packed_bytes,
-            .scratch_unpacked_bytes = s->scratch_unpacked_bytes,
-            .allocator_overhead_bytes = s->allocator_overhead_bytes,
-        };
+        out->devices[d] = velri_device_memory_from_plan(&dec_rep.devices[d]);
     }
 
     if (prog->has_distinct_prefill && prog->prefill_plan) {
@@ -480,7 +500,7 @@ velri_rc velri_program_prepare(velri_ctx *ctx, velri_model *model,
         return VELRI_RC_ERR_BUSY;
     }
     if (!velri_rt_try_acquire_child(&model->live_programs)) {
-        velri_rt_ctx_set_error(ctx, "program_prepare: model is being destroyed");
+        velri_rt_ctx_set_error(ctx, "program_prepare: model is being modified or destroyed");
         velri_rt_release_child(&ctx->live_children);
         return VELRI_RC_ERR_BUSY;
     }
@@ -513,20 +533,9 @@ velri_rc velri_program_prepare(velri_ctx *ctx, velri_model *model,
     bool latent_kv =
         (opts && opts->latent_kv) || (prog->cfg.attn_mechanism == VELRI_ATTN_MECH_LATENT_KV);
     bool allow_cpu_fb = opts ? opts->allow_cpu_fallback : false;
-    uint32_t dec_max_seq = prog->has_distinct_prefill ? 1U : prog->prefill_chunk_size;
-
-    fail_rc = prepare_single_plan(prog, false, dec_max_seq, latent_kv, allow_cpu_fb, nullptr,
-                                  &prog->decode_manifest, &prog->decode_plan);
+    fail_rc = prepare_program_plans(prog, latent_kv, allow_cpu_fb);
     if (fail_rc != VELRI_RC_OK) {
         goto fail;
-    }
-    if (prog->has_distinct_prefill) {
-        fail_rc = prepare_single_plan(prog, true, prog->prefill_chunk_size, latent_kv, allow_cpu_fb,
-                                      prog->decode_plan, &prog->prefill_manifest,
-                                      &prog->prefill_plan);
-        if (fail_rc != VELRI_RC_OK) {
-            goto fail;
-        }
     }
 
     fail_rc = bind_program_weights(prog);
@@ -553,9 +562,9 @@ velri_rc velri_program_destroy(velri_program *prog) {
     if (!prog) {
         return VELRI_RC_OK;
     }
-    if (!velri_rt_try_mark_destroying(&prog->live_sessions)) {
+    if (!velri_rt_try_acquire_exclusive(&prog->live_sessions)) {
         uint32_t ls = atomic_load_explicit(&prog->live_sessions, memory_order_acquire) &
-                      ~VELRI_DESTROYING_BIT;
+                      ~VELRI_EXCLUSIVE_BIT;
         velri_rt_ctx_set_error(prog->ctx,
                                "program_destroy: cannot destroy program with %u live session(s)",
                                ls);
@@ -582,25 +591,15 @@ size_t velri_program_inspect(const velri_program *prog, char *out_buf, size_t ou
     if (!prog || !out_buf || out_cap == 0U) {
         return 0U;
     }
-    size_t pos = velri_placement_format_inspect_placement(
-        &prog->placement, prog->model->desc.num_hidden_layers, out_buf, out_cap);
+    velri_text_writer text = {.buf = out_buf, .cap = out_cap};
+    text.pos = velri_placement_format_inspect(&prog->placement, prog->model->desc.num_hidden_layers,
+                                               nullptr, out_buf, out_cap);
 
     const velri_program_mem_report *mr = &prog->mem_report;
-    prog_sb_appendf(out_buf, out_cap, &pos,
-                    "Memory Plan: total=%zu B | ram_staging=%zu B | ram_transfers=%u\n",
-                    mr->total_physical_bytes, mr->ram_staging_bytes,
-                    mr->num_ram_transfers_decode + mr->num_ram_transfers_prefill);
-    for (uint32_t d = 0U; d < mr->num_devices && d < VELRI_PROGRAM_MAX_DEVICES; ++d) {
-        const velri_program_device_mem *dm = &mr->devices[d];
-        velri_device_caps caps;
-        bool ok = (velri_context_device_caps(prog->ctx->vl_ctx, dm->device_id, &caps) == VELRI_OK);
-        prog_sb_appendf(out_buf, out_cap, &pos,
-                        "  %s:%u | weights=%zu B | state=%zu B | io=%zu B | scratch=%zu B "
-                        "(unpacked=%zu B) | ovh=%zu B\n",
-                        ok ? caps.backend_name : "dev", ok ? caps.local_index : dm->device_id,
-                        dm->weight_bytes, dm->state_bytes, dm->input_output_bytes,
-                        dm->scratch_packed_bytes, dm->scratch_unpacked_bytes,
-                        dm->allocator_overhead_bytes);
+    velri_inspect_memory_summary(&text, mr->total_physical_bytes, mr->ram_staging_bytes,
+                                 (uint64_t)mr->num_ram_transfers_decode + mr->num_ram_transfers_prefill);
+    for (uint32_t d = 0U; d < mr->num_devices; ++d) {
+        velri_inspect_memory_device(&text, prog->ctx->vl_ctx, &mr->devices[d]);
     }
 
     uint32_t dec_ops = 0U;
@@ -611,19 +610,19 @@ size_t velri_program_inspect(const velri_program *prog, char *out_buf, size_t ou
         uint32_t pre_ops = 0U;
         uint32_t pre_elided = 0U;
         (void)velri_plan_barrier_stats(prog->prefill_plan, &pre_ops, &pre_elided);
-        prog_sb_appendf(out_buf, out_cap, &pos,
+        velri_text_appendf(&text,
                         "Program: arch=%s | max_ctx=%u | prefill_chunk=%u | mode=dual-plan "
                         "(shared weights+state) | decode_ops=%u (elided_barriers=%u) | "
                         "prefill_ops=%u (elided_barriers=%u)\n",
                         arch_name, prog->max_ctx, prog->prefill_chunk_size, dec_ops, dec_elided,
                         pre_ops, pre_elided);
     } else {
-        prog_sb_appendf(out_buf, out_cap, &pos,
+        velri_text_appendf(&text,
                         "Program: arch=%s | max_ctx=%u | prefill_chunk=%u | mode=unified | "
                         "ops=%u (elided_barriers=%u)\n",
                         arch_name, prog->max_ctx, prog->prefill_chunk_size, dec_ops, dec_elided);
     }
-    return pos;
+    return text.pos;
 }
 
 bool velri_program_has_distinct_prefill(const velri_program *prog) {

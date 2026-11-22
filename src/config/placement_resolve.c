@@ -310,76 +310,30 @@ velri_status velri_placement_resolve(const velri_placement_plan *plan, const cha
     return VELRI_OK;
 }
 
-bool velri_placement_has_distinct_prefill_for_scopes(const velri_placement_plan *plan,
-                                                     const char *const *root_scopes,
-                                                     uint32_t num_root_scopes,
-                                                     const char *const *layer_scopes,
-                                                     uint32_t num_layer_scopes,
-                                                     uint32_t num_hidden_layers) {
-    if (!plan || !plan->cfg) {
-        return false;
-    }
-    velri_resolved_placement res;
-    for (uint32_t i = 0U; i < num_root_scopes; ++i) {
-        if (velri_placement_resolve(plan, root_scopes[i], -1, &res, nullptr, 0U) == VELRI_OK &&
-            res.prefill_dev != res.compute_dev) {
-            return true;
-        }
-    }
-    for (uint32_t l = 0U; l < num_hidden_layers; ++l) {
-        for (uint32_t i = 0U; i < num_layer_scopes; ++i) {
-            if (velri_placement_resolve(plan, layer_scopes[i], (int32_t)l, &res, nullptr, 0U) ==
-                    VELRI_OK &&
-                res.prefill_dev != res.compute_dev) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool velri_placement_has_distinct_prefill(const velri_placement_plan *plan,
-                                          uint32_t num_hidden_layers) {
-    static const char *const k_all_roots[] = {
-        VELRI_SCOPE_ROOT,      VELRI_SCOPE_INPUT_LAYER, VELRI_SCOPE_LM_HEAD,
-        VELRI_SCOPE_PLE,       VELRI_SCOPE_PLE_TABLE,
-    };
-    const char *all_layers[VELRI_CFG_MAX_LAYER_SCOPES];
-    uint32_t n_layers = (uint32_t)velri_cfg_layer_scopes_len;
-    for (uint32_t i = 0U; i < n_layers; ++i) {
-        all_layers[i] = velri_cfg_layer_scopes[i].scope;
-    }
-    return velri_placement_has_distinct_prefill_for_scopes(
-        plan, k_all_roots, (uint32_t)ARRAY_COUNT(k_all_roots), all_layers, n_layers,
-        num_hidden_layers);
-}
-
-void velri_placement_builder_cb(const char *scope_path, int32_t layer_idx, void *user,
-                                velri_device_id *out_store, velri_device_id *out_compute) {
-    velri_placement_builder_adapter *ad = (velri_placement_builder_adapter *)user;
-    if (!ad || !ad->plan || ad->err != VELRI_OK) {
-        return;
+velri_status velri_placement_builder_cb(const char *scope_path, int32_t layer_idx, void *user,
+                                        velri_device_id *out_store, velri_device_id *out_compute) {
+    velri_placement_builder_adapter *ad = user;
+    if (!ad || !ad->plan) {
+        return VELRI_ERR_INVALID;
     }
     velri_resolved_placement res;
     velri_status st = velri_placement_resolve(ad->plan, scope_path, layer_idx, &res, ad->err_msg,
                                               sizeof(ad->err_msg));
-    if (st == VELRI_OK && res.store_is_disk) {
-        st = VELRI_ERR_UNSUPPORTED;
-        velri_cfg_set_errf(ad->err_msg, sizeof(ad->err_msg),
-                           "scope '%s' (layer %d): 'disk' storage streaming is not yet implemented",
-                           scope_path ? scope_path : "", layer_idx);
-    }
     if (st != VELRI_OK) {
-        ad->err = st;
-        if (ad->builder) {
-            velri_b_set_error(ad->builder, st);
-        }
-        return;
+        return st;
     }
     if (out_store) {
+        if (res.store_is_disk) {
+            velri_cfg_set_errf(ad->err_msg, sizeof(ad->err_msg),
+                               "scope '%s' (layer %d): 'disk' storage streaming is not yet implemented",
+                               scope_path ? scope_path : "", layer_idx);
+            return VELRI_ERR_UNSUPPORTED;
+        }
         *out_store = res.store_dev;
     }
     if (out_compute) {
         *out_compute = ad->is_prefill ? res.prefill_dev : res.compute_dev;
+        ad->distinct_compute |= res.prefill_dev != res.compute_dev;
     }
+    return VELRI_OK;
 }

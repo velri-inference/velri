@@ -114,6 +114,8 @@ velri_status velri_context_create(const velri_context_config *cfg, velri_context
     velri_cpu_open_cfg cpu_cfg = {
         .workers = ctx->cfg.cpu_workers,
         .variant = ctx->cfg.cpu_variant,
+        .use_physical_cores = ctx->cfg.use_physical_cores,
+        .reserve_cores = ctx->cfg.cpu_reserve_cores,
     };
     velri_status st = register_backend_with_cfg(ctx, velri_cpu_backend_vtable(), &cpu_cfg);
     if (st != VELRI_OK) {

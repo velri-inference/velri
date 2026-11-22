@@ -65,6 +65,8 @@ velri_status velri_shape_byte_size(velri_dtype dtype, uint32_t rank, const size_
 typedef struct {
     size_t workers;
     velri_cpu_variant variant;
+    bool use_physical_cores;
+    uint32_t reserve_cores;
 } velri_cpu_open_cfg;
 
 typedef struct {
@@ -136,6 +138,13 @@ typedef struct {
     bool is_bound;
 } velri_plan_weight_binding;
 
+/* Set on the first OP step of each submission. Transfer steps stand alone. */
+typedef struct {
+    uint32_t count;
+    uint32_t capture_index; /* Index in each slot's capture array on backends supporting replay */
+    bool static_t1;
+} velri_launch_batch;
+
 typedef struct {
     velri_launch_step_kind kind;
     union {
@@ -145,6 +154,7 @@ typedef struct {
             velri_prepared_op *prepared; /* Optional backend handle (may be nullptr) */
             uint32_t in_storage_idx[VELRI_OP_MAX_INPUTS];
             uint32_t out_storage_idx[VELRI_OP_MAX_OUTPUTS];
+            velri_launch_batch batch;
             bool no_barrier_before; /* True => DAG analysis proved no RAW/WAR/WAW hazard in batch */
         } op;
         struct {
@@ -180,6 +190,7 @@ struct velri_plan {
     velri_launch_step *steps;
     uint32_t num_steps;
     uint32_t max_batch_len;       /* Max consecutive same-device OP steps (for 0-alloc batching) */
+    uint32_t num_capture_batches; /* Batches on backends supporting capture/replay */
     uint32_t dag_total_ops;       /* Total VELRI_STEP_OP steps in plan */
     uint32_t dag_elided_barriers; /* Intra-batch barriers elided by DAG hazard analysis */
 

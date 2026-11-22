@@ -65,6 +65,8 @@ void velri_os_cond_broadcast(velri_os_cond *cv);
 
 /* ---- CPU Hints ---- */
 int velri_os_hardware_threads(void);
+/* Count accessible physical cores. Zero means the platform could not identify them. */
+uint32_t velri_os_available_physical_cores(void);
 void velri_os_cpu_relax(void);
 size_t velri_os_ctz64(uint64_t x);
 

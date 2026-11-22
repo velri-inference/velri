@@ -23,6 +23,10 @@ Long-lived objects are opaque C handles with paired create/destroy functions:
 
 Destroying an object that still has live dependents (e.g., destroying `Context` while a `Session` is alive) returns an explicit error. Public headers never expose `VkBuffer`, Slang, SIMD, or third-party types. A stable binary ABI is not promised in v1.
 
+Use `velri_ctx_create_from_json` to configure the shared CPU pool from `backends.cpu`. It accepts a full configuration or an object containing only `backends` and returns diagnostics in the caller's buffer. A nonzero `velri_ctx_options.cpu_threads` and an explicit JSON `threads` must agree. Pass the full configuration to `velri_program_prepare` for model placement and workload settings. Omit CPU settings at that stage or specify the same thread selection and automatic reserve. A conflicting request returns `VELRI_RC_ERR_INVALID`. Query `velri_device_info.cpu_workers` on the CPU device for the actual number of workers, including the calling thread.
+
+Weights are registered by canonical name. A bind takes exclusive access to the registry. A concurrent bind or prepare may return `VELRI_RC_ERR_BUSY`. Once a program has acquired the model, its weight bindings stay immutable until all dependent programs are destroyed.
+
 ---
 
 ## 2. Buffer Ownership, Synchronicity, and Concurrency

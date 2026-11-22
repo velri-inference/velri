@@ -11,10 +11,10 @@ Documentation: **[English](docs/EN/README.md)** · **[Русский](docs/RU/RE
 ## Current Status
 
 - **`VelriLib::velri` (alias `VelriLib::core`) is implemented and verified in `velri-lib/`:**
-  - Single consolidated C23 library (`<velri_lib/velri_lib.h>` — 4 public headers: `types.h`, `backend.h`, `graph.h`, `velri_lib.h`): `Storage` / `TensorView`, operation registry, graph builder, liveness scratch memory planner, UMA-aware memory report, plan-shared weights (`velri_plan_bind_weight_host`), device-resident state with explicit host sync, refcounted lifetimes, 6-group Backend Contract v2 with command-buffer batching, cross-backend RAM transfer bus, and independent concurrent execution slots (`core_contract` passes).
-  - MatOps kernels: 23 modular CPU kernels (`GEMV`/`GEMM` incl. FP64, norms, RoPE, activations, `GatedMLP`, `Softmax`, `FWHT`, `QuantRow`) compiled AOT from shared Slang modules (`common/` + `ops/`) alongside 29 `spirv-val`-verified modular Vulkan shaders (`src/kernels/slang/vk/`, `CoopMat`, `Split-K`), verified across every CPU ISA and Vulkan GPU by `test_kernels` ([Kernels](velri-lib/docs/EN/kernels.md)).
+  - Single consolidated C23 library (`<velri_lib/velri_lib.h>` — public headers for types, backends, graphs and reusable blocks): `Storage` / `TensorView`, operation registry, graph builder, liveness scratch memory planner, UMA-aware memory report, plan-shared weights (`velri_plan_bind_weight_host`), device-resident state with explicit host sync, refcounted lifetimes, 6-group Backend Contract v2 with command-buffer batching, cross-backend RAM transfer bus, and independent concurrent execution slots (`core_contract` passes).
+  - MatOps kernels: 23 modular CPU kernels (`GEMV`/`GEMM` incl. FP64, norms, RoPE, activations, `GatedMLP`, `Softmax`, `FWHT`, `QuantRow`) compiled AOT from shared Slang modules (`common/` + `ops/`) alongside `spirv-val`-verified modular Vulkan shaders (`src/kernels/slang/vk/`, `CoopMat`, `Split-K`), verified across every CPU ISA and Vulkan GPU by `test_kernels` ([Kernels](velri-lib/docs/EN/kernels.md)).
 - The earlier handwritten C23/SIMD CPU backend and deprecated `VelriLib::cpu_linear` target are preserved for reference on branch `archive/c23-cpu-legacy`.
-- Model blocks (`Attention`, `TransformerLayer`), `Model`/`Program`/`Session`, weight loading, and full inference are next ([Roadmap](docs/EN/roadmap.md)).
+- The public runtime builds GPT-2 and Llama/Qwen2 from synthetic descriptors and caller-bound weights. It supports chunked prefill, decode, sampling, and independent sessions. Loading model files and tokenization are planned ([Roadmap](docs/EN/roadmap.md)).
 
 ## Quick Build & Test
 

@@ -255,6 +255,120 @@ static void test_sampler_unit(void) {
 
 /* ---- Test 2: Parent-Before-Child Lifecycle & Diagnostic Errors ---- */
 
+static void test_cpu_pool_configuration(void) {
+    const char fixed[] = "{\"model\":{},\"backends\":{\"cpu\":{\"threads\":2,\"affinity\":\"none\"}}}";
+    const char automatic[] = "{\"backends\":{\"cpu\":{\"threads\":0,\"reserve-cores\":4294967295}}}";
+    const char required[] = "{\"backends\":{\"cpu\":{\"affinity\":\"required\"}}}";
+    char err[256];
+    velri_ctx *ctx = nullptr;
+    velri_ctx_options three = {.cpu_threads = 3U};
+    CHECK(velri_ctx_create_from_json(&three, fixed, sizeof(fixed) - 1U, &ctx, err, sizeof(err)) ==
+              VELRI_RC_ERR_INVALID && !ctx && strstr(err, "cpu_threads"),
+          "reject conflicting CPU options during context creation");
+    CHECK(velri_ctx_create_from_json(nullptr, required, sizeof(required) - 1U, &ctx, err, sizeof(err)) ==
+              VELRI_RC_ERR_UNSUPPORTED && !ctx && strstr(err, "pinning"),
+          "required affinity rejected before pool creation");
+    CHECK(velri_ctx_create_from_json(nullptr, "{", 1U, &ctx, err, sizeof(err)) ==
+              VELRI_RC_ERR_INVALID && !ctx && err[0],
+          "return JSON diagnostic before context exists");
+    CHECK_RC(velri_ctx_create_from_json(nullptr, automatic, sizeof(automatic) - 1U, &ctx,
+                                        err, sizeof(err)), "auto context from backend-only object");
+    velri_device_info info;
+    CHECK_RC(velri_ctx_device_info(ctx, 0U, &info), "get actual automatic CPU pool");
+    CHECK(info.cpu_workers == 1U, "reserving all cores leaves one worker");
+
+    velri_model_desc md = {
+        .arch = VELRI_ARCH_GPT2, .vocab_size = 16U, .max_position_embeddings = 8U,
+        .hidden_size = 16U, .num_hidden_layers = 1U, .num_attention_heads = 2U,
+        .intermediate_size = 32U, .hidden_act = VELRI_ACTIVATION_GELU_TANH,
+        .tie_word_embeddings = true,
+    };
+    velri_model *model = nullptr;
+    velri_program *prog = nullptr;
+    CHECK_RC(velri_model_create_synthetic(ctx, &md, &model), "auto context model");
+    const char reserve[] = "{\"model\":{},\"backends\":{\"cpu\":{\"reserve-cores\":0}}}";
+    velri_program_options opts = {.placement_json = reserve, .placement_json_len = sizeof(reserve) - 1U};
+    CHECK(velri_program_prepare(ctx, model, &opts, &prog) == VELRI_RC_ERR_INVALID &&
+              strstr(velri_ctx_last_error(ctx), "reserve-cores"),
+          "prepare rejects changes to an automatic context's reserve");
+    opts = (velri_program_options){.placement_json = fixed, .placement_json_len = sizeof(fixed) - 1U};
+    CHECK(velri_program_prepare(ctx, model, &opts, &prog) == VELRI_RC_ERR_INVALID &&
+              strstr(velri_ctx_last_error(ctx), "cpu.threads"),
+          "prepare rejects different CPU policy");
+    CHECK_RC(velri_model_destroy(model), "destroy automatic context model");
+    CHECK_RC(velri_ctx_destroy(ctx), "destroy automatic context");
+
+    CHECK_RC(velri_ctx_create_from_json(nullptr, fixed, sizeof(fixed) - 1U, &ctx, err, sizeof(err)),
+             "open pool before preparing program");
+    CHECK_RC(velri_ctx_device_info(ctx, 0U, &info), "fixed CPU device info");
+    CHECK(info.cpu_workers == 2U, "JSON controls actual worker count");
+    CHECK_RC(velri_model_create_synthetic(ctx, &md, &model), "fixed context model");
+    weight_pool pool = {0};
+    populate_gpt2_weights(model, &md, &pool);
+    CHECK_RC(velri_program_prepare(ctx, model, &opts, &prog), "reuse context config at prepare");
+    CHECK_RC(velri_program_destroy(prog), "destroy program with explicit CPU settings");
+    CHECK_RC(velri_program_prepare(ctx, model, nullptr, &prog), "omitted CPU settings inherit pool");
+    char report[4096];
+    CHECK(velri_program_inspect(prog, report, sizeof(report)) > 0U &&
+              strstr(report, "CPU pool: threads=2, affinity=none"),
+          "inspection reports actual context settings without program JSON");
+    CHECK_RC(velri_program_destroy(prog), "destroy fixed program");
+    CHECK_RC(velri_model_destroy(model), "destroy fixed model");
+    CHECK_RC(velri_ctx_destroy(ctx), "destroy fixed context");
+    pool_destroy(&pool);
+}
+
+typedef struct {
+    velri_ctx *ctx;
+    velri_model *model;
+} prepare_thread_args;
+
+#if defined(_WIN32)
+static DWORD WINAPI prepare_while_binding(void *arg) {
+#else
+static void *prepare_while_binding(void *arg) {
+#endif
+    prepare_thread_args *args = arg;
+    for (unsigned i = 0; i < 40; ++i) {
+        velri_program *prog = nullptr;
+        velri_rc rc = velri_program_prepare(args->ctx, args->model, nullptr, &prog);
+        CHECK(rc == VELRI_RC_OK || rc == VELRI_RC_ERR_BUSY, "prepare during binding");
+        CHECK_RC(velri_program_destroy(prog), "release concurrent program");
+    }
+    return 0;
+}
+
+static void exercise_weight_registry(velri_ctx *ctx, velri_model *model) {
+    static const float weight = 1.0f;
+    uint32_t initial_count = velri_model_weight_count(model);
+    prepare_thread_args args = {ctx, model};
+#if defined(_WIN32)
+    HANDLE thread = CreateThread(nullptr, 0, prepare_while_binding, &args, 0, nullptr);
+    CHECK(thread != nullptr, "start concurrent prepare");
+#else
+    pthread_t thread;
+    CHECK(pthread_create(&thread, nullptr, prepare_while_binding, &args) == 0, "start concurrent prepare");
+#endif
+    /* Grow through several rehashes while another thread reads the original model weights. */
+    for (unsigned i = 0; i < 256; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "unused.weight.%u", i);
+        velri_rc rc;
+        do {
+            rc = velri_model_bind_weight(model, name, &weight, sizeof(weight));
+        } while (rc == VELRI_RC_ERR_BUSY);
+        CHECK_RC(rc, "register weight during concurrent preparation");
+    }
+#if defined(_WIN32)
+    CHECK(WaitForSingleObject(thread, INFINITE) == WAIT_OBJECT_0, "join concurrent prepare");
+    CloseHandle(thread);
+#else
+    CHECK(pthread_join(thread, nullptr) == 0, "join concurrent prepare");
+#endif
+    CHECK_RC(velri_model_bind_weight(model, "unused.weight.0", &weight, sizeof(weight)), "rebind");
+    CHECK(velri_model_weight_count(model) == initial_count + 256U, "distinct weight names");
+}
+
 static void test_lifecycle_and_diagnostics(void) {
     velri_ctx *ctx = nullptr;
     velri_ctx_options copts = {.cpu_threads = 2U, .enable_vulkan = false};
@@ -291,6 +405,7 @@ static void test_lifecycle_and_diagnostics(void) {
 
     weight_pool pool = {0};
     populate_gpt2_weights(model, &md, &pool);
+    exercise_weight_registry(ctx, model);
 
     velri_program_options popts = {.max_ctx = 16U, .prefill_chunk_size = 4U};
     CHECK_RC(velri_program_prepare(ctx, model, &popts, &prog), "prog prepare");
@@ -493,7 +608,7 @@ static void test_llama_auto_rope_and_cancellation(void) {
         "  \"model\": {\n"
         "    \"store\": \"cpu:0\",\n"
         "    \"compute\": \"cpu:0\",\n"
-        "    \"sampling\": { \"temperature\": 0.0, \"seed\": 777 }\n"
+        "    \"sampling\": { \"temperature\": 0.0, \"top-p\": 0, \"seed\": 777 }\n"
         "  }\n"
         "}\n";
     velri_program_options popts = {
@@ -550,7 +665,7 @@ static void test_llama_auto_rope_and_cancellation(void) {
 
     velri_sampling_params def_samp;
     CHECK_RC(velri_program_default_sampling(prog, &def_samp), "default sampling");
-    CHECK(def_samp.temperature == 0.0f && def_samp.seed == 777ULL, "sampling inherited from JSON");
+    CHECK(def_samp.temperature == 0.0f && def_samp.top_p == 0.0f && def_samp.seed == 777ULL, "sampling inherited from JSON");
 
     velri_session *s1 = nullptr, *s2 = nullptr;
     CHECK_RC(velri_session_create(prog, nullptr, &s1), "llama s1");
@@ -780,6 +895,25 @@ static void test_dual_plan_prefill_compute_and_vulkan(void) {
         CHECK(!velri_program_has_distinct_prefill(u2),
               "dense Llama ignores unused moe.routed-experts prefill-compute");
         CHECK_RC(velri_program_destroy(u2), "destroy u2");
+
+        const char *inactive_compute[] = {
+            "{\"model\":{\"compute\":\"cpu:0\",\"hidden-layers\":{\"attention\":{"
+            "\"kv-cache\":{\"prefill-compute\":\"vulkan:0\"}}}}}",
+            "{\"model\":{\"compute\":\"cpu:0\",\"prefill-compute\":\"vulkan:0\","
+            "\"input-layer\":{\"compute\":\"cpu:0\"},\"lm-head\":{\"compute\":\"cpu:0\"},"
+            "\"hidden-layers\":{\"attention\":{\"compute\":\"cpu:0\"},"
+            "\"dense-mlp\":{\"compute\":\"cpu:0\"}}}}",
+        };
+        for (size_t i = 0; i < sizeof(inactive_compute) / sizeof(inactive_compute[0]); ++i) {
+            velri_program_options opts = dual_opts;
+            opts.placement_json = inactive_compute[i];
+            opts.placement_json_len = strlen(inactive_compute[i]);
+            velri_program *unified = nullptr;
+            CHECK_RC(velri_program_prepare(ctx, model, &opts, &unified), "inactive compute scope");
+            CHECK(!velri_program_has_distinct_prefill(unified),
+                  "storage-only KV or fully overridden parent compute keeps one plan");
+            CHECK_RC(velri_program_destroy(unified), "destroy unified program");
+        }
     }
 
     /* Prove 0 weight duplication AND 0 KV-cache duplication in memory report! */
@@ -857,6 +991,7 @@ static void test_dual_plan_prefill_compute_and_vulkan(void) {
 int main(void) {
     printf("=== Velri Engine Public C23 Runtime Suite ===\n");
     test_sampler_unit();
+    test_cpu_pool_configuration();
     test_lifecycle_and_diagnostics();
     test_gpt2_runtime_e2e();
     test_llama_auto_rope_and_cancellation();

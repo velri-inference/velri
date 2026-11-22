@@ -37,10 +37,7 @@ typedef struct {
 } velri_state_group;
 
 typedef struct {
-    uint32_t first_step;
-    uint32_t count;
     velri_device_id device_id;
-    bool static_t1;
     velri_captured_graph *graph;
 } slot_captured_batch;
 
@@ -60,7 +57,6 @@ struct velri_slot {
 
     /* Optional pre-recorded persistent decode launch graphs (captured in velri_slot_create). */
     slot_captured_batch *captured;
-    uint32_t num_captured;
 
     bool needs_reset;
     uint64_t last_run_allocs;
@@ -290,23 +286,10 @@ static bool populate_batch_items(velri_slot *slot, uint32_t first_step, uint32_t
 static velri_status validate_dynamic_params(const velri_plan *plan,
                                             const velri_step_params *params);
 
-static bool batch_is_static_t1(const velri_plan *plan, uint32_t first_step, uint32_t count) {
-    for (uint32_t k = 0U; k < count; ++k) {
-        const velri_resolved_op *op = &plan->steps[first_step + k].u.op.resolved;
-        if (!velri_op_is_dynamic_seq(op)) {
-            continue;
-        }
-        if (velri_op_static_rows(op) != 1U) {
-            return false;
-        }
-    }
-    return true;
-}
-
 /* Best-effort eager capture of T=1 persistent decode graphs on backends supporting capture_graph. */
 static void slot_capture_decode_graphs(velri_slot *slot) {
     const velri_plan *plan = slot->plan;
-    if (!slot->batch_items || plan->num_steps == 0U) {
+    if (plan->num_capture_batches == 0U) {
         return;
     }
 
@@ -322,66 +305,27 @@ static void slot_capture_decode_graphs(velri_slot *slot) {
         return;
     }
 
-    /* Count eligible contiguous batches first so we allocate once. */
-    uint32_t max_batches = 0U;
-    uint32_t s = 0U;
-    while (s < plan->num_steps) {
-        if (plan->steps[s].kind != VELRI_STEP_OP) {
-            s++;
-            continue;
-        }
-        velri_device_id dev_id = plan->steps[s].u.op.device_id;
-        const velri_backend_vtable *vt = plan->ctx->devices[dev_id].vt;
-        uint32_t batch = 1U;
-        if (vt->submit_batch) {
-            while (s + batch < plan->num_steps && plan->steps[s + batch].kind == VELRI_STEP_OP &&
-                   plan->steps[s + batch].u.op.device_id == dev_id) {
-                batch++;
-            }
-        }
-        if (vt->capture_graph && vt->replay_graph && vt->destroy_captured_graph) {
-            max_batches++;
-        }
-        s += batch;
-    }
-    if (max_batches == 0U) {
-        return;
-    }
-
-    slot->captured = (slot_captured_batch *)calloc(max_batches, sizeof(*slot->captured));
+    slot->captured = calloc(plan->num_capture_batches, sizeof(*slot->captured));
     if (!slot->captured) {
         return;
     }
 
-    s = 0U;
-    while (s < plan->num_steps) {
-        if (plan->steps[s].kind != VELRI_STEP_OP) {
+    for (uint32_t s = 0U; s < plan->num_steps;) {
+        const velri_launch_step *step = &plan->steps[s];
+        if (step->kind == VELRI_STEP_RAM_TRANSFER) {
             s++;
             continue;
         }
-        velri_device_id dev_id = plan->steps[s].u.op.device_id;
+        const velri_launch_batch *batch = &step->u.op.batch;
+        velri_device_id dev_id = step->u.op.device_id;
         velri_device_entry *de = &plan->ctx->devices[dev_id];
-        uint32_t batch = 1U;
-        if (de->vt->submit_batch) {
-            while (s + batch < plan->num_steps && plan->steps[s + batch].kind == VELRI_STEP_OP &&
-                   plan->steps[s + batch].u.op.device_id == dev_id) {
-                batch++;
+        if (de->vt->capture_graph && populate_batch_items(slot, s, batch->count, &cap_params)) {
+            velri_captured_graph *graph = nullptr;
+            if (de->vt->capture_graph(de->dev, slot->batch_items, batch->count, &graph) == VELRI_OK) {
+                slot->captured[batch->capture_index] = (slot_captured_batch){.device_id = dev_id, .graph = graph};
             }
         }
-        if (de->vt->capture_graph && de->vt->replay_graph && de->vt->destroy_captured_graph &&
-            batch <= slot->batch_cap && populate_batch_items(slot, s, batch, &cap_params)) {
-            velri_captured_graph *cg = nullptr;
-            if (de->vt->capture_graph(de->dev, slot->batch_items, batch, &cg) == VELRI_OK && cg) {
-                slot->captured[slot->num_captured++] = (slot_captured_batch){
-                    .first_step = s,
-                    .count = batch,
-                    .device_id = dev_id,
-                    .static_t1 = batch_is_static_t1(plan, s, batch),
-                    .graph = cg,
-                };
-            }
-        }
-        s += batch;
+        s += batch->count;
     }
 }
 
@@ -648,10 +592,11 @@ void velri_slot_destroy(velri_slot *slot) {
     velri_state_group *sg = slot->state_group;
     if (plan && plan->ctx) {
         /* Destroy captured graphs BEFORE releasing `state_group` so shared STATE BDAs stay valid. */
-        for (uint32_t i = 0U; i < slot->num_captured; ++i) {
-            velri_device_entry *de = &plan->ctx->devices[slot->captured[i].device_id];
-            if (slot->captured[i].graph && de->vt->destroy_captured_graph) {
-                de->vt->destroy_captured_graph(de->dev, slot->captured[i].graph);
+        for (uint32_t i = 0U; slot->captured && i < plan->num_capture_batches; ++i) {
+            const slot_captured_batch *batch = &slot->captured[i];
+            if (batch->graph) {
+                velri_device_entry *de = &plan->ctx->devices[batch->device_id];
+                de->vt->destroy_captured_graph(de->dev, batch->graph);
             }
         }
         for (uint32_t d = 0U; d < plan->ctx->num_devices; ++d) {
@@ -795,29 +740,21 @@ static velri_status run_ram_transfer(velri_slot *slot, const velri_launch_step *
     return dst_de->vt->copy_from_ram(dst_de->dev, &dst_b, slot->ram_staging, n);
 }
 
-static const slot_captured_batch *find_captured_batch(const velri_slot *slot, uint32_t first_step,
-                                                      uint32_t count) {
-    for (uint32_t i = 0U; i < slot->num_captured; ++i) {
-        if (slot->captured[i].first_step == first_step && slot->captured[i].count == count) {
-            return &slot->captured[i];
-        }
-    }
-    return nullptr;
-}
-
-static velri_status run_compute_batch(velri_slot *slot, uint32_t first_step, uint32_t count,
+static velri_status run_compute_batch(velri_slot *slot, uint32_t first_step,
                                       const velri_step_params *params, bool *out_accepted) {
     *out_accepted = false;
     const velri_plan *plan = slot->plan;
+    const velri_launch_batch *batch = &plan->steps[first_step].u.op.batch;
+    uint32_t count = batch->count;
     velri_device_id dev_id = plan->steps[first_step].u.op.device_id;
     velri_device_entry *de = &plan->ctx->devices[dev_id];
 
     /* Fast path: replay pre-recorded T=1 decode launch graph if captured and accepted. */
-    if (de->vt->replay_graph) {
-        const slot_captured_batch *cb = find_captured_batch(slot, first_step, count);
+    if (de->vt->replay_graph && slot->captured) {
+        const slot_captured_batch *cb = &slot->captured[batch->capture_index];
         bool is_t1 =
-            (params && params->has_seq_len) ? (params->seq_len_override == 1U) : (cb && cb->static_t1);
-        if (cb && cb->graph && is_t1) {
+            (params && params->has_seq_len) ? (params->seq_len_override == 1U) : batch->static_t1;
+        if (cb->graph && is_t1) {
             velri_completion *comp = nullptr;
             velri_status r_st = de->vt->replay_graph(de->dev, cb->graph, params, &comp);
             if (r_st != VELRI_ERR_UNSUPPORTED || comp != nullptr) {
@@ -994,25 +931,15 @@ velri_status velri_slot_run(velri_slot *slot, const velri_step_params *params,
             continue;
         }
 
-        velri_device_id dev_id = step->u.op.device_id;
-        uint32_t batch = 1U;
-        if (plan->ctx->devices[dev_id].vt->submit_batch) {
-            while (s + batch < plan->num_steps &&
-                   plan->steps[s + batch].kind == VELRI_STEP_OP &&
-                   plan->steps[s + batch].u.op.device_id == dev_id) {
-                batch++;
-            }
-        }
-
         bool accepted = false;
-        st = run_compute_batch(slot, s, batch, eff_params, &accepted);
+        st = run_compute_batch(slot, s, eff_params, &accepted);
         if (accepted) {
             any_work_accepted = true;
         }
         if (st != VELRI_OK) {
             goto finish;
         }
-        s += batch;
+        s += step->u.op.batch.count;
     }
 
     /* Download ONLY non-host OUTPUTs (STATE remains resident on its home device!). */

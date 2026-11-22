@@ -1,4 +1,4 @@
-#include "vk_internal.h"
+#include "velri_vk_abi.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -166,7 +166,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                     args.split_k = sk;
                     gz = sk;
 
-                    vk_splitk_reduce_args red = {
+                    vk_split_k_reduce_args red = {
                         .partials = (uint64_t)dev->splitk_buf->bda,
                         .bias = args.bias,
                         .x_scale = args.x_scale,
@@ -198,7 +198,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             return st;
         }
         bool has_w = (op->num_inputs > 1U && op->input_present[1]);
-        vk_rmsnorm_args args = {
+        vk_rms_norm_args args = {
             .x = ib[0],
             .w = has_w ? ib[1] : 0ULL,
             .y = ob[0],
@@ -209,7 +209,6 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .eps = op->raw.attr.rmsnorm.eps,
             .has_weight = has_w ? 1U : 0U,
             .unit_offset = op->raw.attr.rmsnorm.unit_offset ? 1U : 0U,
-            .pad = 0U,
         };
         set_dispatch_stage(&out->stages[0], pipe0, &args, sizeof(args), args.rows, 1U, 1U);
         out->num_stages = 1U;
@@ -223,7 +222,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             return st;
         }
         bool has_w = (op->num_inputs > 1U && op->input_present[1]);
-        vk_fused_add_rmsnorm_args args = {
+        vk_fused_add_rms_norm_args args = {
             .residual_inout = ob[0],
             .x = ib[0],
             .w = has_w ? ib[1] : 0ULL,
@@ -250,7 +249,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         }
         bool has_w = (op->num_inputs > 1U && op->input_present[1]);
         bool has_b = (op->num_inputs > 2U && op->input_present[2]);
-        vk_layernorm_args args = {
+        vk_layer_norm_args args = {
             .x = ib[0],
             .w = has_w ? ib[1] : 0ULL,
             .b = has_b ? ib[2] : 0ULL,
@@ -477,7 +476,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
         vk_embedding_args args = {
             .table = ib[0],
             .ids = has_ids ? ib[1] : 0ULL,
-            .out = ob[0],
+            .y = ob[0],
             .step_params = has_ids ? 0ULL : step_params_bda,
             .rows = rows,
             .dim = dim,
@@ -553,7 +552,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                 VkPipeline pipe_red =
                     velri_vk_get_pipe_locked(dev, plan.stage3_splitkv_reduce_pipe_id);
                 if (pipe_skv != VK_NULL_HANDLE && pipe_red != VK_NULL_HANDLE) {
-                    vk_splitkv_args s2 = {
+                    vk_split_kv_args s2 = {
                         .q = ib[0],
                         .k_cache = ob[1],
                         .v_cache = ob[2],
@@ -576,7 +575,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
                         .pad = 0U,
                         .scale = aa.scale,
                     };
-                    vk_splitkv_reduce_args s3 = {
+                    vk_split_kv_reduce_args s3 = {
                         .partials = (uint64_t)dev->splitk_buf->bda,
                         .out = ob[0],
                         .n_heads = nh,
@@ -605,7 +604,7 @@ static velri_status encode_item_locked(velri_backend_device *dev, const velri_su
             .q = ib[0],
             .k_cache = ob[1],
             .v_cache = ob[2],
-            .out = ob[0],
+            .y = ob[0],
             .step_params = step_params_bda,
             .rows = aa.active_t,
             .n_heads = nh,

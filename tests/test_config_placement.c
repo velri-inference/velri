@@ -257,7 +257,6 @@ static void test_example_configs_and_cascade(velri_context *ctx, velri_device_id
         velri_placement_plan plan;
         CHECK_OK(velri_placement_plan_bind(&dense_cfg, ctx, vk_dev, &plan, err, sizeof(err)),
                  "bind dense plan");
-        CHECK(velri_placement_has_distinct_prefill(&plan, 64U), "dense has distinct prefill");
 
         velri_resolved_placement r;
         /* input-layer: store=ram:0 (cpu_dev), compute=vulkan:0, prefill=vulkan:0 (inherited) */
@@ -289,17 +288,6 @@ static void test_example_configs_and_cascade(velri_context *ctx, velri_device_id
                  "resolve ple/table");
         CHECK(r.store_is_disk, "ple/table resolves to disk");
 
-        velri_graph *dg = nullptr;
-        CHECK_OK(velri_graph_create(&dg), "disk builder graph");
-        velri_builder db;
-        velri_placement_builder_adapter ad = {.plan = &moe_plan, .builder = &db, .is_prefill = false};
-        velri_b_init(&db, dg, nullptr, vk_dev, vk_dev, velri_placement_builder_cb, &ad);
-        velri_device_id sd = 0U, cd = 0U;
-        velri_placement_builder_cb("ple/table", -1, &ad, &sd, &cd);
-        CHECK(ad.err == VELRI_ERR_UNSUPPORTED && velri_b_status(&db) == VELRI_ERR_UNSUPPORTED,
-              "disk scope fails with UNSUPPORTED and propagates sticky error to builder");
-        velri_graph_destroy(dg);
-
         /* Inspect on example-moe.json must display PLE, indexer, and MoE routed-experts scopes. */
         char moe_inspect[8192];
         size_t mlen = velri_placement_format_inspect(&moe_plan, 48U, nullptr, moe_inspect,
@@ -309,6 +297,31 @@ static void test_example_configs_and_cascade(velri_context *ctx, velri_device_id
                   strstr(moe_inspect, "layers[0..31].moe.routed-experts") != nullptr &&
                   strstr(moe_inspect, "layers[32..47].moe.routed-experts") != nullptr,
               "inspect displays PLE, indexer, and MoE selector groups");
+    }
+
+    /* A storage-only resolver failure aborts the builder even without a back pointer. */
+    {
+        const char *disk_json = "{\"model\":{\"store\":\"disk\",\"compute\":\"cpu:0\"}}";
+        velri_engine_config cfg;
+        velri_engine_config_init(&cfg);
+        CHECK_OK(velri_engine_config_parse(disk_json, strlen(disk_json), &cfg, err, sizeof(err)),
+                 "parse disk store");
+        velri_placement_plan plan;
+        CHECK_OK(velri_placement_plan_bind(&cfg, ctx, cpu_dev, &plan, err, sizeof(err)),
+                 "bind disk store");
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "disk builder graph");
+        velri_builder b;
+        velri_placement_builder_adapter ad = {.plan = &plan};
+        velri_b_init_checked(&b, g, nullptr, cpu_dev, cpu_dev, velri_placement_builder_cb, &ad);
+        const size_t dims[] = {2U};
+        CHECK(velri_b_scratch(&b, VELRI_DTYPE_F32, 1U, dims).valid,
+              "compute-only scratch does not request disk storage");
+        CHECK(!velri_b_state(&b, "kv", VELRI_DTYPE_F32, 1U, dims).valid &&
+                  velri_b_status(&b) == VELRI_ERR_UNSUPPORTED && strstr(ad.err_msg, "disk"),
+              "disk state retains resolver status and diagnostic");
+        velri_graph_destroy(g);
+        velri_engine_config_destroy(&cfg);
     }
 
     /* Inspect grouping must NOT merge ram:0 vs cpu:0 or differing provenance/compute. */
@@ -358,8 +371,6 @@ static void test_example_configs_and_cascade(velri_context *ctx, velri_device_id
         velri_placement_plan plan;
         CHECK_OK(velri_placement_plan_bind(&cfg, ctx, cpu_dev, &plan, err, sizeof(err)),
                  "bind no-prefill");
-        CHECK(!velri_placement_has_distinct_prefill(&plan, 4U),
-              "omitted prefill-compute must not create distinct prefill plan");
         velri_resolved_placement r;
         CHECK_OK(velri_placement_resolve(&plan, "hidden-layers/dense-mlp", 2, &r, err, sizeof(err)),
                  "resolve l2");
@@ -462,7 +473,7 @@ static float det_val(uint64_t seed, size_t idx, float scale) {
     return (float)((u * 2.0 - 1.0) * (double)scale);
 }
 
-static void run_json_gpt2(velri_context *ctx, const velri_placement_plan *pplan, bool is_prefill,
+static bool run_json_gpt2(velri_context *ctx, const velri_placement_plan *pplan, bool is_prefill,
                           const velri_model_params *meta, const int32_t *seq, size_t seq_len,
                           float *out_logits, velri_memory_report *out_rep) {
     velri_graph *g = nullptr;
@@ -473,14 +484,11 @@ static void run_json_gpt2(velri_context *ctx, const velri_placement_plan *pplan,
     velri_builder b;
     velri_placement_builder_adapter ad = {
         .plan = pplan,
-        .builder = &b,
         .is_prefill = is_prefill,
-        .err = VELRI_OK,
     };
-    velri_b_init(&b, g, &manifest, pplan->default_store_dev, pplan->default_compute_dev,
-                 velri_placement_builder_cb, &ad);
+    velri_b_init_checked(&b, g, &manifest, pplan->default_store_dev, pplan->default_compute_dev,
+                         velri_placement_builder_cb, &ad);
     CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2 from placement plan");
-    CHECK_OK(ad.err, "placement adapter ok");
 
     velri_plan *plan = nullptr;
     CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare gpt2");
@@ -546,6 +554,7 @@ static void run_json_gpt2(velri_context *ctx, const velri_placement_plan *pplan,
     free(w_bufs);
     velri_manifest_destroy(&manifest);
     velri_graph_destroy(g);
+    return ad.distinct_compute;
 }
 
 static void test_json_driven_gpt2_hybrid(velri_context *ctx, velri_device_id cpu_dev, bool has_vk,
@@ -583,7 +592,8 @@ static void test_json_driven_gpt2_hybrid(velri_context *ctx, velri_device_id cpu
     float *cpu_logits = (float *)calloc(meta.vocab_size, sizeof(float));
     CHECK(cpu_logits != nullptr, "cpu_logits");
     velri_memory_report cpu_rep;
-    run_json_gpt2(ctx, &cpu_pplan, false, &meta, seq, 4U, cpu_logits, &cpu_rep);
+    CHECK(!run_json_gpt2(ctx, &cpu_pplan, false, &meta, seq, 4U, cpu_logits, &cpu_rep),
+          "pure CPU graph uses one compute placement");
 
     char inspect_buf[4096];
     size_t ilen = velri_placement_format_inspect(&cpu_pplan, meta.num_hidden_layers, &cpu_rep,
@@ -621,14 +631,13 @@ static void test_json_driven_gpt2_hybrid(velri_context *ctx, velri_device_id cpu
         velri_placement_plan hyb_pplan;
         CHECK_OK(velri_placement_plan_bind(&hyb_cfg, ctx, vk_dev, &hyb_pplan, err, sizeof(err)),
                  "bind hybrid pplan");
-        CHECK(velri_placement_has_distinct_prefill(&hyb_pplan, meta.num_hidden_layers),
-              "hybrid has distinct prefill");
 
         float *dec_logits = (float *)calloc(meta.vocab_size, sizeof(float));
         float *pre_logits = (float *)calloc(meta.vocab_size, sizeof(float));
         CHECK(dec_logits && pre_logits, "hyb logits");
         velri_memory_report dec_rep, pre_rep;
-        run_json_gpt2(ctx, &hyb_pplan, false, &meta, seq, 4U, dec_logits, &dec_rep);
+        CHECK(run_json_gpt2(ctx, &hyb_pplan, false, &meta, seq, 4U, dec_logits, &dec_rep),
+              "hybrid graph uses distinct dense-mlp compute placement");
         run_json_gpt2(ctx, &hyb_pplan, true, &meta, seq, 4U, pre_logits, &pre_rep);
 
         CHECK(dec_rep.ram_staging_bytes == 0U && pre_rep.ram_staging_bytes == 0U,

@@ -80,6 +80,12 @@ typedef void (*velri_placement_resolve_fn)(const char *scope_path, int32_t layer
                                            velri_device_id *out_store,
                                            velri_device_id *out_compute);
 
+/* In a checked resolver, only the requested placement outputs are non-null.
+ * A failing resolver aborts the tensor or operation being built and sets the builder error. */
+typedef velri_status (*velri_placement_resolve_checked_fn)(
+    const char *scope_path, int32_t layer_idx, void *user, velri_device_id *out_store,
+    velri_device_id *out_compute);
+
 typedef struct {
     velri_graph *graph;
     velri_manifest *manifest; /* Optional; when non-null, named weights/states/IO are recorded */
@@ -97,11 +103,15 @@ typedef struct {
     int32_t layer_stack[VELRI_BUILDER_MAX_SCOPE_DEPTH];
     uint32_t layer_depth;
     uint32_t skipped_layer_pushes;
+    velri_placement_resolve_checked_fn resolve_checked_fn;
 } velri_builder;
 
 void velri_b_init(velri_builder *b, velri_graph *graph, velri_manifest *manifest,
                   velri_device_id default_store_dev, velri_device_id default_compute_dev,
                   velri_placement_resolve_fn resolve_fn, void *resolve_user);
+void velri_b_init_checked(velri_builder *b, velri_graph *graph, velri_manifest *manifest,
+                          velri_device_id default_store_dev, velri_device_id default_compute_dev,
+                          velri_placement_resolve_checked_fn resolve_fn, void *resolve_user);
 velri_status velri_b_status(const velri_builder *b);
 void velri_b_set_error(velri_builder *b, velri_status err);
 
@@ -109,8 +119,12 @@ void velri_b_push_scope(velri_builder *b, const char *name);
 void velri_b_pop_scope(velri_builder *b);
 void velri_b_push_layer(velri_builder *b, int32_t layer_idx);
 void velri_b_pop_layer(velri_builder *b);
+/* Read the current scope's placement, returning defaults when the resolver fails. */
 void velri_b_devices(const velri_builder *b, velri_device_id *out_store,
                      velri_device_id *out_compute);
+/* Resolve placement for graph construction and retain a failure as the builder's first error. */
+velri_status velri_b_resolve_devices(velri_builder *b, velri_device_id *out_store,
+                                     velri_device_id *out_compute);
 
 /* ---- Tensor Constructors & Named Registration ---- */
 

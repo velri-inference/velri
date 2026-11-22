@@ -193,6 +193,44 @@ int velri_os_hardware_threads(void) {
     return (nproc > 0U && nproc < 65536U) ? (int)nproc : 1;
 }
 
+uint32_t velri_os_available_physical_cores(void) {
+    /* The legacy affinity mask only describes a single processor group. */
+    USHORT num_groups = 1, group = 0;
+    DWORD_PTR allowed = 0, system_mask = 0;
+    HANDLE process = GetCurrentProcess();
+    if (!GetProcessGroupAffinity(process, &num_groups, &group) || num_groups != 1 ||
+        !GetProcessAffinityMask(process, &allowed, &system_mask)) {
+        return 0U;
+    }
+    DWORD bytes = 0U;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    if (bytes == 0U) {
+        return 0U;
+    }
+    unsigned char *buf = (unsigned char *)malloc(bytes);
+    if (!buf) {
+        return 0U;
+    }
+    uint32_t count = 0U;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore,
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf, &bytes)) {
+        for (DWORD offset = 0U; offset < bytes;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *entry =
+                (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + offset);
+            for (WORD i = 0; i < entry->Processor.GroupCount; ++i) {
+                const GROUP_AFFINITY *mask = &entry->Processor.GroupMask[i];
+                if (mask->Group == group && (mask->Mask & allowed) != 0) {
+                    ++count;
+                    break;
+                }
+            }
+            offset += entry->Size;
+        }
+    }
+    free(buf);
+    return count;
+}
+
 void velri_os_cpu_relax(void) { YieldProcessor(); }
 
 size_t velri_os_ctz64(uint64_t x) {

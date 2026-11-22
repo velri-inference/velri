@@ -20,6 +20,8 @@ Everything invariant stays out of the token-generation loop:
 | Compute full memory budget and reserve buffers/slots | Wait for completion (`wait`) and return outputs |
 | Pack immutable weights once and build GPU pipelines / descriptors | `0 B` heap allocations, no JSON parsing or string lookup |
 
+The plan records the length of each same-device submission and its capture index. A transfer ends the batch. Slot creation and execution use the recorded boundaries, including single-operation submissions for backends without batch support.
+
 If raw weights are no longer needed after packing, their buffer is released explicitly. Whenever both representations are alive simultaneously, both count toward the memory budget.
 
 ### Memory budgets and UMA

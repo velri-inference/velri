@@ -5,8 +5,7 @@
  * Canonical Velri Placement Scope Keys & Paths (Single Source of Truth).
  *
  * Shared across config parsing (`placement.c`), cascading resolution (`placement_resolve.c`),
- * inspect formatting (`placement_inspect.c`), model layer builders (`src/model/layers.c`),
- * and the architecture registry (`src/model/arch_registry.c`).
+ * inspect formatting (`placement_inspect.c`) and model layer builders (`src/model/layers.c`).
  */
 
 #define VELRI_SCOPE_ROOT            ""

@@ -140,7 +140,8 @@ static bool probe_phys_device(const vk_inst_loader *L, VkPhysicalDevice phys, ui
         .pNext = &f12,
     };
     L->vkGetPhysicalDeviceFeatures2(phys, &f2);
-    if (!f12.bufferDeviceAddress || !f12.vulkanMemoryModel ||
+    /* All production shaders use 64-bit device-address arithmetic. */
+    if (!f2.features.shaderInt64 || !f12.bufferDeviceAddress || !f12.vulkanMemoryModel ||
         !f12.vulkanMemoryModelDeviceScope || !f12.scalarBlockLayout) {
         return false;
     }
@@ -482,6 +483,7 @@ static velri_status create_logical_device(velri_backend_device *dev,
         .pNext = &en11,
         .features = {
             .shaderInt16 = feats->shader_int16,
+            .shaderInt64 = VK_TRUE,
         },
     };
 

@@ -94,7 +94,9 @@ Device indices bind at runtime and are reported by `inspect`. Legacy `cuda:N` / 
    - deepest matching node inside a matching layer selector (e.g., `hidden-layers → "32-47" → moe → routed-experts`);
    - deepest matching node directly under `hidden-layers`;
    - defaults at the `model` root.
-4. **Validation:** overlapping layer selectors and unknown keys are errors; known components absent from a given model are marked inapplicable in `inspect`; out-of-range layer indices follow strictness rules.
+4. Overlapping layer selectors and unknown keys are errors. Strict mode rejects out-of-range indices. In permissive mode, `inspect` flags them. The placement report includes configured component rules even when the architecture does not use those components.
+
+During graph construction, the builder resolves placement for each storage and compute request. A separate prefill plan is prepared when the context supports multiple tokens and a compute device used by the graph differs between phases. In GPT-2 and Llama, the `kv-cache` scope places persistent state. Attention reads and writes this state on the device selected by the surrounding `attention` scope.
 
 ### Backend settings (`backends.<name>`)
 Backend-specific options sit at the top level under `backends.<name>`, do not inherit through the model tree, and are validated once by the owning backend module inside `velri-lib` when creating the context.
@@ -128,8 +130,8 @@ Backend-specific options sit at the top level under `backends.<name>`, do not in
 }
 ```
 
-- `cpu.threads: 0` chooses worker count from physical cores available to the process minus `reserve-cores` (logical SMT threads are not counted as physical cores).
-- `cpu.affinity`: `"auto"` (pin when possible, report fallback reason), `"none"` (disable pinning), or `"required"` (fail if pinning cannot be satisfied).
+- Apply `backends.cpu` when creating the context with `velri_ctx_create_from_json`. A fixed positive `threads` sets the pool size directly. The automatic mode (`threads: 0` or omitted) subtracts `reserve-cores` (default 1) from the accessible physical core count and clamps the result to 1–256 workers. Linux uses the calling thread’s affinity mask and SMT topology. Windows supports a single process affinity group. If the topology is unavailable, the engine uses one worker.
+- The current pool runs unpinned. `affinity: "auto"` uses this fallback, `"none"` requests it explicitly, and `"required"` returns an unsupported-configuration error. Program inspection reports the effective worker count and pinning policy alongside the JSON settings.
 - Full dense and MoE target-schema examples: [examples/example-dense.json](../../examples/example-dense.json) and [examples/example-moe.json](../../examples/example-moe.json).
 
 ### Separating parsing from capability checks

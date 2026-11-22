@@ -1,7 +1,6 @@
 #include "runtime/runtime_internal.h"
 
 #include <math.h>
-#include <string.h>
 
 /* ---- Public-to-VelriLib Enum Mapping (switch retains -Wswitch exhaustiveness checks) ---- */
 
@@ -48,27 +47,6 @@ static bool map_rope_to_vl(velri_rotary_mode m, velri_rope_mode *out) {
     default:
         return false;
     }
-}
-
-/* ---- Internal Weight Lookup ---- */
-
-const velri_rt_weight_entry *velri_rt_model_find_weight(const velri_model *model,
-                                                        const char *name) {
-    for (uint32_t i = 0U; i < model->num_weights; ++i) {
-        if (strcmp(model->weights[i].name, name) == 0) {
-            return &model->weights[i];
-        }
-    }
-    return nullptr;
-}
-
-static velri_rt_weight_entry *model_find_weight_mut(velri_model *model, const char *name) {
-    for (uint32_t i = 0U; i < model->num_weights; ++i) {
-        if (strcmp(model->weights[i].name, name) == 0) {
-            return &model->weights[i];
-        }
-    }
-    return nullptr;
 }
 
 /* ---- Model Lifecycle & Weight Registry API ---- */
@@ -174,6 +152,7 @@ velri_rc velri_model_create_synthetic(velri_ctx *ctx, const velri_model_desc *de
     m->vl_act = vl_act;
     m->vl_rope = vl_rope;
     atomic_init(&m->live_programs, 0U);
+    atomic_init(&m->num_weights, 0U);
     *out_model = m;
     return VELRI_RC_OK;
 
@@ -186,11 +165,8 @@ velri_rc velri_model_destroy(velri_model *model) {
     if (!model) {
         return VELRI_RC_OK;
     }
-    if (!velri_rt_try_mark_destroying(&model->live_programs)) {
-        uint32_t lp = atomic_load_explicit(&model->live_programs, memory_order_acquire) &
-                      ~VELRI_DESTROYING_BIT;
-        velri_rt_ctx_set_error(model->ctx,
-                               "model_destroy: cannot destroy model with %u live program(s)", lp);
+    if (!velri_rt_try_acquire_exclusive(&model->live_programs)) {
+        velri_rt_ctx_set_error(model->ctx, "model_destroy: model has active programs or a weight binding");
         return VELRI_RC_ERR_BUSY;
     }
     velri_ctx *ctx = model->ctx;
@@ -198,63 +174,6 @@ velri_rc velri_model_destroy(velri_model *model) {
     free(model);
     velri_rt_release_child(&ctx->live_children);
     return VELRI_RC_OK;
-}
-
-velri_rc velri_model_bind_weight(velri_model *model, const char *name, const void *host_data,
-                                 size_t byte_size) {
-    if (!model) {
-        return VELRI_RC_ERR_INVALID;
-    }
-    if (atomic_load_explicit(&model->live_programs, memory_order_acquire) != 0U) {
-        velri_rt_ctx_set_error(model->ctx,
-                               "model_bind_weight: model is immutable while programs are alive");
-        return VELRI_RC_ERR_BUSY;
-    }
-    if (!name || name[0] == '\0' || !host_data || byte_size == 0U) {
-        velri_rt_ctx_set_error(model->ctx,
-                               "model_bind_weight: invalid weight name, pointer, or size");
-        return VELRI_RC_ERR_INVALID;
-    }
-    size_t nlen = strlen(name);
-    if (nlen >= VELRI_MANIFEST_NAME_MAX) {
-        velri_rt_ctx_set_error(model->ctx, "model_bind_weight: weight name exceeds %u bytes",
-                               (unsigned)(VELRI_MANIFEST_NAME_MAX - 1U));
-        return VELRI_RC_ERR_OVERFLOW;
-    }
-
-    velri_rt_weight_entry *existing = model_find_weight_mut(model, name);
-    if (existing) {
-        existing->host_ptr = host_data;
-        existing->byte_size = byte_size;
-        return VELRI_RC_OK;
-    }
-
-    if (model->num_weights == model->cap_weights) {
-        uint32_t new_cap = model->cap_weights ? (model->cap_weights * 2U) : 64U;
-        size_t new_cap_sz = new_cap;
-        if (new_cap <= model->cap_weights || new_cap_sz > SIZE_MAX / sizeof(velri_rt_weight_entry)) {
-            velri_rt_ctx_set_error(model->ctx, "model_bind_weight: weight table overflow");
-            return VELRI_RC_ERR_OVERFLOW;
-        }
-        velri_rt_weight_entry *nb = (velri_rt_weight_entry *)realloc(
-            model->weights, new_cap_sz * sizeof(velri_rt_weight_entry));
-        if (!nb) {
-            velri_rt_ctx_set_error(model->ctx, "model_bind_weight: out of memory");
-            return VELRI_RC_ERR_NOMEM;
-        }
-        model->weights = nb;
-        model->cap_weights = new_cap;
-    }
-
-    velri_rt_weight_entry *e = &model->weights[model->num_weights++];
-    memcpy(e->name, name, nlen + 1U);
-    e->host_ptr = host_data;
-    e->byte_size = byte_size;
-    return VELRI_RC_OK;
-}
-
-uint32_t velri_model_weight_count(const velri_model *model) {
-    return model ? model->num_weights : 0U;
 }
 
 velri_rc velri_model_get_desc(const velri_model *model, velri_model_desc *out_desc) {

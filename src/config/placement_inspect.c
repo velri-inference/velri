@@ -1,24 +1,10 @@
 #include "config/placement_internal.h"
+#include "format/inspect.h"
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #define ARRAY_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
-
-void velri_cfg_sb_appendf(velri_cfg_str_buf *sb, const char *fmt, ...) {
-    if (!sb || !sb->buf || sb->cap == 0U || sb->pos >= sb->cap) {
-        return;
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(sb->buf + sb->pos, sb->cap - sb->pos, fmt, ap);
-    va_end(ap);
-    if (n > 0) {
-        size_t avail = sb->cap - 1U - sb->pos;
-        sb->pos += ((size_t)n < avail) ? (size_t)n : avail;
-    }
-}
 
 static bool spec_eq(const velri_device_spec *a, const velri_device_spec *b) {
     return a->kind == b->kind && a->local_index == b->local_index &&
@@ -45,7 +31,7 @@ static bool config_has_scope_rule(const velri_engine_config *cfg, const char *sc
     return false;
 }
 
-static void format_resolved_line(velri_cfg_str_buf *sb, const char *label,
+static void format_resolved_line(velri_text_writer *sb, const char *label,
                                  const velri_resolved_placement *r) {
     char s_buf[48];
     char c_buf[48];
@@ -53,34 +39,39 @@ static void format_resolved_line(velri_cfg_str_buf *sb, const char *label,
     velri_device_spec_format(&r->store_spec, s_buf, sizeof(s_buf));
     velri_device_spec_format(&r->compute_spec, c_buf, sizeof(c_buf));
     velri_device_spec_format(&r->prefill_spec, p_buf, sizeof(p_buf));
-    velri_cfg_sb_appendf(sb,
+    velri_text_appendf(sb,
                          "  %-32s store=%-10s (%s) | compute=%-10s (%s) | prefill=%-10s (%s)\n",
                          label, s_buf, r->store_source, c_buf, r->compute_source, p_buf,
                          r->prefill_source);
 }
 
-static void format_devices_and_backends(velri_cfg_str_buf *sb, const velri_placement_plan *plan,
+static void format_devices_and_backends(velri_text_writer *sb, const velri_placement_plan *plan,
                                         uint32_t num_hidden_layers) {
-    velri_cfg_sb_appendf(sb, "=== Velri Placement & Context Inspect ===\n");
+    velri_text_appendf(sb, "=== Velri Placement & Context Inspect ===\n");
     if (plan->cfg->model_path[0] != '\0') {
-        velri_cfg_sb_appendf(sb, "Model path: %s\n", plan->cfg->model_path);
+        velri_text_appendf(sb, "Model path: %s\n", plan->cfg->model_path);
     }
 
     uint32_t n_dev = velri_context_device_count(plan->ctx);
-    velri_cfg_sb_appendf(sb, "Devices (%u):\n", n_dev);
+    velri_text_appendf(sb, "Devices (%u):\n", n_dev);
     for (uint32_t d = 0U; d < n_dev; ++d) {
         velri_device_caps caps;
         if (velri_context_device_caps(plan->ctx, d, &caps) == VELRI_OK) {
-            velri_cfg_sb_appendf(sb, "  [%u] %s:%u - %s (host=%s, uma=%s)\n", d, caps.backend_name,
+            velri_text_appendf(sb, "  [%u] %s:%u - %s (host=%s, uma=%s)\n", d, caps.backend_name,
                                  caps.local_index, caps.device_name,
                                  caps.is_host_memory ? "yes" : "no", caps.is_uma ? "yes" : "no");
+            if (caps.cpu_workers > 0U) {
+                velri_text_appendf(sb, "  CPU pool: threads=%u, affinity=none "
+                                     "(worker pinning unavailable)\n", caps.cpu_workers);
+            }
         }
     }
 
     const char *aff_str = velri_cfg_enum_name(velri_cfg_affinity_table, velri_cfg_affinity_table_len,
                                               (int)plan->cfg->cpu_backend.affinity, "auto");
-    velri_cfg_sb_appendf(
-        sb, "Backends: cpu(threads=%u, reserve=%u, affinity=%s), vulkan(prefill_chunk=%u)\n",
+    velri_text_appendf(
+        sb, "Program JSON (with defaults): cpu(threads=%u, reserve=%u, affinity=%s), "
+            "vulkan(prefill_chunk=%u)\n",
         plan->cfg->cpu_backend.threads, plan->cfg->cpu_backend.reserve_cores, aff_str,
         plan->cfg->vulkan_backend.prefill_chunk_size);
 
@@ -89,7 +80,7 @@ static void format_devices_and_backends(velri_cfg_str_buf *sb, const velri_place
             const velri_layer_selector *sel = &plan->cfg->selectors[s];
             for (uint32_t r = 0U; r < sel->num_ranges; ++r) {
                 if (sel->ranges[r].end >= num_hidden_layers) {
-                    velri_cfg_sb_appendf(
+                    velri_text_appendf(
                         sb, "  [note] layer selector '%s' exceeds %u model layers\n", sel->raw_key,
                         num_hidden_layers);
                     break;
@@ -105,7 +96,7 @@ typedef struct {
     bool optional;
 } root_display_entry;
 
-static void format_resolved_scopes(velri_cfg_str_buf *sb, const velri_placement_plan *plan,
+static void format_resolved_scopes(velri_text_writer *sb, const velri_placement_plan *plan,
                                    uint32_t num_hidden_layers) {
     static const root_display_entry k_root_disp[] = {
         {VELRI_SCOPE_INPUT_LAYER, "input-layer", false},
@@ -114,7 +105,7 @@ static void format_resolved_scopes(velri_cfg_str_buf *sb, const velri_placement_
         {VELRI_SCOPE_PLE_TABLE, "ple.table", true},
     };
 
-    velri_cfg_sb_appendf(sb, "Resolved Placement:\n");
+    velri_text_appendf(sb, "Resolved Placement:\n");
     velri_resolved_placement res;
     for (size_t i = 0U; i < ARRAY_COUNT(k_root_disp); ++i) {
         if ((!k_root_disp[i].optional || config_has_scope_rule(plan->cfg, k_root_disp[i].scope)) &&
@@ -164,39 +155,17 @@ static void format_resolved_scopes(velri_cfg_str_buf *sb, const velri_placement_
     }
 }
 
-static void format_memory_plan(velri_cfg_str_buf *sb, const velri_context *ctx,
+static void format_memory_plan(velri_text_writer *sb, const velri_context *ctx,
                                const velri_memory_report *mem_report) {
-    velri_cfg_sb_appendf(sb, "Memory Plan: total=%zu B | ram_staging=%zu B | ram_transfers=%u\n",
-                         mem_report->total_physical_bytes, mem_report->ram_staging_bytes,
-                         mem_report->num_ram_transfers);
+    velri_inspect_memory_summary(sb, mem_report->total_physical_bytes, mem_report->ram_staging_bytes,
+                                 mem_report->num_ram_transfers);
     uint32_t nd = (mem_report->num_devices <= VELRI_MAX_REPORT_DEVICES)
                       ? mem_report->num_devices
                       : (uint32_t)VELRI_MAX_REPORT_DEVICES;
     for (uint32_t d = 0U; d < nd; ++d) {
-        const velri_device_memory_report *dr = &mem_report->devices[d];
-        velri_device_caps caps;
-        bool ok = (velri_context_device_caps(ctx, dr->device_id, &caps) == VELRI_OK);
-        velri_cfg_sb_appendf(sb,
-                             "  %s:%u | weights=%zu B | state=%zu B | io=%zu B | scratch=%zu B "
-                             "(unpacked=%zu B) | ovh=%zu B\n",
-                             ok ? caps.backend_name : "dev", ok ? caps.local_index : dr->device_id,
-                             dr->weight_bytes, dr->state_bytes, dr->input_output_bytes,
-                             dr->scratch_packed_bytes, dr->scratch_unpacked_bytes,
-                             dr->allocator_overhead_bytes);
+        velri_program_device_mem row = velri_device_memory_from_plan(&mem_report->devices[d]);
+        velri_inspect_memory_device(sb, ctx, &row);
     }
-}
-
-size_t velri_placement_format_inspect_placement(const velri_placement_plan *plan,
-                                                uint32_t num_hidden_layers, char *out_buf,
-                                                size_t out_cap) {
-    if (!plan || !plan->cfg || !plan->ctx || !out_buf || out_cap == 0U) {
-        return 0U;
-    }
-    out_buf[0] = '\0';
-    velri_cfg_str_buf sb = {.buf = out_buf, .cap = out_cap, .pos = 0U};
-    format_devices_and_backends(&sb, plan, num_hidden_layers);
-    format_resolved_scopes(&sb, plan, num_hidden_layers);
-    return sb.pos;
 }
 
 size_t velri_placement_format_inspect(const velri_placement_plan *plan, uint32_t num_hidden_layers,
@@ -206,7 +175,7 @@ size_t velri_placement_format_inspect(const velri_placement_plan *plan, uint32_t
         return 0U;
     }
     out_buf[0] = '\0';
-    velri_cfg_str_buf sb = {.buf = out_buf, .cap = out_cap, .pos = 0U};
+    velri_text_writer sb = {.buf = out_buf, .cap = out_cap, .pos = 0U};
     format_devices_and_backends(&sb, plan, num_hidden_layers);
     format_resolved_scopes(&sb, plan, num_hidden_layers);
     if (mem_report) {

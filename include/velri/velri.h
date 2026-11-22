@@ -25,7 +25,9 @@ extern "C" {
  *     `velri_ctx_destroy` must be serialized against all operations on `ctx`.
  *   - `velri_model`: immutable once a `velri_program` is prepared from it; safe to share across
  *     multiple programs and threads. `velri_model_bind_weight` is rejected with `VELRI_RC_ERR_BUSY`
- *     while any dependent `velri_program` is alive.
+ *     while any dependent `velri_program` is alive. Binding a weight also takes exclusive access.
+ *     A competing bind or prepare may return `VELRI_RC_ERR_BUSY`. Serialize destruction with
+ *     all other operations on the same model.
  *   - `velri_program`: immutable after `velri_program_prepare`; safe to share across multiple
  *     concurrent `velri_session`s.
  *   - `velri_session`: at most one call (`step` / `reset`) may run concurrently on a given
@@ -71,7 +73,7 @@ bool velri_cancel_triggered(const velri_cancel *cancel);
 /* ---- Context (Devices, Shared CPU Pool, Diagnostics) ---- */
 
 typedef struct {
-    uint32_t cpu_threads; /* 0 => automatic hardware worker count */
+    uint32_t cpu_threads; /* 0 => automatic physical-core selection or the JSON setting */
     bool enable_vulkan;   /* Opt-in Vulkan backend when compiled into VelriLib */
 } velri_ctx_options;
 
@@ -83,10 +85,17 @@ typedef struct {
     bool is_host_memory;
     bool is_uma;
     uint64_t total_memory_bytes; /* 0 when unknown */
+    uint32_t cpu_workers;        /* Pool size including the caller; 0 for other devices */
 } velri_device_info;
 
 /* `opts` may be nullptr for defaults (auto CPU threads, Vulkan disabled). */
 velri_rc velri_ctx_create(const velri_ctx_options *opts, velri_ctx **out_ctx);
+
+/* Apply backends.cpu before opening the shared pool. Accepts a full engine config or a
+ * backend-only object. Nonzero opts->cpu_threads and explicitly specified JSON threads
+ * must agree. JSON is borrowed for the call; err_msg is an optional diagnostic buffer. */
+velri_rc velri_ctx_create_from_json(const velri_ctx_options *opts, const char *json, size_t json_len,
+                                    velri_ctx **out_ctx, char *err_msg, size_t err_cap);
 
 /* Fails with `VELRI_RC_ERR_BUSY` (leaving `ctx` alive) if any Model or Program still depends on it. */
 velri_rc velri_ctx_destroy(velri_ctx *ctx);
@@ -203,7 +212,7 @@ typedef struct {
 
 typedef struct {
     float temperature; /* 0.0f => deterministic greedy argmax; > 0.0f => stochastic sampling */
-    float top_p;       /* (0, 1]; 0.0f or 1.0f => disabled */
+    float top_p;       /* [0, 1]; 0.0f or 1.0f => disabled */
     uint32_t top_k;    /* 0 => disabled */
     float min_p;       /* [0, 1]; 0.0f => disabled */
     uint64_t seed;     /* Applied only when `reseed == true` (otherwise advances session PRNG) */

@@ -1,4 +1,5 @@
 #include "runtime/sampler.h"
+#include "config/sampling_limits.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -111,13 +112,13 @@ velri_rc velri_sampler_validate_params(const velri_sampling_params *params) {
     if (!params) {
         return VELRI_RC_ERR_INVALID;
     }
-    if (!isfinite(params->temperature) || params->temperature < 0.0f) {
+    if (!velri_sampling_valid_temperature(params->temperature)) {
         return VELRI_RC_ERR_INVALID;
     }
-    if (!isfinite(params->top_p) || params->top_p < 0.0f || params->top_p > 1.0f) {
+    if (!velri_sampling_valid_top_p(params->top_p)) {
         return VELRI_RC_ERR_INVALID;
     }
-    if (!isfinite(params->min_p) || params->min_p < 0.0f || params->min_p > 1.0f) {
+    if (!velri_sampling_valid_probability(params->min_p)) {
         return VELRI_RC_ERR_INVALID;
     }
     return VELRI_RC_OK;

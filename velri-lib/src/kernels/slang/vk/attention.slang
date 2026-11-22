@@ -94,26 +94,15 @@ groupshared float s_m[8];
 groupshared float s_l[8];
 
 // Fast partition-parallel path for d_k <= 256 && d_v <= 256 (0 barriers per key on Wave32).
-void attention_online_impl<let P : uint, TIter : IKeyIter>(
-    AttentionArgs a, uint q_row, uint h, uint tid, TIter iter)
+// Split-KV stores [max, sum of weights, unnormalized values] for the reduction shader.
+void attention_partition<let P : uint, let Partial : bool, TIter : IKeyIter>(
+    Ptr<float, Access.Read> q_ptr, Ptr<float, Access.Read> k_head, Ptr<float, Access.Read> v_head,
+    uint d_k, uint d_v, uint k_row_stride, uint v_row_stride, float scale,
+    Ptr<float> output, uint tid, TIter iter)
 {
-    if (q_row >= a.rows || h >= a.n_heads) return;
-
     static const uint kWgSize = P << 5u;
-
     uint kv_len = iter.count();
-    Ptr<float> o_ptr =
-        a.y + uint64_t(q_row) * uint64_t(a.o_stride) + uint64_t(h) * uint64_t(a.d_v);
-    if (kv_len == 0u) {
-        for (uint d = tid; d < a.d_v; d += kWgSize) {
-            o_ptr[d] = 0.0f;
-        }
-        return;
-    }
-
-    Ptr<float, Access.Read> q_ptr =
-        a.q + uint64_t(q_row) * uint64_t(a.q_stride) + uint64_t(h) * uint64_t(a.d_k);
-    for (uint d = tid; d < a.d_k; d += kWgSize) {
+    for (uint d = tid; d < d_k; d += kWgSize) {
         s_q[d] = q_ptr[d];
     }
     GroupMemoryBarrierWithGroupSync();
@@ -125,16 +114,12 @@ void attention_online_impl<let P : uint, TIter : IKeyIter>(
     float acc[8];
     [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
         uint d = lane + (j << 5u);
-        q_reg[j] = (d < a.d_k) ? s_q[d] : 0.0f;
+        q_reg[j] = (d < d_k) ? s_q[d] : 0.0f;
         acc[j] = 0.0f;
     }
 
-    uint group_size = a.n_heads / a.n_kv_heads;
-    uint kvh = h / group_size;
-    Ptr<float, Access.Read> k_head = a.k_cache + uint64_t(kvh) * uint64_t(a.k_head_stride);
-    Ptr<float, Access.Read> v_head = a.v_cache + uint64_t(kvh) * uint64_t(a.v_head_stride);
-    uint64_t krs64 = uint64_t(a.k_row_stride);
-    uint64_t vrs64 = uint64_t(a.v_row_stride);
+    uint64_t krs64 = uint64_t(k_row_stride);
+    uint64_t vrs64 = uint64_t(v_row_stride);
 
     float m_p = kNegInfSentinel;
     float l_p = 0.0f;
@@ -149,16 +134,16 @@ void attention_online_impl<let P : uint, TIter : IKeyIter>(
         if (valid) {
             Ptr<float, Access.Read> k_row = k_head + uint64_t(k_idx) * krs64;
             [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
-                if ((j << 5u) < a.d_k) {
+                if ((j << 5u) < d_k) {
                     uint d = lane + (j << 5u);
-                    if (d < a.d_k) {
+                    if (d < d_k) {
                         partial_dot = fma(q_reg[j], k_row[d], partial_dot);
                     }
                 }
             }
         }
 
-        float score = part32_reduce_sum(partial_dot, tid, part, lane) * a.scale;
+        float score = part32_reduce_sum(partial_dot, tid, part, lane) * scale;
 
         if (valid) {
             float alpha = 1.0f;
@@ -178,9 +163,9 @@ void attention_online_impl<let P : uint, TIter : IKeyIter>(
 
             Ptr<float, Access.Read> v_row = v_head + uint64_t(k_idx) * vrs64;
             [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
-                if ((j << 5u) < a.d_v) {
+                if ((j << 5u) < d_v) {
                     uint d = lane + (j << 5u);
-                    if (d < a.d_v) {
+                    if (d < d_v) {
                         acc[j] = fma(acc[j], alpha, p_w * v_row[d]);
                     }
                 }
@@ -208,18 +193,39 @@ void attention_online_impl<let P : uint, TIter : IKeyIter>(
         }
     }
 
+    if (Partial && tid == 0u) {
+        output[0] = m_all;
+        output[1] = l_all;
+    }
     float w_p = (l_p > 0.0f) ? exp(m_p - m_all) : 0.0f;
     float inv_l = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;
 
     [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
-        if ((j << 5u) < a.d_v) {
+        if ((j << 5u) < d_v) {
             uint d = lane + (j << 5u);
-            float sum = part32_cross_sum<P>((d < a.d_v) ? (acc[j] * w_p) : 0.0f, tid, part, lane);
-            if (part == 0u && d < a.d_v) {
-                o_ptr[d] = sum * inv_l;
+            float sum = part32_cross_sum<P>((d < d_v) ? (acc[j] * w_p) : 0.0f, tid, part, lane);
+            if (part == 0u && d < d_v) {
+                if (Partial) output[2u + d] = sum;
+                else output[d] = sum * inv_l;
             }
         }
     }
+}
+
+void attention_online_impl<let P : uint, TIter : IKeyIter>(
+    AttentionArgs a, uint q_row, uint h, uint tid, TIter iter)
+{
+    if (q_row >= a.rows || h >= a.n_heads) return;
+    Ptr<float> output = a.y + uint64_t(q_row) * a.o_stride + uint64_t(h) * a.d_v;
+    if (iter.count() == 0u) {
+        for (uint d = tid; d < a.d_v; d += P << 5u) output[d] = 0.0f;
+        return;
+    }
+    uint kvh = h / (a.n_heads / a.n_kv_heads);
+    attention_partition<P, false, TIter>(
+        a.q + uint64_t(q_row) * a.q_stride + uint64_t(h) * a.d_k,
+        a.k_cache + uint64_t(kvh) * a.k_head_stride, a.v_cache + uint64_t(kvh) * a.v_head_stride,
+        a.d_k, a.d_v, a.k_row_stride, a.v_row_stride, a.scale, output, tid, iter);
 }
 
 // Wide path for d_k > 256 || d_v > 256 (up to 2048): 4-key tiled online softmax, 0 spills.
@@ -398,9 +404,6 @@ void vk_attention_splitkv_f32(uniform SplitKvArgs a, uint3 gtid : SV_GroupThread
     uint tid = gtid.x;
     if (h >= a.n_heads || sp >= a.n_splits) return;
 
-    static const uint kP = 4u;
-    static const uint kWgSize = kP << 5u;
-
     uint eff_kv_pos = (a.step_params != nullptr) ? a.step_params[2] : a.kv_pos;
     DenseRangeIter full = make_dense_range_iter(eff_kv_pos, 0u, 1u, a.max_ctx, a.sliding_window, a.causal);
     uint total_kv = full.count();
@@ -418,122 +421,14 @@ void vk_attention_splitkv_f32(uniform SplitKvArgs a, uint3 gtid : SV_GroupThread
         }
         return;
     }
-
     DenseRangeIter iter;
     iter.start = full.start + sp_start;
     iter.len = sp_len;
-
-    Ptr<float, Access.Read> q_ptr = a.q + uint64_t(h) * uint64_t(a.d_k);
-    for (uint d = tid; d < a.d_k; d += kWgSize) {
-        s_q[d] = q_ptr[d];
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    uint part = tid >> 5u;
-    uint lane = tid & 31u;
-
-    float q_reg[8];
-    float acc[8];
-    [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
-        uint d = lane + (j << 5u);
-        q_reg[j] = (d < a.d_k) ? s_q[d] : 0.0f;
-        acc[j] = 0.0f;
-    }
-
-    uint group_size = a.n_heads / a.n_kv_heads;
-    uint kvh = h / group_size;
-    Ptr<float, Access.Read> k_head = a.k_cache + uint64_t(kvh) * uint64_t(a.k_head_stride);
-    Ptr<float, Access.Read> v_head = a.v_cache + uint64_t(kvh) * uint64_t(a.v_head_stride);
-    uint64_t krs64 = uint64_t(a.k_row_stride);
-    uint64_t vrs64 = uint64_t(a.v_row_stride);
-
-    float m_p = kNegInfSentinel;
-    float l_p = 0.0f;
-    uint n_iters = (sp_len - 1u) / kP + 1u;
-
-    for (uint it = 0u; it < n_iters; ++it) {
-        uint64_t k_rel = uint64_t(it) * uint64_t(kP) + uint64_t(part);
-        bool valid = (k_rel < uint64_t(sp_len));
-        uint k_idx = valid ? iter.key_index(uint(k_rel)) : 0u;
-
-        float partial_dot = 0.0f;
-        if (valid) {
-            Ptr<float, Access.Read> k_row = k_head + uint64_t(k_idx) * krs64;
-            [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
-                if ((j << 5u) < a.d_k) {
-                    uint d = lane + (j << 5u);
-                    if (d < a.d_k) {
-                        partial_dot = fma(q_reg[j], k_row[d], partial_dot);
-                    }
-                }
-            }
-        }
-
-        float score = part32_reduce_sum(partial_dot, tid, part, lane) * a.scale;
-
-        if (valid) {
-            float alpha = 1.0f;
-            float p_w = 1.0f;
-            if (l_p == 0.0f) {
-                alpha = 0.0f;
-                m_p = score;
-                l_p = 1.0f;
-            } else if (score > m_p) {
-                alpha = exp(m_p - score);
-                l_p = l_p * alpha + 1.0f;
-                m_p = score;
-            } else {
-                p_w = exp(score - m_p);
-                l_p += p_w;
-            }
-
-            Ptr<float, Access.Read> v_row = v_head + uint64_t(k_idx) * vrs64;
-            [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
-                if ((j << 5u) < a.d_v) {
-                    uint d = lane + (j << 5u);
-                    if (d < a.d_v) {
-                        acc[j] = fma(acc[j], alpha, p_w * v_row[d]);
-                    }
-                }
-            }
-        }
-    }
-
-    if (lane == 0u) {
-        s_m[part] = m_p;
-        s_l[part] = l_p;
-    }
-    GroupMemoryBarrierWithGroupSync();
-
-    float m_all = s_m[0];
-    [ForceUnroll] for (uint p = 1u; p < kP; ++p) {
-        if (s_l[p] > 0.0f) {
-            m_all = max(m_all, s_m[p]);
-        }
-    }
-
-    float l_all = 0.0f;
-    [ForceUnroll] for (uint p = 0u; p < kP; ++p) {
-        if (s_l[p] > 0.0f) {
-            l_all += s_l[p] * exp(s_m[p] - m_all);
-        }
-    }
-
-    if (tid == 0u) {
-        slot_ptr[0] = m_all;
-        slot_ptr[1] = l_all;
-    }
-
-    float w_p = (l_p > 0.0f) ? exp(m_p - m_all) : 0.0f;
-    [ForceUnroll] for (uint j = 0u; j < 8u; ++j) {
-        if ((j << 5u) < a.d_v) {
-            uint d = lane + (j << 5u);
-            float sum = part32_cross_sum<kP>((d < a.d_v) ? (acc[j] * w_p) : 0.0f, tid, part, lane);
-            if (part == 0u && d < a.d_v) {
-                slot_ptr[2u + d] = sum;
-            }
-        }
-    }
+    uint kvh = h / (a.n_heads / a.n_kv_heads);
+    attention_partition<4u, true, DenseRangeIter>(
+        a.q + uint64_t(h) * a.d_k,
+        a.k_cache + uint64_t(kvh) * a.k_head_stride, a.v_cache + uint64_t(kvh) * a.v_head_stride,
+        a.d_k, a.d_v, a.k_row_stride, a.v_row_stride, a.scale, slot_ptr, tid, iter);
 }
 
 struct SplitKvReduceArgs {

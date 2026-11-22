@@ -66,55 +66,6 @@ static const velri_manifest_entry *manifest_find_entry(const velri_manifest_entr
     return nullptr;
 }
 
-static velri_status manifest_append_entry(velri_manifest_entry **entries, uint32_t *count,
-                                          uint32_t *cap, const char *name,
-                                          const char *source_name, const velri_tensor *t) {
-    if (!entries || !count || !cap || !name || name[0] == '\0' || !t || !t->valid ||
-        t->rank == 0U || t->rank > VELRI_MAX_RANK) {
-        return VELRI_ERR_INVALID;
-    }
-    size_t nlen = strlen(name);
-    if (nlen >= VELRI_MANIFEST_NAME_MAX) {
-        return VELRI_ERR_OVERFLOW;
-    }
-    size_t slen = 0U;
-    if (source_name && source_name[0] != '\0') {
-        slen = strlen(source_name);
-        if (slen >= VELRI_MANIFEST_NAME_MAX) {
-            return VELRI_ERR_OVERFLOW;
-        }
-    }
-    if (manifest_find_entry(*entries, *count, name) != nullptr) {
-        return VELRI_ERR_INVALID;
-    }
-    if (*count == UINT32_MAX) {
-        return VELRI_ERR_OVERFLOW;
-    }
-
-    void *new_ptr = nullptr;
-    if (!velri_vec_ensure(*entries, &new_ptr, cap, *count, 1U, sizeof(velri_manifest_entry))) {
-        return VELRI_ERR_NOMEM;
-    }
-    *entries = (velri_manifest_entry *)new_ptr;
-
-    velri_manifest_entry *e = &(*entries)[*count];
-    memset(e, 0, sizeof(*e));
-    memcpy(e->name, name, nlen + 1U);
-    if (slen > 0U) {
-        memcpy(e->source_name, source_name, slen + 1U);
-    }
-    e->storage_id = t->storage_id;
-    e->view_id = t->view_id;
-    e->dtype = t->dtype;
-    e->rank = t->rank;
-    for (uint32_t d = 0U; d < t->rank; ++d) {
-        e->dims[d] = t->dims[d];
-    }
-    e->device_id = t->device_id;
-    (*count)++;
-    return VELRI_OK;
-}
-
 static velri_tensor_view view_from_tensor(const velri_tensor *t) {
     velri_tensor_view v;
     memset(&v, 0, sizeof(v));
@@ -218,7 +169,9 @@ static velri_tensor alloc_compute_tensor(velri_builder *b, velri_storage_kind ki
         return VELRI_TENSOR_NONE;
     }
     velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
+    if (velri_b_resolve_devices(b, nullptr, &compute_dev) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     return alloc_tensor(b, kind, compute_dev, dtype, rank, dims);
 }
 
@@ -266,8 +219,8 @@ static bool emit_op_on(velri_builder *b, const velri_op_desc *op, velri_device_i
 
 static bool emit_op(velri_builder *b, const velri_op_desc *op) {
     velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
-    return emit_op_on(b, op, compute_dev);
+    return velri_b_resolve_devices(b, nullptr, &compute_dev) == VELRI_OK &&
+           emit_op_on(b, op, compute_dev);
 }
 
 static bool same_shape(const velri_tensor *a, const velri_tensor *b) {
@@ -327,6 +280,15 @@ void velri_b_init(velri_builder *b, velri_graph *graph, velri_manifest *manifest
     b->resolve_fn = resolve_fn;
     b->resolve_user = resolve_user;
     b->current_layer = -1;
+}
+
+void velri_b_init_checked(velri_builder *b, velri_graph *graph, velri_manifest *manifest,
+                          velri_device_id default_store_dev, velri_device_id default_compute_dev,
+                          velri_placement_resolve_checked_fn resolve_fn, void *resolve_user) {
+    velri_b_init(b, graph, manifest, default_store_dev, default_compute_dev, nullptr, resolve_user);
+    if (b) {
+        b->resolve_checked_fn = resolve_fn;
+    }
 }
 
 velri_status velri_b_status(const velri_builder *b) {
@@ -420,63 +382,125 @@ void velri_b_pop_layer(velri_builder *b) {
     b->layer_stack[b->layer_depth] = 0;
 }
 
-void velri_b_devices(const velri_builder *b, velri_device_id *out_store,
-                     velri_device_id *out_compute) {
+static velri_status current_devices(const velri_builder *b, velri_device_id *out_store,
+                                    velri_device_id *out_compute) {
     velri_device_id store = b ? b->default_store_dev : 0U;
     velri_device_id compute = b ? b->default_compute_dev : 0U;
+    velri_status st = velri_b_status(b);
 
-    if (b && b->err == VELRI_OK && b->resolve_fn) {
+    if (st == VELRI_OK && (b->resolve_fn || b->resolve_checked_fn)) {
         char path[VELRI_BUILDER_MAX_SCOPE_PATH];
         format_scope_path(b, path);
-        b->resolve_fn(path, b->current_layer, b->resolve_user, &store, &compute);
+        if (b->resolve_checked_fn) {
+            st = b->resolve_checked_fn(path, b->current_layer, b->resolve_user,
+                                       out_store ? &store : nullptr, out_compute ? &compute : nullptr);
+            if (st != VELRI_OK) {
+                store = b->default_store_dev;
+                compute = b->default_compute_dev;
+            }
+        } else {
+            b->resolve_fn(path, b->current_layer, b->resolve_user, &store, &compute);
+            st = velri_b_status(b);
+        }
     }
-
     if (out_store) {
         *out_store = store;
     }
     if (out_compute) {
         *out_compute = compute;
     }
+    return st;
+}
+
+void velri_b_devices(const velri_builder *b, velri_device_id *out_store,
+                     velri_device_id *out_compute) {
+    (void)current_devices(b, out_store, out_compute);
+}
+
+velri_status velri_b_resolve_devices(velri_builder *b, velri_device_id *out_store,
+                                     velri_device_id *out_compute) {
+    velri_status st = current_devices(b, out_store, out_compute);
+    velri_b_set_error(b, st);
+    return st;
 }
 
 /* ---- Tensor Constructors & Named Registration ---- */
 
-velri_tensor velri_b_weight(velri_builder *b, const char *name, velri_dtype dtype, uint32_t rank,
-                            const size_t *dims) {
-    if (!b || b->err != VELRI_OK) {
+/* Each named WEIGHT or STATE has its own namespace. Replicas may additionally name
+ * their logical source. Reserve the manifest entry before adding anything to the graph. */
+static velri_tensor alloc_registered_tensor(velri_builder *b, velri_storage_kind kind,
+                                            velri_device_id store_dev, const char *name,
+                                            const char *source_name, velri_dtype dtype,
+                                            uint32_t rank, const size_t *dims) {
+    if (!name) {
+        return alloc_tensor(b, kind, store_dev, dtype, rank, dims);
+    }
+    size_t name_len = strlen(name);
+    size_t source_len = source_name ? strlen(source_name) : 0U;
+    if (name_len == 0U || !dims || rank == 0U || rank > VELRI_MAX_RANK) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-    if (name) {
-        if (name[0] == '\0') {
-            velri_b_set_error(b, VELRI_ERR_INVALID);
-            return VELRI_TENSOR_NONE;
-        }
-        if (strlen(name) >= VELRI_MANIFEST_NAME_MAX) {
-            velri_b_set_error(b, VELRI_ERR_OVERFLOW);
-            return VELRI_TENSOR_NONE;
-        }
-        if (b->manifest && velri_manifest_find_weight(b->manifest, name) != nullptr) {
-            velri_b_set_error(b, VELRI_ERR_INVALID);
-            return VELRI_TENSOR_NONE;
-        }
-    }
-
-    velri_device_id store_dev = 0U;
-    velri_b_devices(b, &store_dev, nullptr);
-    velri_tensor t = alloc_tensor(b, VELRI_STORAGE_WEIGHT, store_dev, dtype, rank, dims);
-    if (!t.valid) {
+    if (name_len >= VELRI_MANIFEST_NAME_MAX || source_len >= VELRI_MANIFEST_NAME_MAX) {
+        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
         return VELRI_TENSOR_NONE;
     }
 
-    if (b->manifest && name) {
-        velri_status st = manifest_append_entry(&b->manifest->weights, &b->manifest->num_weights,
-                                                &b->manifest->cap_weights, name, "", &t);
-        if (st != VELRI_OK) {
-            velri_b_set_error(b, st);
-            return VELRI_TENSOR_NONE;
-        }
+    velri_manifest *m = b->manifest;
+    if (!m) {
+        return alloc_tensor(b, kind, store_dev, dtype, rank, dims);
+    }
+    bool is_weight = kind == VELRI_STORAGE_WEIGHT;
+    velri_manifest_entry **entries = is_weight ? &m->weights : &m->states;
+    uint32_t *count = is_weight ? &m->num_weights : &m->num_states;
+    uint32_t *cap = is_weight ? &m->cap_weights : &m->cap_states;
+    if (manifest_find_entry(*entries, *count, name)) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return VELRI_TENSOR_NONE;
+    }
+    if (*count == UINT32_MAX) {
+        velri_b_set_error(b, VELRI_ERR_OVERFLOW);
+        return VELRI_TENSOR_NONE;
+    }
+
+    /* Names and dimensions may have been borrowed from this manifest before realloc. */
+    velri_manifest_entry entry = {0};
+    memcpy(entry.name, name, name_len + 1U);
+    memcpy(entry.dims, dims, rank * sizeof(dims[0]));
+    if (source_name) {
+        memcpy(entry.source_name, source_name, source_len + 1U);
+    }
+    void *new_entries = nullptr;
+    if (!velri_vec_ensure(*entries, &new_entries, cap, *count, 1U, sizeof(entry))) {
+        velri_b_set_error(b, VELRI_ERR_NOMEM);
+        return VELRI_TENSOR_NONE;
+    }
+    *entries = new_entries;
+
+    velri_tensor t = alloc_tensor(b, kind, store_dev, dtype, rank, entry.dims);
+    if (t.valid) {
+        entry.storage_id = t.storage_id;
+        entry.view_id = t.view_id;
+        entry.dtype = t.dtype;
+        entry.rank = t.rank;
+        entry.device_id = t.device_id;
+        (*entries)[(*count)++] = entry;
     }
     return t;
+}
+
+static velri_tensor placed_storage(velri_builder *b, velri_storage_kind kind, const char *name,
+                                   velri_dtype dtype, uint32_t rank, const size_t *dims) {
+    velri_device_id store_dev;
+    if (velri_b_resolve_devices(b, &store_dev, nullptr) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
+    return alloc_registered_tensor(b, kind, store_dev, name, nullptr, dtype, rank, dims);
+}
+
+velri_tensor velri_b_weight(velri_builder *b, const char *name, velri_dtype dtype, uint32_t rank,
+                            const size_t *dims) {
+    return placed_storage(b, VELRI_STORAGE_WEIGHT, name, dtype, rank, dims);
 }
 
 velri_tensor velri_b_weight_shared(velri_builder *b, const char *name, velri_dtype dtype,
@@ -496,7 +520,9 @@ velri_tensor velri_b_weight_shared(velri_builder *b, const char *name, velri_dty
     }
 
     velri_device_id store_dev = 0U;
-    velri_b_devices(b, &store_dev, nullptr);
+    if (velri_b_resolve_devices(b, &store_dev, nullptr) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
 
     const velri_manifest_entry *any_match = nullptr;
     const velri_manifest_entry *dev_match = nullptr;
@@ -542,7 +568,8 @@ velri_tensor velri_b_weight_shared(velri_builder *b, const char *name, velri_dty
     }
 
     if (!any_match) {
-        return velri_b_weight(b, name, dtype, rank, dims);
+        return alloc_registered_tensor(b, VELRI_STORAGE_WEIGHT, store_dev, name, nullptr, dtype,
+                                       rank, dims);
     }
 
     /* Cross-device placement: allocate one per-device replica aliased to `source_name = name`. */
@@ -552,24 +579,7 @@ velri_tensor velri_b_weight_shared(velri_builder *b, const char *name, velri_dty
         velri_b_set_error(b, VELRI_ERR_OVERFLOW);
         return VELRI_TENSOR_NONE;
     }
-    if (velri_manifest_find_weight(b->manifest, alias) != nullptr) {
-        velri_b_set_error(b, VELRI_ERR_INVALID);
-        return VELRI_TENSOR_NONE;
-    }
-    char src_buf[VELRI_MANIFEST_NAME_MAX];
-    memcpy(src_buf, name, nlen + 1U);
-
-    velri_tensor t = alloc_tensor(b, VELRI_STORAGE_WEIGHT, store_dev, dtype, rank, dims);
-    if (!t.valid) {
-        return VELRI_TENSOR_NONE;
-    }
-    velri_status st = manifest_append_entry(&b->manifest->weights, &b->manifest->num_weights,
-                                            &b->manifest->cap_weights, alias, src_buf, &t);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-    return t;
+    return alloc_registered_tensor(b, VELRI_STORAGE_WEIGHT, store_dev, alias, name, dtype, rank, dims);
 }
 
 velri_tensor velri_b_weight_tied(velri_builder *b, const char *name, const char *tie_to,
@@ -608,7 +618,9 @@ velri_tensor velri_b_weight_tied(velri_builder *b, const char *name, const char 
     }
 
     velri_device_id store_dev = 0U;
-    velri_b_devices(b, &store_dev, nullptr);
+    if (velri_b_resolve_devices(b, &store_dev, nullptr) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     if (src->device_id == store_dev) {
         velri_tensor_view tv;
         velri_status st = velri_tensor_view_contiguous(src->storage_id, src->dtype, src->rank,
@@ -621,29 +633,11 @@ velri_tensor velri_b_weight_tied(velri_builder *b, const char *name, const char 
     }
 
     /* Cross-device placement requires a distinct logical alias name for the replicated storage. */
-    if (!name || velri_manifest_find_weight(b->manifest, name) != nullptr) {
+    if (!name) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
-
-    size_t nlen = strlen(name);
-    size_t slen = strlen(tie_to);
-    char name_buf[VELRI_MANIFEST_NAME_MAX];
-    char src_buf[VELRI_MANIFEST_NAME_MAX];
-    memcpy(name_buf, name, nlen + 1U);
-    memcpy(src_buf, tie_to, slen + 1U);
-
-    velri_tensor t = alloc_tensor(b, VELRI_STORAGE_WEIGHT, store_dev, dtype, rank, dims);
-    if (!t.valid) {
-        return VELRI_TENSOR_NONE;
-    }
-    velri_status st = manifest_append_entry(&b->manifest->weights, &b->manifest->num_weights,
-                                            &b->manifest->cap_weights, name_buf, src_buf, &t);
-    if (st != VELRI_OK) {
-        velri_b_set_error(b, st);
-        return VELRI_TENSOR_NONE;
-    }
-    return t;
+    return alloc_registered_tensor(b, VELRI_STORAGE_WEIGHT, store_dev, name, tie_to, dtype, rank, dims);
 }
 
 velri_tensor velri_b_input(velri_builder *b, velri_dtype dtype, uint32_t rank, const size_t *dims) {
@@ -657,40 +651,7 @@ velri_tensor velri_b_output(velri_builder *b, velri_dtype dtype, uint32_t rank,
 
 velri_tensor velri_b_state(velri_builder *b, const char *name, velri_dtype dtype, uint32_t rank,
                            const size_t *dims) {
-    if (!b || b->err != VELRI_OK) {
-        return VELRI_TENSOR_NONE;
-    }
-    if (name) {
-        if (name[0] == '\0') {
-            velri_b_set_error(b, VELRI_ERR_INVALID);
-            return VELRI_TENSOR_NONE;
-        }
-        if (strlen(name) >= VELRI_MANIFEST_NAME_MAX) {
-            velri_b_set_error(b, VELRI_ERR_OVERFLOW);
-            return VELRI_TENSOR_NONE;
-        }
-        if (b->manifest && velri_manifest_find_state(b->manifest, name) != nullptr) {
-            velri_b_set_error(b, VELRI_ERR_INVALID);
-            return VELRI_TENSOR_NONE;
-        }
-    }
-
-    velri_device_id store_dev = 0U;
-    velri_b_devices(b, &store_dev, nullptr);
-    velri_tensor t = alloc_tensor(b, VELRI_STORAGE_STATE, store_dev, dtype, rank, dims);
-    if (!t.valid) {
-        return VELRI_TENSOR_NONE;
-    }
-
-    if (b->manifest && name) {
-        velri_status st = manifest_append_entry(&b->manifest->states, &b->manifest->num_states,
-                                                &b->manifest->cap_states, name, "", &t);
-        if (st != VELRI_OK) {
-            velri_b_set_error(b, st);
-            return VELRI_TENSOR_NONE;
-        }
-    }
-    return t;
+    return placed_storage(b, VELRI_STORAGE_STATE, name, dtype, rank, dims);
 }
 
 velri_tensor velri_b_scratch(velri_builder *b, velri_dtype dtype, uint32_t rank,
@@ -959,7 +920,9 @@ static velri_tensor emit_rope(velri_builder *b, velri_tensor x, velri_tensor cos
     }
 
     velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
+    if (velri_b_resolve_devices(b, nullptr, &compute_dev) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     velri_tensor out = x;
     if (!inplace || x.device_id != compute_dev) {
         out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, x.dtype, 3U, x.dims);
@@ -1005,7 +968,9 @@ static velri_tensor emit_activation(velri_builder *b, velri_tensor x, velri_act_
     }
 
     velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
+    if (velri_b_resolve_devices(b, nullptr, &compute_dev) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     velri_tensor out = x;
     if (!inplace || x.device_id != compute_dev) {
         out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, x.dtype, x.rank, x.dims);
@@ -1043,7 +1008,9 @@ static velri_tensor emit_gated_mlp_act(velri_builder *b, velri_tensor gate, velr
     }
 
     velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
+    if (velri_b_resolve_devices(b, nullptr, &compute_dev) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     velri_tensor out = gate;
     if (!inplace || gate.device_id != compute_dev) {
         out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, gate.dtype, gate.rank, gate.dims);
@@ -1085,7 +1052,9 @@ static velri_tensor emit_add(velri_builder *b, velri_tensor a, velri_tensor b_in
     }
 
     velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
+    if (velri_b_resolve_devices(b, nullptr, &compute_dev) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     velri_tensor out = a;
     if (!inplace || a.device_id != compute_dev) {
         out = alloc_tensor(b, VELRI_STORAGE_SCRATCH, compute_dev, a.dtype, a.rank, a.dims);
@@ -1177,7 +1146,9 @@ static velri_tensor emit_attention(velri_builder *b, velri_tensor q, velri_tenso
     }
 
     velri_device_id compute_dev = 0U;
-    velri_b_devices(b, nullptr, &compute_dev);
+    if (velri_b_resolve_devices(b, nullptr, &compute_dev) != VELRI_OK) {
+        return VELRI_TENSOR_NONE;
+    }
     velri_tensor out = q;
     bool can_inplace = inplace && dv == head_dim_k && q.device_id == compute_dev &&
                        q.dims[1] == attn_dim && q.strides[1] == 1U && q.strides[0] == q.dims[1];

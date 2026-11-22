@@ -17,8 +17,8 @@
 #include <malloc.h>
 #endif
 
-/* Sentinel bit on atomic child counters: prevents TOCTOU races between destroy and child create. */
-enum { VELRI_DESTROYING_BIT = 0x80000000U };
+/* An exclusive owner (destruction or weight binding) excludes all child readers. */
+enum { VELRI_EXCLUSIVE_BIT = 0x80000000U };
 
 struct velri_cancel {
     velri_cancel_token tok;
@@ -27,7 +27,8 @@ struct velri_cancel {
 struct velri_ctx {
     velri_context *vl_ctx;
     bool vulkan_requested;
-    _Atomic uint32_t live_children; /* Models + Programs; high bit = VELRI_DESTROYING_BIT */
+    velri_cpu_backend_cfg cpu_policy;
+    _Atomic uint32_t live_children; /* Models + Programs; high bit = VELRI_EXCLUSIVE_BIT */
     atomic_flag err_lock;
     char last_error[256];
 };
@@ -47,9 +48,9 @@ struct velri_model {
     velri_rope_mode vl_rope;
 
     velri_rt_weight_entry *weights;
-    uint32_t num_weights;
+    _Atomic uint32_t num_weights;
     uint32_t cap_weights;
-    _Atomic uint32_t live_programs; /* Programs; high bit = VELRI_DESTROYING_BIT */
+    _Atomic uint32_t live_programs; /* Programs; high bit = VELRI_EXCLUSIVE_BIT */
 };
 
 struct velri_program {
@@ -77,7 +78,7 @@ struct velri_program {
     bool has_default_seed;
 
     velri_program_mem_report mem_report;
-    _Atomic uint32_t live_sessions; /* Sessions; high bit = VELRI_DESTROYING_BIT */
+    _Atomic uint32_t live_sessions; /* Sessions; high bit = VELRI_EXCLUSIVE_BIT */
 };
 
 struct velri_session {
@@ -103,7 +104,7 @@ struct velri_session {
 static inline bool velri_rt_try_acquire_child(_Atomic uint32_t *counter) {
     uint32_t cur = atomic_load_explicit(counter, memory_order_acquire);
     for (;;) {
-        if ((cur & VELRI_DESTROYING_BIT) != 0U || cur >= (VELRI_DESTROYING_BIT - 1U)) {
+        if ((cur & VELRI_EXCLUSIVE_BIT) != 0U || cur >= (VELRI_EXCLUSIVE_BIT - 1U)) {
             return false;
         }
         if (atomic_compare_exchange_weak_explicit(counter, &cur, cur + 1U, memory_order_acq_rel,
@@ -117,9 +118,9 @@ static inline void velri_rt_release_child(_Atomic uint32_t *counter) {
     atomic_fetch_sub_explicit(counter, 1U, memory_order_acq_rel);
 }
 
-static inline bool velri_rt_try_mark_destroying(_Atomic uint32_t *counter) {
+static inline bool velri_rt_try_acquire_exclusive(_Atomic uint32_t *counter) {
     uint32_t expected = 0U;
-    return atomic_compare_exchange_strong_explicit(counter, &expected, VELRI_DESTROYING_BIT,
+    return atomic_compare_exchange_strong_explicit(counter, &expected, VELRI_EXCLUSIVE_BIT,
                                                    memory_order_acq_rel, memory_order_acquire);
 }
 
@@ -159,6 +160,9 @@ static inline size_t velri_rt_sat_add_size(size_t a, size_t b) {
 
 /* Cross-TU runtime helpers (defined in context.c and model.c). */
 velri_rc velri_rt_rc_from_vl(velri_status st);
+velri_rc velri_rt_check_cpu_policy(const velri_cpu_backend_cfg *request,
+                                   const velri_cpu_backend_cfg *existing,
+                                   char *err_msg, size_t err_cap);
 void velri_rt_ctx_set_error(velri_ctx *ctx, const char *fmt, ...);
 void velri_rt_ctx_clear_tls_error(const velri_ctx *ctx);
 const velri_rt_weight_entry *velri_rt_model_find_weight(const velri_model *model, const char *name);

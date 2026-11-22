@@ -10,9 +10,8 @@ Computation, kernel launch graphs, and device backends live in **`velri-lib/`** 
 
 ## What Works Today
 
-- `velri-lib/` provides the Slang-first **`VelriLib::cpu`** library (`<velri_lib/kernels.h>`, build-time `slangc` AOT) and opt-in **`VelriLib::vulkan`** (`-DVELRI_ENABLE_VULKAN=ON`): 23 CPU MatOps kernels (`GEMV`/`GEMM` across `F64`, `FP32`, `FP16`, `BF16`, `W8A8`, `W8A32`, `RMSNorm`, `Add+RMSNorm`, `LayerNorm`, `RoPE`, activations, `GatedMLP`, `Softmax`, `FWHT`, `QuantRow`, format conversions) over `velri_pool` plus 35 `spirv-val`-verified SPIR-V 1.6 shaders (`CoopMat`, `Split-K`), verified against independent C23 references ([Slang-First Kernels](../../velri-lib/docs/EN/kernels.md)). The earlier handwritten C23/SIMD backend is preserved on branch `archive/c23-cpu-legacy`.
-- The root repository builds a consumer integration check against `VelriLib::cpu` (`tests/integration/velri_lib.c`).
-- The compute graph, backend registry, memory planner, weight loading, and real-model inference are target architecture under active development ([Roadmap](roadmap.md)).
+- The engine builds GPT-2 and Llama/Qwen2 from model descriptors and caller-bound weights. It supports prefill, decode, sampling, and independent sessions. Model file loading and tokenization are planned. [Runtime API](api.md)
+- Consumers link `VelriLib::velri` and include `<velri_lib/velri_lib.h>`. The library provides reusable blocks, graph and memory planning, Slang AOT CPU kernels and an optional Vulkan backend. The integration test uses the same public API with an in-tree or installed library. [Architecture and build](architecture.md)
 
 ---
 

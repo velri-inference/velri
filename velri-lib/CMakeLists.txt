@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(VelriLib VERSION 0.1.0 LANGUAGES C)
+project(VelriLib VERSION 0.2.0 LANGUAGES C)
 include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 23)
@@ -130,6 +130,7 @@ if(VELRI_ENABLE_VULKAN)
         src/backend/vulkan/vk_pipeline.c
         src/backend/vulkan/vk_dispatch.c
         "${VELRI_VK_SHADER_HEADER}"
+        "${VELRI_VK_ABI_HEADER}"
     )
 endif()
 

@@ -1,5 +1,6 @@
 #include "model/arch/gpt2.h"
 #include "model/arch/llama.h"
+#include "model/manifest.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -1319,7 +1320,37 @@ static void run_llama_suite_on_device(velri_context *ctx, velri_device_id dev, c
                        out_logits);
 }
 
+static void test_shared_manifest(void) {
+    velri_manifest_entry entries[] = {
+        {.name = "key",   .rank = 2, .dims = {1, 4}, .device_id = 0},
+        {.name = "other", .rank = 1, .dims = {8},    .device_id = 1},
+        {.name = "value", .rank = 2, .dims = {1, 4}, .device_id = 0},
+    };
+    velri_manifest_entry peer_entries[] = {entries[1], entries[0], entries[2]};
+    velri_manifest owner = {.weights = entries, .num_weights = 3};
+    velri_manifest peer = {.weights = peer_entries, .num_weights = 3};
+    char err[192];
+    CHECK(velri_model_check_shared_manifest(&owner, &peer, 2, err, sizeof(err)),
+          "independent devices can interleave declarations differently");
+    strcpy(peer_entries[1].source_name, "wrong-tied-weight");
+    CHECK(!velri_model_check_shared_manifest(&owner, &peer, 2, err, sizeof(err)),
+          "tied weights must resolve to the same source in both plans");
+    peer_entries[1] = entries[2];
+    peer_entries[2] = entries[0];
+    owner = (velri_manifest){.states = entries, .num_states = 3};
+    peer = (velri_manifest){.states = peer_entries, .num_states = 3};
+    CHECK(!velri_model_check_shared_manifest(&owner, &peer, 2, err, sizeof(err)) &&
+              strstr(err, "key") && strstr(err, "value"), "reject same-size swapped KV roles");
+    peer_entries[1] = entries[0];
+    peer_entries[2] = entries[2];
+    peer_entries[2].dims[0] = 4;
+    peer_entries[2].dims[1] = 1;
+    CHECK(!velri_model_check_shared_manifest(&owner, &peer, 2, err, sizeof(err)),
+          "equal bytes with different state shape");
+}
+
 int main(void) {
+    test_shared_manifest();
     printf("=== Velri End-to-End GPT-2 & Llama/Qwen Architecture Suite ===\n");
 
     const velri_model_params meta_std = {

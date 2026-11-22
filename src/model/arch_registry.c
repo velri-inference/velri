@@ -1,6 +1,5 @@
 #include "model/arch_registry.h"
 
-#include "config/placement_scopes.h"
 #include "model/arch/gpt2.h"
 #include "model/arch/llama.h"
 
@@ -8,19 +7,6 @@
 #include <stdio.h>
 
 #define ARRAY_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
-
-static const char *const k_dense_root_scopes[] = {
-    VELRI_SCOPE_ROOT,
-    VELRI_SCOPE_INPUT_LAYER,
-    VELRI_SCOPE_LM_HEAD,
-};
-
-static const char *const k_dense_layer_scopes[] = {
-    VELRI_SCOPE_HIDDEN_LAYERS,
-    VELRI_SCOPE_HL_ATTENTION,
-    VELRI_SCOPE_HL_KV_CACHE,
-    VELRI_SCOPE_HL_DENSE_MLP,
-};
 
 static velri_rc validate_llama_desc(velri_model_desc *norm, char *err_buf, size_t err_cap) {
     if (norm->rope_theta == 0.0f) {
@@ -47,10 +33,6 @@ static const velri_arch_ops k_arch_table[] = {
         .name = "gpt2",
         .has_auto_rope = false,
         .enforces_max_pos_ctx = true,
-        .root_scopes = k_dense_root_scopes,
-        .num_root_scopes = (uint32_t)ARRAY_COUNT(k_dense_root_scopes),
-        .layer_scopes = k_dense_layer_scopes,
-        .num_layer_scopes = (uint32_t)ARRAY_COUNT(k_dense_layer_scopes),
         .validate_desc = nullptr,
         .build_graph = velri_arch_gpt2_build,
     },
@@ -59,10 +41,6 @@ static const velri_arch_ops k_arch_table[] = {
         .name = "llama",
         .has_auto_rope = true,
         .enforces_max_pos_ctx = false,
-        .root_scopes = k_dense_root_scopes,
-        .num_root_scopes = (uint32_t)ARRAY_COUNT(k_dense_root_scopes),
-        .layer_scopes = k_dense_layer_scopes,
-        .num_layer_scopes = (uint32_t)ARRAY_COUNT(k_dense_layer_scopes),
         .validate_desc = validate_llama_desc,
         .build_graph = velri_arch_llama_build,
     },

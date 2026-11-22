@@ -1,7 +1,7 @@
 #include "config/placement_internal.h"
+#include "config/sampling_limits.h"
 #include "format/json.h"
 
-#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -206,21 +206,19 @@ static velri_status read_u32_range(velri_json_reader *r, uint32_t *out, uint32_t
     return VELRI_OK;
 }
 
-static velri_status read_f32_range(velri_json_reader *r, float *out, float min_v, bool min_inc,
-                                   float max_v, const char *path, char *err_msg, size_t err_cap) {
+static velri_status read_sampling_float(velri_json_reader *r, float *out, bool (*valid)(double),
+                                        const char *path, char *err_msg, size_t err_cap) {
     double v = 0.0;
     velri_status st = velri_json_read_f64(r, &v);
     if (st != VELRI_OK) {
         velri_cfg_set_errf(err_msg, err_cap, "%s: %s", path, r->err_msg);
         return st;
     }
-    float fv = (float)v;
-    bool lo_ok = min_inc ? (fv >= min_v) : (fv > min_v);
-    if (!isfinite(fv) || !lo_ok || fv > max_v) {
+    if (!valid(v)) {
         velri_cfg_set_errf(err_msg, err_cap, "%s: expected finite float in range", path);
         return VELRI_ERR_INVALID;
     }
-    *out = fv;
+    *out = (float)v;
     return VELRI_OK;
 }
 
@@ -843,14 +841,14 @@ static velri_status parse_sampling(velri_json_reader *r, velri_sampling_config *
                            err_cap)) {
                 return VELRI_ERR_INVALID;
             }
-            st = read_f32_range(r, &out->temperature, 0.0f, true, INFINITY,
+            st = read_sampling_float(r, &out->temperature, velri_sampling_valid_temperature,
                                 "model.sampling.temperature", err_msg, err_cap);
         } else if (velri_json_str_eq(key, "top-p")) {
             if (!check_dup(&seen, SAMP_SEEN_TOP_P, "model.sampling", "top-p", err_msg, err_cap)) {
                 return VELRI_ERR_INVALID;
             }
-            st = read_f32_range(r, &out->top_p, 0.0f, false, 1.0f, "model.sampling.top-p", err_msg,
-                                err_cap);
+            st = read_sampling_float(r, &out->top_p, velri_sampling_valid_top_p,
+                                     "model.sampling.top-p", err_msg, err_cap);
         } else if (velri_json_str_eq(key, "top-k")) {
             if (!check_dup(&seen, SAMP_SEEN_TOP_K, "model.sampling", "top-k", err_msg, err_cap)) {
                 return VELRI_ERR_INVALID;
@@ -861,8 +859,8 @@ static velri_status parse_sampling(velri_json_reader *r, velri_sampling_config *
             if (!check_dup(&seen, SAMP_SEEN_MIN_P, "model.sampling", "min-p", err_msg, err_cap)) {
                 return VELRI_ERR_INVALID;
             }
-            st = read_f32_range(r, &out->min_p, 0.0f, true, 1.0f, "model.sampling.min-p", err_msg,
-                                err_cap);
+            st = read_sampling_float(r, &out->min_p, velri_sampling_valid_probability,
+                                     "model.sampling.min-p", err_msg, err_cap);
         } else if (velri_json_str_eq(key, "seed")) {
             if (!check_dup(&seen, SAMP_SEEN_SEED, "model.sampling", "seed", err_msg, err_cap)) {
                 return VELRI_ERR_INVALID;
@@ -980,6 +978,7 @@ static velri_status parse_cpu_backend(velri_json_reader *r, velri_cpu_backend_cf
             }
             st = read_u32_range(r, &out->threads, 0U, UINT32_MAX, "backends.cpu.threads", err_msg,
                                 err_cap);
+            out->has_threads = true;
         } else if (velri_json_str_eq(key, "reserve-cores")) {
             if (!check_dup(&seen, CPU_SEEN_RESERVE, "backends.cpu", "reserve-cores", err_msg,
                            err_cap)) {
@@ -987,6 +986,7 @@ static velri_status parse_cpu_backend(velri_json_reader *r, velri_cpu_backend_cf
             }
             st = read_u32_range(r, &out->reserve_cores, 0U, UINT32_MAX,
                                 "backends.cpu.reserve-cores", err_msg, err_cap);
+            out->has_reserve_cores = true;
         } else if (velri_json_str_eq(key, "affinity")) {
             if (!check_dup(&seen, CPU_SEEN_AFFINITY, "backends.cpu", "affinity", err_msg, err_cap)) {
                 return VELRI_ERR_INVALID;
@@ -1079,7 +1079,7 @@ void velri_engine_config_init(velri_engine_config *cfg) {
     }
     memset(cfg, 0, sizeof(*cfg));
     cfg->sampling.top_p = 1.0f;
-    cfg->cpu_backend.reserve_cores = 1U;
+    cfg->cpu_backend.reserve_cores = VELRI_DEFAULT_CPU_RESERVE_CORES;
     cfg->cpu_backend.affinity = VELRI_AFFINITY_AUTO;
 }
 
@@ -1095,9 +1095,8 @@ void velri_engine_config_destroy(velri_engine_config *cfg) {
     velri_engine_config_init(cfg);
 }
 
-velri_status velri_engine_config_parse(const char *json_data, size_t json_len,
-                                       velri_engine_config *out_cfg, char *err_msg,
-                                       size_t err_cap) {
+static velri_status parse_config(const char *json_data, size_t json_len, bool require_model,
+                                 velri_engine_config *out_cfg, char *err_msg, size_t err_cap) {
     enum {
         TOP_SEEN_MODEL = 1U << 0,
         TOP_SEEN_CHAT_TEMPLATE = 1U << 1,
@@ -1227,7 +1226,7 @@ velri_status velri_engine_config_parse(const char *json_data, size_t json_len,
         velri_engine_config_destroy(&tmp);
         return st;
     }
-    if ((seen_top & TOP_SEEN_MODEL) == 0U) {
+    if (require_model && (seen_top & TOP_SEEN_MODEL) == 0U) {
         velri_cfg_set_errf(err_msg, err_cap, "missing required top-level 'model' object");
         velri_engine_config_destroy(&tmp);
         return VELRI_ERR_INVALID;
@@ -1236,6 +1235,26 @@ velri_status velri_engine_config_parse(const char *json_data, size_t json_len,
     velri_engine_config_destroy(out_cfg);
     *out_cfg = tmp;
     return VELRI_OK;
+}
+
+velri_status velri_engine_config_parse(const char *json_data, size_t json_len,
+                                       velri_engine_config *out_cfg, char *err_msg, size_t err_cap) {
+    return parse_config(json_data, json_len, true, out_cfg, err_msg, err_cap);
+}
+
+velri_status velri_cpu_config_parse(const char *json_data, size_t json_len,
+                                    velri_cpu_backend_cfg *out, char *err_msg, size_t err_cap) {
+    if (!out) {
+        return VELRI_ERR_INVALID;
+    }
+    velri_engine_config cfg;
+    velri_engine_config_init(&cfg);
+    velri_status st = parse_config(json_data, json_len, false, &cfg, err_msg, err_cap);
+    if (st == VELRI_OK) {
+        *out = cfg.cpu_backend;
+    }
+    velri_engine_config_destroy(&cfg);
+    return st;
 }
 
 velri_status velri_engine_config_validate_layers(const velri_engine_config *cfg,
