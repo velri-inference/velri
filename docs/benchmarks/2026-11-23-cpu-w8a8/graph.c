@@ -48,7 +48,8 @@ static void fill(int8_t *p, size_t n, uint32_t seed) {
 }
 
 static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_linear_desc d,
-                               size_t rows, size_t m, size_t k, size_t ring_len, size_t iterations) {
+                               size_t rows, size_t m, size_t k, size_t ring_len, size_t iterations,
+                               bool pack, double *bind_ms) {
     size_t xb = velri_dtype_bytes(d.x_dtype);
     size_t wb = velri_dtype_bytes(d.w_dtype);
     size_t yb = velri_dtype_bytes(d.y_dtype);
@@ -104,7 +105,17 @@ static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_li
     }
 
     velri_plan *plan = nullptr;
+#ifdef VELRI_BENCH_PACKED_API
+    uint32_t flags = pack ? VELRI_PLAN_PACK_CPU_WEIGHTS : 0;
+    check_ok(velri_plan_prepare_ex(ctx, g, nullptr, flags, &plan), "prep");
+    if (velri_plan_weight_is_packed(plan, sw[0]) != pack) {
+        fprintf(stderr, "requested weight layout unavailable\n");
+        exit(1);
+    }
+#else
+    (void)pack;
     check_ok(velri_plan_prepare(ctx, g, nullptr, &plan), "prep");
+#endif
 
     void *hx = xalloc(rows * k * xb);
     void *hy = xalloc(rows * m * yb);
@@ -117,9 +128,13 @@ static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_li
 
     void **hw = (void **)calloc(ring_len, sizeof(void *));
     for (size_t r = 0; r < ring_len; ++r) {
-        hw[r] = xalloc(m * k * wb);
-        fill(hw[r], m * k, 23);
-        check_ok(velri_plan_bind_weight_host(plan, sw[r], hw[r], m * k * wb), "bw");
+        if (!pack || r == 0) {
+            hw[r] = xalloc(m * k * wb);
+            fill(hw[r], m * k, 23);
+        }
+        double start = now_sec();
+        check_ok(velri_plan_bind_weight_host(plan, sw[r], hw[pack ? 0 : r], m * k * wb), "bw");
+        *bind_ms += 1000.0 * (now_sec() - start) / ring_len;
     }
 
     velri_slot *slot = nullptr;
@@ -142,7 +157,17 @@ static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_li
             exit(2);
         }
     }
+    if (pack) {
+        velri_os_aligned_free(hw[0]);
+        hw[0] = nullptr;
+    }
     check_ok(velri_slot_run(slot, nullptr, nullptr), "warmup");
+#ifdef VELRI_BENCH_FIXED_WARMUP
+    double warm = now_sec();
+    do {
+        check_ok(velri_slot_run(slot, nullptr, nullptr), "warmup");
+    } while (now_sec() - warm < 0.25);
+#endif
     double times[9];
     for (size_t s = 0; s < 9; ++s) {
         double t0 = now_sec();
@@ -163,8 +188,8 @@ static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_li
 }
 
 int main(int argc, char **argv) {
-    if (argc != 7) {
-        fprintf(stderr, "usage: graph ROWS M K THREADS RING ITERATIONS\n");
+    if (argc != 7 && argc != 8) {
+        fprintf(stderr, "usage: graph ROWS M K THREADS RING ITERATIONS [packed]\n");
         return 1;
     }
     size_t rows = strtoul(argv[1], nullptr, 10), m = strtoul(argv[2], nullptr, 10);
@@ -176,9 +201,16 @@ int main(int argc, char **argv) {
     velri_device_id dev;
     check_ok(velri_context_create(&cfg, &ctx), "context");
     check_ok(velri_context_find_device(ctx, "cpu", 0, &dev), "device");
-    double sec = bench_linear_sec(ctx, dev, velri_desc_w8a8_f32(), rows, m, k, ring, iterations);
-    printf("w8a8,auto,%zu,%zu,%zu,%zu,0,%zu,%.9g,,,%.9g,%.9g\n", rows, m, k, workers, ring,
-           1e3 * sec, 2.0 * rows * m * k / sec / 1e12, (double)m * k / sec / 1e9);
+    bool pack = argc == 8 && strcmp(argv[7], "packed") == 0;
+    if (argc == 8 && !pack) return 1;
+#ifndef VELRI_BENCH_PACKED_API
+    if (pack) return 1;
+#endif
+    double bind_ms = 0;
+    double sec = bench_linear_sec(ctx, dev, velri_desc_w8a8_f32(), rows, m, k, ring, iterations,
+                                  pack, &bind_ms);
+    printf("w8a8,auto,%zu,%zu,%zu,%zu,%d,%zu,%.9g,,,%.9g,%.9g,,,%.6g\n", rows, m, k, workers, pack, ring,
+           1e3 * sec, 2.0 * rows * m * k / sec / 1e12, (double)m * k / sec / 1e9, bind_ms);
     velri_context_destroy(ctx);
     return 0;
 }

@@ -24,6 +24,8 @@ GEMM throughput counts a multiply and an add as two integer operations. GEMV thr
 
 ## Recorded results
 
+The timings below describe the archived AVX-512 VNNI implementation at Velri `782d72b2`. The portable Slang implementation has a different kernel and requires a new measurement.
+
 Each entry is the median of three independent processes in `final.csv`. The production kernel uses 14 × 32 accumulators, 140 rows per panel, 192 K bytes per panel and four column tiles. The SHA-256 of the measured `velri-lib/src/kernels/slang/w8a8_vnni.slang` is `4063c78f37eff59f3d4871199c30726cbd2d08ceb522e09d6cbed45119fdced9`.
 
 | Shape (rows × M × K) | Unit | Previous graph | New graph | Archived raw | Archived prepared |
@@ -50,3 +52,5 @@ python3 summarize.py /tmp/w8-baseline.csv /tmp/w8-final.csv
 ```
 
 Replace `HEAD` with the candidate's commit to select that exact implementation. On a different CPU, pass `--cpus` and `--workers` for the desired physical cores.
+
+Use `--compare-packed --candidate HEAD` on a revision with the packing API to compare packed and row-major graph calls against the previous graph and archived prepared C. This mode adds a 250 ms warmup for each implementation and reports binding or packing time separately.
