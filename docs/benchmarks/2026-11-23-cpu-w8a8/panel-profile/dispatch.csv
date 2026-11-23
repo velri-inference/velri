@@ -1,0 +1,9 @@
+revision,aot,layout,raw_dot_calls,packed_dot_calls
+production,gcc,raw,341260,0
+production,gcc,packed,0,1052040
+production,clang,raw,840,0
+production,clang,packed,0,1384450
+candidate,gcc,raw,642990,0
+candidate,gcc,packed,0,855180
+candidate,clang,raw,655640,0
+candidate,clang,packed,0,674830
