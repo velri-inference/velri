@@ -1,0 +1,25 @@
+aot,layout,symbol,first,backedge,byte_dots_512,word_dots_512,byte_dots_256,byte_dots_128,body
+gcc,raw,velri_slang_dot_linear_w8a8_f32,0x600,0x70d,19,2,0,0,mov/=5 vmovdqu8/zmm=4 vpxorq/zmm=5 vpmovsxbw/zmm=2 vpdpbusd/zmm=19 vpmovzxbw/zmm=2 vpdpwssd/zmm=2 vextracti64x4/zmm=2 add/=1 cmp/=1
+gcc,raw,velri_slang_dot_linear_w8a8_f32,0x1d10,0x1d62,5,0,0,0,vmovdqu8/zmm=1 vpxorq/zmm=5 vpdpbusd/zmm=5 add/=1 cmp/=1
+gcc,raw,velri_slang_dot_linear_w8a8_f32,0x24d0,0x2504,4,0,0,0,mov/=1 vpxorq/zmm=1 vpdpbusd/zmm=4 add/=1 cmp/=1
+gcc,raw,velri_slang_dot_linear_w8a8_f32,0x2a90,0x2aaf,1,0,0,0,mov/=1 vpxorq/zmm=1 vpdpbusd/zmm=1 add/=1 cmp/=1
+gcc,packed,velri_slang_dot_linear_w8a8_f32_packed,0x5e0,0x6ec,19,2,0,0,mov/=5 vmovdqu8/zmm=9 vpmovsxbw/zmm=2 vpdpbusd/zmm=19 vpmovzxbw/zmm=2 vpdpwssd/zmm=2 vextracti64x4/zmm=2 add/=1 cmp/=1
+gcc,packed,velri_slang_dot_linear_w8a8_f32_packed,0x1c70,0x1cc5,5,0,0,0,vmovdqu8/zmm=6 vpdpbusd/zmm=5 add/=1 cmp/=1
+gcc,packed,velri_slang_dot_linear_w8a8_f32_packed,0x23c0,0x23f7,4,0,0,0,mov/=1 vmovdqu8/zmm=1 vpdpbusd/zmm=4 add/=1 cmp/=1
+gcc,packed,velri_slang_dot_linear_w8a8_f32_packed,0x2980,0x29a2,1,0,0,0,mov/=1 vmovdqu8/zmm=1 vpdpbusd/zmm=1 add/=1 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0xb20,0xbdf,20,0,0,0,vmovdqu64/zmm=4 vpxorq/zmm=5 vpdpbusd/zmm=20 add/=1 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0x1100,0x121f,0,0,0,0,vpmovsxbd/ymm=4 vmovq/xmm=5 vpxorq/xmm=5 vpmovzxbd/ymm=5 vpdpwssd/ymm=20 add/=10 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0x2250,0x22ed,10,0,0,0,vmovdqu64/zmm=2 vpxorq/zmm=10 vpdpbusd/zmm=10 sub/=1 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0x2460,0x24f8,0,0,0,0,vpmovsxbd/ymm=1 vmovq/xmm=5 vpxorq/xmm=5 vpmovzxbd/ymm=5 vpdpwssd/ymm=5 add/=7 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0x2ad0,0x2b22,8,0,0,0,vpxorq/zmm=2 vpdpbusd/zmm=8 sub/=1 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0x2c30,0x2c79,0,0,0,0,vpmovsxbd/ymm=4 vmovq/xmm=1 vpxorq/xmm=1 vpmovzxbd/ymm=1 vpdpwssd/ymm=4 add/=1 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0x3050,0x3098,4,0,0,0,vpxorq/zmm=4 vpdpbusd/zmm=4 add/=1 cmp/=1
+llvm,raw,velri_slang_dot_linear_w8a8_f32,0x3110,0x3134,0,0,0,0,vpmovsxbd/ymm=1 vmovq/xmm=1 vpxorq/xmm=1 vpmovzxbd/ymm=1 vpdpwssd/ymm=1 add/=1 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0xab0,0xb6f,20,0,0,0,vmovdqu64/zmm=9 vpdpbusd/zmm=20 add/=1 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0x1070,0x1153,0,0,0,0,vpmovsxbd/ymm=4 vpmovzxbd/ymm=5 vpdpwssd/ymm=20 add/=10 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0x21c0,0x225d,10,0,0,0,vmovdqu64/zmm=12 vpdpbusd/zmm=10 sub/=1 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0x23d0,0x2431,0,0,0,0,vpmovsxbd/ymm=1 vpmovzxbd/ymm=5 vpdpwssd/ymm=5 add/=7 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0x29e0,0x2a32,8,0,0,0,vmovdqu64/zmm=2 vpdpbusd/zmm=8 sub/=1 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0x2b40,0x2b7e,0,0,0,0,vpmovsxbd/ymm=4 vpmovzxbd/ymm=1 vpdpwssd/ymm=4 add/=1 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0x2f30,0x2f78,4,0,0,0,vmovdqu64/zmm=4 vpdpbusd/zmm=4 add/=1 cmp/=1
+llvm,packed,velri_slang_dot_linear_w8a8_f32_packed,0x2ff0,0x3009,0,0,0,0,vpmovsxbd/ymm=1 vpmovzxbd/ymm=1 vpdpwssd/ymm=1 add/=1 cmp/=1

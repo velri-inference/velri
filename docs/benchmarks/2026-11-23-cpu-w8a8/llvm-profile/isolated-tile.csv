@@ -1,0 +1,14 @@
+software,mode,k,runs,median_Tops,min_Tops,max_Tops,median_process_best_TOPS
+gcc,inner-packed,4096,3,15.9311,15.7556,15.9532,15.9745
+gcc,inner-packed,32768,3,12.7062,12.5644,12.8764,12.8019
+gcc,inner-raw,4096,3,15.7062,15.5881,15.7776,15.7467
+gcc,inner-raw,32768,3,12.7319,12.7051,12.7955,13.0984
+gcc,prod-packed,4096,3,6.1358,6.1238,6.1447,6.2013
+gcc,prod-raw,4096,3,6.1990,6.1926,6.2046,6.2142
+gcc,register,4096,3,22.1593,22.1092,22.1708,22.1872
+llvm-cpp,inner-packed,4096,3,5.1798,5.1717,5.3236,5.3367
+llvm-cpp,inner-raw,4096,3,5.3109,5.1389,5.3146,5.3203
+llvm-ir,inner-packed,4096,3,5.3418,5.3376,5.3771,5.3688
+llvm-ir,inner-raw,4096,3,5.3365,5.2826,5.3389,5.3526
+llvm-ir64,inner-packed,4096,3,17.9117,17.9033,18.0217,17.9903
+llvm-ir64,inner-raw,4096,3,18.0019,17.6491,18.0331,18.0320
