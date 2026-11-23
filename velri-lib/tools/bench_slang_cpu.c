@@ -48,6 +48,7 @@ typedef struct {
     double bw_copy_gbps;
     double fma_f32_gflops;
     double fma_f64_gflops;
+    double vnni_i8_gops;
 } cpu_ceilings;
 
 typedef struct {
@@ -117,6 +118,22 @@ __attribute__((target("avx512f,fma"))) static void ceil_fma_f64_worker(void *v, 
     c->sink[wid] = _mm512_reduce_add_pd(s);
 }
 
+__attribute__((target("avx512f,avx512vnni"))) static void ceil_vnni_i8_worker(void *v, size_t wid,
+                                                                              size_t nw) {
+    (void)nw;
+    cpu_compute_ctx *c = (cpu_compute_ctx *)v;
+    __m512i a = _mm512_set1_epi8((char)(1 + (wid & 7U)));
+    __m512i b = _mm512_set1_epi8((char)129);
+    __m512i r[12];
+    for (int j = 0; j < 12; ++j) r[j] = _mm512_set1_epi32(j + 1);
+    for (size_t i = 0; i < c->iters; ++i) {
+        for (int j = 0; j < 12; ++j) r[j] = _mm512_dpbusd_epi32(r[j], b, a);
+    }
+    __m512i s = r[0];
+    for (int j = 1; j < 12; ++j) s = _mm512_add_epi32(s, r[j]);
+    c->sink[wid] = (double)_mm512_reduce_add_epi32(s);
+}
+
 #endif
 
 static cpu_ceilings measure_cpu_ceilings(size_t nw) {
@@ -168,6 +185,16 @@ static cpu_ceilings measure_cpu_ceilings(size_t nw) {
             if (gf > out.fma_f64_gflops) out.fma_f64_gflops = gf;
         }
     }
+    if (velri_get_cpu_info()->has_avx512_vnni) {
+        cpu_compute_ctx vctx = {.iters = 3000000U};
+        for (int w = 0; w < 2; ++w) velri_pool_parallel(pool, nw, ceil_vnni_i8_worker, &vctx);
+        for (int s = 0; s < 5; ++s) {
+            double t0 = now_sec();
+            velri_pool_parallel(pool, nw, ceil_vnni_i8_worker, &vctx);
+            double gops = (double)nw * (double)vctx.iters * 12.0 * 128.0 / (now_sec() - t0) / 1e9;
+            if (gops > out.vnni_i8_gops) out.vnni_i8_gops = gops;
+        }
+    }
 #endif
     velri_pool_destroy(pool);
 
@@ -178,12 +205,16 @@ static cpu_ceilings measure_cpu_ceilings(size_t nw) {
         printf("  AVX-512 FP32 FMA Peak        : %7.1f GFLOPS\n", out.fma_f32_gflops);
         printf("  AVX-512 FP64 FMA Peak        : %7.1f GFLOPS\n", out.fma_f64_gflops);
     }
+    if (out.vnni_i8_gops > 0.0) {
+        printf("  AVX-512 INT8 VNNI Peak       : %7.1f GOP/s\n", out.vnni_i8_gops);
+    }
     return out;
 }
 
 /* ---- Linear Graph Benchmark Helper (via public VelriLib Graph/Slot API) ---- */
 static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_linear_desc d,
-                               size_t rows, size_t m, size_t k, size_t ring_len, size_t samples) {
+                               size_t rows, size_t m, size_t k, size_t ring_len, size_t samples,
+                               bool pack_weights) {
     size_t xb = velri_dtype_bytes(d.x_dtype);
     size_t wb = velri_dtype_bytes(d.w_dtype);
     size_t yb = velri_dtype_bytes(d.y_dtype);
@@ -239,7 +270,8 @@ static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_li
     }
 
     velri_plan *plan = nullptr;
-    check_ok(velri_plan_prepare(ctx, g, nullptr, &plan), "prep");
+    uint32_t plan_flags = pack_weights ? VELRI_PLAN_PACK_CPU_WEIGHTS : 0U;
+    check_ok(velri_plan_prepare_ex(ctx, g, nullptr, plan_flags, &plan), "prep");
 
     uint64_t rng = 0xA0000001ULL ^ (uint64_t)rows ^ ((uint64_t)m << 12);
     void *hx = xalloc(rows * k * xb);
@@ -305,13 +337,15 @@ int main(int argc, char **argv) {
     struct {
         const char *name;
         velri_linear_desc desc;
+        bool pack_weights;
     } modes[] = {
-        {"F32", velri_desc_f32()},
-        {"F64", velri_desc_f64()},
-        {"F16->F32", velri_desc_f16(VELRI_DTYPE_F32)},
-        {"BF16->F32", velri_desc_bf16(VELRI_DTYPE_F32)},
-        {"F32xBF16", velri_desc_f32x_bf16w()},
-        {"W8A8->F32", velri_desc_w8a8_f32()},
+        {"F32", velri_desc_f32(), false},
+        {"F64", velri_desc_f64(), false},
+        {"F16->F32", velri_desc_f16(VELRI_DTYPE_F32), false},
+        {"BF16->F32", velri_desc_bf16(VELRI_DTYPE_F32), false},
+        {"F32xBF16", velri_desc_f32x_bf16w(), false},
+        {"W8A8->F32", velri_desc_w8a8_f32(), false},
+        {"W8A8(pack)", velri_desc_w8a8_f32(), true},
     };
 
     printf("\n=== Cold-DRAM GEMV (rows=1, M=4096, K=4096, ring=8) ===\n");
@@ -319,7 +353,7 @@ int main(int argc, char **argv) {
     printf("------------+-------------+--------\n");
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
         velri_linear_desc d = modes[i].desc;
-        double sec = bench_linear_sec(ctx, dev, d, 1U, 4096U, 4096U, 8U, 5U);
+        double sec = bench_linear_sec(ctx, dev, d, 1U, 4096U, 4096U, 8U, 5U, modes[i].pack_weights);
         double bytes = (double)(4096U * 4096U * velri_dtype_bytes(d.w_dtype) +
                                 4096U * velri_dtype_bytes(d.x_dtype) +
                                 4096U * velri_dtype_bytes(d.y_dtype));
@@ -334,11 +368,16 @@ int main(int argc, char **argv) {
     double ops = 2.0 * 128.0 * 2048.0 * 2048.0;
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
         velri_linear_desc d = modes[i].desc;
-        double sec = bench_linear_sec(ctx, dev, d, 128U, 2048U, 2048U, 1U, 5U);
+        double sec = bench_linear_sec(ctx, dev, d, 128U, 2048U, 2048U, 1U, 5U, modes[i].pack_weights);
         double rate = ops / sec / 1e9;
         bool int8 = d.x_dtype == VELRI_DTYPE_I8 && d.w_dtype == VELRI_DTYPE_I8;
         if (int8) {
-            printf("%-11s | %7.1f GOP/s   |     n/a | n/a\n", modes[i].name, rate);
+            printf("%-11s | %7.1f GOP/s   | ", modes[i].name, rate);
+            if (ceil.vnni_i8_gops > 0.0) {
+                printf("%6.1f%% | %s\n", 100.0 * rate / ceil.vnni_i8_gops, "INT8 VNNI");
+            } else {
+                printf("    n/a | %s\n", "INT8 VNNI");
+            }
             continue;
         }
         bool fp64 = d.y_dtype == VELRI_DTYPE_F64;

@@ -29,13 +29,15 @@ typedef struct {
 struct velri_pool {
     size_t num_workers;
     atomic_bool stopping;
-    velri_parallel_fn fn;
-    void *fn_ctx;
     size_t last_nw;
     uint64_t host_gen;
-    alignas(64) _Atomic uint64_t dispatch_word; /* (gen << 16) | (nw & 0xFFFFU) */
-    alignas(64) _Atomic uint64_t parked_mask[VELRI_POOL_MASK_WORDS];
     velri_worker_slot *slots;
+    /* Co-locate dispatch_word + fn + fn_ctx on one 64B cache line so waking workers
+     * fetch all three in a single cross-CCD cache transfer instead of two. */
+    alignas(64) _Atomic uint64_t dispatch_word; /* (gen << 16) | (nw & 0xFFFFU) */
+    velri_parallel_fn fn;
+    void *fn_ctx;
+    alignas(64) _Atomic uint64_t parked_mask[VELRI_POOL_MASK_WORDS];
 };
 
 static inline uint64_t pack_dispatch_word(uint64_t gen, size_t nw) {
@@ -88,21 +90,33 @@ static void worker_loop(void *arg) {
         unpack_dispatch_word(word, &cg, &cnw);
 
         if (cg == g && wid < cnw) {
-            const uint64_t deadline = velri_os_monotonic_ns() + UINT64_C(250000000);
-            do {
-                for (int spin = 0; spin < 2048; ++spin) {
-                    velri_os_cpu_relax();
-                    word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
-                    unpack_dispatch_word(word, &cg, &cnw);
-                    if (cg != g) {
-                        break;
-                    }
-                }
-                if (cg != g || wid >= cnw ||
-                    atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
+            /* Fast spin before calling monotonic_ns() to avoid vDSO overhead on back-to-back ops. */
+            for (int spin = 0; spin < 1024; ++spin) {
+                velri_os_cpu_relax();
+                word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
+                unpack_dispatch_word(word, &cg, &cnw);
+                if (cg != g) {
                     break;
                 }
-            } while (velri_os_monotonic_ns() < deadline);
+            }
+            if (cg == g && wid < cnw &&
+                !atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
+                const uint64_t deadline = velri_os_monotonic_ns() + UINT64_C(250000000);
+                do {
+                    for (int spin = 0; spin < 2048; ++spin) {
+                        velri_os_cpu_relax();
+                        word = atomic_load_explicit(&pool->dispatch_word, memory_order_acquire);
+                        unpack_dispatch_word(word, &cg, &cnw);
+                        if (cg != g) {
+                            break;
+                        }
+                    }
+                    if (cg != g || wid >= cnw ||
+                        atomic_load_explicit(&pool->stopping, memory_order_relaxed)) {
+                        break;
+                    }
+                } while (velri_os_monotonic_ns() < deadline);
+            }
         }
 
         if (cg == g || wid >= cnw) {
