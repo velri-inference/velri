@@ -24,7 +24,7 @@ GEMM throughput counts a multiply and an add as two integer operations. GEMV thr
 
 ## Recorded results
 
-The timings below describe the archived AVX-512 VNNI implementation at Velri `782d72b2`. The [portable Slang CPU profile](portable-profile/README.md) measures the current packed and row-major kernels, including dispatch and source-level CPU samples.
+The timings below describe the archived AVX-512 VNNI implementation at Velri `782d72b2`. The [byte-dot profile](dot-profile/README.md) measures the current W8A8 CPU graph, including dispatch, source-level samples and paired comparisons. The [earlier FP32 microkernel profile](portable-profile/README.md) records the preceding portable implementation.
 
 Each entry is the median of three independent processes in `final.csv`. The production kernel uses 14 × 32 accumulators, 140 rows per panel, 192 K bytes per panel and four column tiles. The SHA-256 of the measured `velri-lib/src/kernels/slang/w8a8_vnni.slang` is `4063c78f37eff59f3d4871199c30726cbd2d08ceb522e09d6cbed45119fdced9`.
 

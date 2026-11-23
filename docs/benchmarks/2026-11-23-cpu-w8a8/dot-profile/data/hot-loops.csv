@@ -1,0 +1,25 @@
+rows,layout,symbol,first,back_edge,loop_samples,all_samples,static_byte_dots,static_word_dots,static_body
+1,packed,velri_slang_dot_linear_w8a8_f32_packed,0x1c70,0x1cc5,65098,71827,5,0,vmovdqu8=6 vpdpbusd=5 add=1 cmp=1
+1,packed,velri_slang_dot_linear_w8a8_f32_packed,0x2980,0x29a2,125,71827,1,0,mov=1 vmovdqu8=1 vpdpbusd=1 add=1 cmp=1
+1,packed,velri_slang_dot_linear_w8a8_f32_packed,0x170,0x1ce,20,71827,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+1,raw,velri_slang_dot_linear_w8a8_f32,0x1d10,0x1d62,64257,71345,5,0,vmovdqu8=1 vpxorq=5 vpdpbusd=5 add=1 cmp=1
+1,raw,velri_slang_dot_linear_w8a8_f32,0x2a90,0x2aaf,130,71345,1,0,mov=1 vpxorq=1 vpdpbusd=1 add=1 cmp=1
+1,raw,velri_slang_dot_linear_w8a8_f32,0x180,0x1de,20,71345,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+64,packed,velri_slang_dot_linear_w8a8_f32_packed,0x5e0,0x6ec,54433,71891,19,2,mov=5 vmovdqu8=9 vpmovsxbw=2 vpdpbusd=19 vpmovzxbw=2 vpdpwssd=2 vextracti64x4=2 add=1 cmp=1
+64,packed,velri_slang_dot_linear_w8a8_f32_packed,0x170,0x1ce,887,71891,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+64,packed,velri_slang_dot_linear_w8a8_f32_packed,0x23c0,0x23f7,715,71891,4,0,mov=1 vmovdqu8=1 vpdpbusd=4 add=1 cmp=1
+64,raw,velri_slang_dot_linear_w8a8_f32,0x600,0x70d,54234,70885,19,2,mov=5 vmovdqu8=4 vpxorq=5 vpmovsxbw=2 vpdpbusd=19 vpmovzxbw=2 vpdpwssd=2 vextracti64x4=2 add=1 cmp=1
+64,raw,velri_slang_dot_linear_w8a8_f32,0x180,0x1de,993,70885,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+64,raw,velri_slang_dot_linear_w8a8_f32,0x24d0,0x2504,574,70885,4,0,mov=1 vpxorq=1 vpdpbusd=4 add=1 cmp=1
+128,packed,velri_slang_dot_linear_w8a8_f32_packed,0x5e0,0x6ec,43049,71816,19,2,mov=5 vmovdqu8=9 vpmovsxbw=2 vpdpbusd=19 vpmovzxbw=2 vpdpwssd=2 vextracti64x4=2 add=1 cmp=1
+128,packed,velri_slang_dot_linear_w8a8_f32_packed,0x23c0,0x23f7,3481,71816,4,0,mov=1 vmovdqu8=1 vpdpbusd=4 add=1 cmp=1
+128,packed,velri_slang_dot_linear_w8a8_f32_packed,0x170,0x1ce,1944,71816,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+128,raw,velri_slang_dot_linear_w8a8_f32,0x600,0x70d,42989,71376,19,2,mov=5 vmovdqu8=4 vpxorq=5 vpmovsxbw=2 vpdpbusd=19 vpmovzxbw=2 vpdpwssd=2 vextracti64x4=2 add=1 cmp=1
+128,raw,velri_slang_dot_linear_w8a8_f32,0x24d0,0x2504,3295,71376,4,0,mov=1 vpxorq=1 vpdpbusd=4 add=1 cmp=1
+128,raw,velri_slang_dot_linear_w8a8_f32,0x180,0x1de,2144,71376,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+256,packed,velri_slang_dot_linear_w8a8_f32_packed,0x5e0,0x6ec,55127,71907,19,2,mov=5 vmovdqu8=9 vpmovsxbw=2 vpdpbusd=19 vpmovzxbw=2 vpdpwssd=2 vextracti64x4=2 add=1 cmp=1
+256,packed,velri_slang_dot_linear_w8a8_f32_packed,0x170,0x1ce,1570,71907,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+256,packed,velri_slang_dot_linear_w8a8_f32_packed,0x23c0,0x23f7,654,71907,4,0,mov=1 vmovdqu8=1 vpdpbusd=4 add=1 cmp=1
+256,raw,velri_slang_dot_linear_w8a8_f32,0x600,0x70d,55395,71886,19,2,mov=5 vmovdqu8=4 vpxorq=5 vpmovsxbw=2 vpdpbusd=19 vpmovzxbw=2 vpdpwssd=2 vextracti64x4=2 add=1 cmp=1
+256,raw,velri_slang_dot_linear_w8a8_f32,0x180,0x1de,1581,71886,0,0,vmovdqu8=1 add=1 vpmovsxbw=2 vextracti64x4=3 vpmovsxwd=4 vpaddd=4 cmp=1
+256,raw,velri_slang_dot_linear_w8a8_f32,0x24d0,0x2504,666,71886,4,0,mov=1 vpxorq=1 vpdpbusd=4 add=1 cmp=1
