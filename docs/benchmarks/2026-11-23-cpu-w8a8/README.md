@@ -24,7 +24,7 @@ GEMM throughput counts a multiply and an add as two integer operations. GEMV thr
 
 ## Recorded results
 
-The timings below describe the archived AVX-512 VNNI implementation at Velri `782d72b2`. The [output panel comparison](panel-profile/README.md) measures the current Slang GEMM change on both native compilers, including a separate instruction-level profile. The [LLVM/GCC comparison](llvm-profile/README.md) measures both native byte-dot compiler paths on the public graph. The [GCC byte-dot profile](dot-profile/README.md) includes dispatch, source-level samples and paired comparisons. The [earlier FP32 microkernel profile](portable-profile/README.md) records the preceding portable implementation.
+The timings below describe the archived AVX-512 VNNI implementation at Velri `782d72b2`. The [packed-depth comparison](packed-depth/README.md) measures row padding and the 4 × 6 prepared tile. The [output panel comparison](panel-profile/README.md) measures the current Slang GEMM change on both native compilers, including a separate instruction-level profile. The [LLVM/GCC comparison](llvm-profile/README.md) measures both native byte-dot compiler paths on the public graph. The [GCC byte-dot profile](dot-profile/README.md) includes dispatch, source-level samples and paired comparisons. The [earlier FP32 microkernel profile](portable-profile/README.md) records the preceding portable implementation.
 
 Each entry is the median of three independent processes in `final.csv`. The production kernel uses 14 × 32 accumulators, 140 rows per panel, 192 K bytes per panel and four column tiles. The SHA-256 of the measured `velri-lib/src/kernels/slang/w8a8_vnni.slang` is `4063c78f37eff59f3d4871199c30726cbd2d08ceb522e09d6cbed45119fdced9`.
 
