@@ -1,0 +1,9 @@
+rows,layout,symbol,start_offset,back_edge_offset,loop_samples,all_samples,static_loop_body
+1,packed,velri_slang_avx512_linear_w8a8_f32_packed,0x840,0xe70,61425,72107,vpaddd=10 vpmovzxdq=4 vpsllq=4 vmovq=16 movzbl=8 vmovd=8 vpextrq=16 vpinsrb=120 vextracti32x4=12 vextracti64x4=2 vpmovsxbd=10 vpmulld=8 add=1 cmp=1
+1,raw,velri_slang_avx512_linear_w8a8_f32,0x390,0x4f2,65487,71299,vpmovsxbd=20 vpmulld=16 vpaddd=16 add=1 cmp=1
+64,packed,velri_slang_avx512_linear_w8a8_f32_packed,0x2ea0,0x2f99,52629,71617,vbroadcastss=6 vmovups=4 vfmadd231ps=24 inc=1 add=1 cmp=1
+64,raw,velri_slang_avx512_linear_w8a8_f32,0x2450,0x2549,47194,71260,vbroadcastss=6 vmovups=4 vfmadd231ps=24 inc=1 add=1 cmp=1
+128,packed,velri_slang_avx512_linear_w8a8_f32_packed,0x2ea0,0x2f99,53969,71579,vbroadcastss=6 vmovups=4 vfmadd231ps=24 inc=1 add=1 cmp=1
+128,raw,velri_slang_avx512_linear_w8a8_f32,0x2450,0x2549,48367,71506,vbroadcastss=6 vmovups=4 vfmadd231ps=24 inc=1 add=1 cmp=1
+256,packed,velri_slang_avx512_linear_w8a8_f32_packed,0x2ea0,0x2f99,56462,70631,vbroadcastss=6 vmovups=4 vfmadd231ps=24 inc=1 add=1 cmp=1
+256,raw,velri_slang_avx512_linear_w8a8_f32,0x2450,0x2549,57118,72011,vbroadcastss=6 vmovups=4 vfmadd231ps=24 inc=1 add=1 cmp=1

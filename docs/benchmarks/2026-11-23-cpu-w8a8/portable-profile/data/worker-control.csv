@@ -1,0 +1,13 @@
+rep,mask,observer,ms,tops
+0,unfixed,plain,2.0023405,4.28994698
+0,unfixed,graph-profile,1.9935905,4.30877585
+0,-pin,graph-profile,1.9925505,4.31102478
+0,-pin,plain,2.04885575,4.19255216
+1,-pin,plain,1.9974105,4.30053541
+1,-pin,graph-profile,1.99259075,4.31093771
+1,unfixed,graph-profile,2.0071805,4.27960245
+1,unfixed,plain,1.9960755,4.30341167
+2,unfixed,plain,2.01488325,4.26324185
+2,unfixed,graph-profile,2.06860825,4.15251877
+2,-pin,graph-profile,2.0192155,4.25409501
+2,-pin,plain,1.99590575,4.30377767

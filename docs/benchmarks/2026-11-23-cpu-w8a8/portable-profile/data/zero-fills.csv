@@ -1,0 +1,7 @@
+rows,n,k,layout,symbol,return_offset,calls,bytes
+128,2048,2048,raw,velri_slang_avx512_linear_w8a8_f32,0x23bd,2048,1048576
+128,2048,2048,packed,velri_slang_avx512_linear_w8a8_f32_packed,0x2e10,2048,1048576
+64,4096,4096,raw,velri_slang_avx512_linear_w8a8_f32,0x23bd,4096,2097152
+64,4096,4096,packed,velri_slang_avx512_linear_w8a8_f32_packed,0x2e10,4096,2097152
+256,4096,4096,raw,velri_slang_avx512_linear_w8a8_f32,0x23bd,4096,2097152
+256,4096,4096,packed,velri_slang_avx512_linear_w8a8_f32_packed,0x2e10,4096,2097152

@@ -1,0 +1,10 @@
+series,rep,calls,calls_with_collocated_start_cpu,calls_with_start_after_1ms,calls_with_worker_wall_minus_threadcpu_above_0.5ms,calls_with_1ms_after_last_kernel,median_graph_ms,median_latest_worker_start_ms,median_after_last_kernel_ms
+original,0,36,36,35,25,0,4.854797,1.918158,0.00035
+original,1,36,36,36,0,35,5.9997145,2.999755,1.150447
+original,2,36,0,0,0,0,2.218294,0.0009400000000000001,0.00036
+repeat-pinned,0,36,0,0,0,0,1.9924879999999998,0.00122,0.00044
+repeat,0,36,0,0,0,0,1.9910685,0.000875,0.00023
+repeat-pinned,1,36,0,0,0,0,1.992333,0.001075,0.00035000000000000005
+repeat,1,36,0,0,0,0,2.005423,0.0009,0.00027
+repeat-pinned,2,36,0,0,0,0,2.0283379999999998,0.00121,0.00046
+repeat,2,36,0,0,0,0,2.0830080000000004,0.001165,0.000435
