@@ -269,14 +269,77 @@ static bool gemv_residual(velri_backend_device *dev, const velri_submit_item *it
     return true;
 }
 
+/* Quantize once per workgroup. Group zero also publishes both original outputs
+ * for any later consumer of the quantized row or its scale. */
+static bool quantized_gemv(const velri_backend_device *dev, const velri_submit_item *items,
+                           const vk_encoded_dispatch *e, vk_encoded_dispatch *out) {
+    VkPipeline pipe = dev->pipes[PIPE_QUANT_GEMV_W8A8];
+    if (!pipe || !single_stage(dev, e + 1, PIPE_GEMV_W8A8))
+        return false;
+    vk_quantize_row_args q;
+    vk_linear_args linear;
+    memcpy(&q, e[0].stages[0].pc, sizeof(q));
+    memcpy(&linear, e[1].stages[0].pc, sizeof(linear));
+    if (q.rows != 1U || linear.rows != 1U || q.k != linear.k || q.k > 2048U ||
+        ((q.k | linear.w_stride) & 15U) || ((q.x | linear.w) & 15U) || (q.x_i8 & 3U) ||
+        q.x_i8 != linear.x || q.scale_out != linear.x_scale || !linear.w_scale || linear.bias)
+        return false;
+
+    const device_span reads[] = {input_span(items, 0), input_span(items + 1, 1),
+                                 input_span(items + 1, 4)};
+    const device_span writes[] = {output_span(items, 0), output_span(items, 1),
+                                  output_span(items + 1, 0)};
+    if (!independent(reads, 3U, writes, 3U))
+        return false;
+    const vk_quant_gemv_args args = {
+        .x = q.x, .x_i8 = q.x_i8, .scale_out = q.scale_out,
+        .weights = linear.w, .weight_scale = linear.w_scale, .y = linear.y,
+        .channels = linear.m, .k4 = q.k / 4U, .stride16 = linear.w_stride / 16U,
+    };
+    const uint32_t gx = velri_div_ceil_u32(linear.m, VK_ROW_WG_SIZE / dev->subgroup_size);
+    *out = e[1];
+    set_dispatch_stage(&out->stages[0], pipe, &args, sizeof(args), gx, 1U, 1U);
+    return true;
+}
+
+static bool rms_quantize(const velri_backend_device *dev, const velri_submit_item *quant,
+                         const vk_encoded_dispatch *encoded, const decode_norm *norm,
+                         vk_encoded_dispatch *out) {
+    VkPipeline pipe = dev->pipes[PIPE_RMS_QUANT];
+    if (!pipe || !single_stage(dev, encoded, PIPE_QUANTIZE_ROW_F32_I8))
+        return false;
+    vk_quantize_row_args q;
+    memcpy(&q, encoded->stages[0].pc, sizeof(q));
+    const vk_rms_norm_args *n = &norm->args;
+    if (q.rows != 1U || q.k != n->dim || q.x != n->y || (q.x_i8 & 3U))
+        return false;
+    /* Every lane reads its own input before writing the same elements for in-place RMS. */
+    const device_span reads[] = {norm->weight, norm->input};
+    const device_span writes[] = {norm->output, output_span(quant, 0), output_span(quant, 1)};
+    if (!independent(reads, n->x == n->y ? 1U : 2U, writes, 3U))
+        return false;
+    const vk_rms_quant_args args = {.x = n->x, .weight = n->w, .normalized = n->y,
+                                    .quantized = q.x_i8, .scale = q.scale_out,
+                                    .dim = n->dim, .eps = n->eps};
+    *out = *encoded;
+    set_dispatch_stage(&out->stages[0], pipe, &args, sizeof(args), 1U, 1U, 1U);
+    return true;
+}
+
 uint32_t velri_vk_fuse_decode(velri_backend_device *dev, const velri_submit_item *items,
                               const vk_encoded_dispatch *e, uint32_t count,
                               vk_encoded_dispatch *out) {
     if (dev->subgroup_size != 32U || count < 2U)
         return 0U;
+    if (single_stage(dev, e, PIPE_QUANTIZE_ROW_F32_I8))
+        return quantized_gemv(dev, items, e, out) ? 2U : 0U;
     decode_norm previous;
     const decode_norm *norm = nullptr;
-    if (count >= 4U && read_norm(dev, items, e, &previous)) {
+    if (read_norm(dev, items, e, &previous)) {
+        if (rms_quantize(dev, items + 1, e + 1, &previous, out))
+            return 2U;
+        if (count < 4U)
+            return 0U;
         norm = &previous;
         ++items;
         ++e;

@@ -24,12 +24,10 @@ static uint32_t row_correction(const int8_t *x, size_t depth) {
     (void)depth;
     return 0;
 }
+#endif
 
-static void pack_panel(const int8_t *w, size_t ws, uint8_t *panel, size_t depth) {
-    for (size_t k = 0; k < depth; ++k)
-        for (size_t c = 0; c < NR; ++c)
-            panel[k * NR + c] = (uint8_t)w[c * ws + k];
-}
+#if defined(VELRI_W8A8_USE_VNNI) || defined(__AVX2__)
+#include "w8a8_gemv.h"
 #endif
 
 static inline float scaled_output(uint32_t sum, uint32_t correction, const float *xscale,
@@ -81,7 +79,9 @@ static void run(const int8_t *x, size_t xs, const int8_t *w, size_t ws, bool pac
 #endif
 
     enum { ROW_BLOCK = 128 };
+#if defined(VELRI_W8A8_USE_VNNI)
     alignas(64) uint8_t scratch[KC * NR];
+#endif
     alignas(64) uint32_t sums[ROW_BLOCK * NR];
     uint32_t corrections[ROW_BLOCK];
     for (size_t rb = r0; rb < r1; rb += ROW_BLOCK) {
@@ -112,6 +112,7 @@ static void run(const int8_t *x, size_t xs, const int8_t *w, size_t ws, bool pac
 #endif
             for (size_t k = 0; k < depth; k += block_depth) {
                 size_t n = depth - k < block_depth ? depth - k : block_depth;
+#if defined(VELRI_W8A8_USE_VNNI)
                 const uint8_t *block;
                 if (packed) {
                     block = (const uint8_t *)w + c * depth + k * NR;
@@ -119,11 +120,12 @@ static void run(const int8_t *x, size_t xs, const int8_t *w, size_t ws, bool pac
                     pack_panel(w + c * ws + k, ws, scratch, n);
                     block = scratch;
                 }
-#if defined(VELRI_W8A8_USE_VNNI)
                 const panel_output *last = k + n == depth ? &output : nullptr;
                 multiply_panel(x + rb * xs + k, xs, block, n, sums, NR, height, k == 0, last);
 #else
-                multiply_panel(x + rb * xs + k, xs, block, n, sums, NR, height, k == 0);
+                const int8_t *block = packed ? w + c * depth + k * NR : w + c * ws + k;
+                multiply_panel(x + rb * xs + k, xs, block, packed ? 0 : ws, n, sums, NR, height,
+                               k == 0);
 #endif
             }
 #if !defined(VELRI_W8A8_USE_VNNI)
@@ -141,6 +143,9 @@ static void run(const int8_t *x, size_t xs, const int8_t *w, size_t ws, bool pac
 const velri_w8a8_kernel VELRI_W8A8_VARIANT = {
 #if defined(VELRI_W8A8_USE_VNNI)
     .pack = pack_weights,
+#endif
+#if defined(VELRI_W8A8_USE_VNNI) || defined(__AVX2__)
+    .raw_gemv = raw_gemv,
 #endif
     .run = run,
 };

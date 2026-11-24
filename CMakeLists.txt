@@ -100,6 +100,12 @@ if(UNIX)
     target_link_libraries(velri_engine PRIVATE m)
 endif()
 
+if(VELRI_BUILD_BENCHMARKS AND VELRI_LIB_SOURCE_DIR)
+    add_executable(bench_session tools/bench_session.c)
+    target_include_directories(bench_session PRIVATE tests "${VELRI_LIB_SOURCE_DIR}/src/platform")
+    target_link_libraries(bench_session PRIVATE velri_engine VelriLib::velri)
+endif()
+
 # Integration & End-to-End Model Tests
 if(BUILD_TESTING)
     add_executable(test_velri_lib tests/integration/velri_lib.c)

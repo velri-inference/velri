@@ -68,6 +68,8 @@ For a long single-token decode with a binary16 cache, 64-dimensional Q/K/V heads
 
 The Vulkan encoder recognizes adjacent dense F32 projections in a single-token graph. It can combine Q/K/V with full, half-layout RoPE and KV append, gate/up with SiLU and multiplication, and a projection with residual addition. A preceding weighted RMSNorm on an aligned row of up to 2048 elements can run in the projection workgroup. Group zero writes the normalized row, and the projections materialize all outputs visible in the original graph. Physical buffer-span checks exclude cross-workgroup aliases. Unsupported strides, shapes, and subgroups use the original operations.
 
+For single-token W8A8, adjacent weighted FP32 RMSNorm and row quantization can share a workgroup. A quantization followed by a bias-free W8A8 GEMV can also share a dispatch for aligned rows up to 2048 elements. Both forms publish the intermediate results for other graph consumers. At 64 active rows, eligible cooperative-matrix projections use 64 × 32 output tiles and read 128 input bytes per channel per depth step.
+
 ---
 
 ## 4. CPU Path: Slang-First and Slang CPU Backend Improvement Plan
@@ -79,6 +81,8 @@ The target CPU strategy is **Slang-first for all optimized kernels** from the sh
 - **simple independent C23 reference implementations** for correctness checks without involving the Slang compiler.
 
 The temporary CPU W8A8 path is enabled by default. Set `-DVELRI_C23_W8A8=OFF` to build the Slang-only path. For matrices with channel count divisible by 64 and depth divisible by 64 and at least 256, C23 computes tiled GEMM over signed 32-channel panels on every supported CPU. The x86 dispatcher can also select AVX2 or AVX-512 VNNI. VNNI uses biased weights interleaved in depth quartets across 64 channels and reserves exactly M × K bytes for prepared weights before allocator alignment. It uses the same packed bytes for decode. Other shapes use the existing Slang kernels.
+
+For single-row decode with eligible raw weights, AVX2 accumulates signed byte pairs with an exact sign correction and AVX-512 VNNI processes up to sixteen output channels at a time. Dense single-row FP32 projections on vectorized x86 targets stream one weight row at a time from depth 256. The dispatcher checks physical output overlap before changing the traversal order.
 
 ### Out-of-the-box Slang CPU limits and improvement strategy
 Slang supports CPU emission via LLVM (`slang-llvm`: LLVM IR / `.o`) and C++. We account for its practical limits explicitly:

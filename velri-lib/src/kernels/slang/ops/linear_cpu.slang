@@ -319,13 +319,20 @@ public void linear_slice_cpu<let MR : int, let NR : int,
     Ptr<TW.Storage, Access.Read> w, uint w_stride,
     Ptr<TY.Storage> y, uint y_stride,
     uint r0, uint r1, uint c0, uint c1, uint k,
-    EpilogueParams ep)
+    EpilogueParams ep, bool stream_weights = false)
 {
     uint nrows = r1 - r0;
     if (nrows < kGemvRowThreshold) {
         for (uint r = r0; r < r1; ++r) {
             Ptr<TX.Storage, Access.Read> xr = x + uint64_t(r) * uint64_t(x_stride);
             Ptr<TY.Storage> yr = y + uint64_t(r) * uint64_t(y_stride);
+            if (stream_weights) {
+                // Traverse a dense matrix sequentially while the activation stays in cache.
+                for (uint c = c0; c < c1; ++c)
+                    gemv_1row<TX, TW, TY, Ep>(xr, w + uint64_t(c) * uint64_t(w_stride),
+                                              yr, r, c, k, ep);
+                continue;
+            }
             uint c = c0;
             for (; c + 4u <= c1; c += 4u) {
                 gemv_4rows<TX, TW, TY, Ep>(xr, w, w_stride, yr, r, c, k, ep);

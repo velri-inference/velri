@@ -1,6 +1,7 @@
 #include "reference.h"
 #include "cpu/guard_buffer.h"
 #include "velri_lib/velri_lib.h"
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,7 @@ static velri_view_id add_view_3d_strided(velri_graph *g, velri_storage_id sid, v
 typedef enum {
     LINEAR_RANDOM,
     LINEAR_F16_MATMUL,
+    LINEAR_DYNAMIC_W8A8,
     LINEAR_W8A8_EXTREMES,
     LINEAR_PACKED_W8A8_EXTREMES,
 } linear_fixture;
@@ -135,6 +137,7 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
                               size_t k, size_t x_pad, size_t w_pad, size_t y_pad, bool with_bias,
                               double tol, linear_fixture fixture) {
     const bool allow_f16_matmul = fixture == LINEAR_F16_MATMUL;
+    const bool dynamic = fixture == LINEAR_DYNAMIC_W8A8;
     const bool pack = fixture == LINEAR_PACKED_W8A8_EXTREMES;
     const bool w8a8_extremes = pack || fixture == LINEAR_W8A8_EXTREMES;
     size_t xs = k + x_pad, ws = k + w_pad, ys = m + y_pad;
@@ -146,7 +149,8 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     CHECK_OK(velri_graph_create(&g), "graph");
     velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, desc.x_dtype, rows * xs, dev);
     velri_storage_id sw = add_store(g, VELRI_STORAGE_WEIGHT, desc.w_dtype, m * ws, dev);
-    velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, desc.y_dtype, rows * ys, dev);
+    velri_storage_id sy = add_store(g, dynamic ? VELRI_STORAGE_STATE : VELRI_STORAGE_OUTPUT,
+                                    desc.y_dtype, rows * ys, dev);
     velri_storage_id sb = with_bias ? add_store(g, VELRI_STORAGE_WEIGHT, desc.y_dtype, m, dev) : 0U;
     velri_storage_id sxs = desc.has_x_scale ? add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows, dev) : 0U;
     velri_storage_id sws = desc.has_w_scale ? add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m, dev) : 0U;
@@ -163,6 +167,7 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
             desc.has_w_scale ? add_view_1d(g, sws, VELRI_DTYPE_F32, m, 0U) : VELRI_INVALID_ID,
         },
         .outputs = {add_view_2d_strided(g, sy, desc.y_dtype, rows, m, ys)},
+        .dynamic_seq = dynamic,
         .attr.linear = {.desc = desc, .allow_f16_matmul = allow_f16_matmul},
     };
     CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "add linear");
@@ -212,7 +217,27 @@ static void verify_linear_one(velri_context *ctx, velri_device_id dev, const cha
     if (desc.has_x_scale) {
         CHECK_OK(velri_slot_bind_host(slot, sxs, hxs, rows * sizeof(float)), "bind xs");
     }
-    CHECK_OK(velri_slot_run(slot, nullptr, nullptr), label);
+    if (dynamic) {
+        const uint32_t lengths[] = {1U, 63U, 64U, 65U};
+        for (size_t i = 0U; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
+            const float guard = 1234.5f;
+            const velri_step_params step = {.has_seq_len = true, .seq_len_override = lengths[i]};
+            float *out = hy;
+            for (size_t j = 0U; j < rows * ys; ++j) out[j] = guard;
+            CHECK_OK(velri_slot_sync_state_from_host(slot, sy), "initialize dynamic output guards");
+            CHECK_OK(velri_slot_run(slot, &step, nullptr), "dynamic W8A8 projection");
+            CHECK_OK(velri_slot_sync_state_to_host(slot, sy), "read guarded dynamic projection");
+            CHECK(velri_test_max_abs_diff_2d(desc.y_dtype, hy_ref, hy, lengths[i], m, ys) <= tol,
+                  "active W8A8 rows match the reference");
+            for (size_t r = 0U; r < rows; ++r) {
+                for (size_t c = r < lengths[i] ? m : 0U; c < ys; ++c) {
+                    CHECK(out[r * ys + c] == guard, "inactive W8A8 rows and padding retain guards");
+                }
+            }
+        }
+    } else {
+        CHECK_OK(velri_slot_run(slot, nullptr, nullptr), label);
+    }
     CHECK(velri_slot_last_run_allocs(slot) == 0U, "0 hot-path allocs on linear");
 
     size_t checked_cols = w8a8_extremes ? ys : m;
@@ -843,10 +868,172 @@ static void verify_dynamic_prompt_linear(velri_context *ctx, velri_device_id dev
     velri_graph_destroy(g);
 }
 
+static void verify_rms_quantize_outputs(velri_context *ctx, velri_device_id dev, bool inplace) {
+    enum { k = 1040, pad = 16, stride = k + pad };
+    const velri_dtype dt = VELRI_DTYPE_F32;
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "RMS quantize graph");
+    velri_storage_id x = add_store(g, VELRI_STORAGE_STATE, dt, stride, dev);
+    velri_storage_id norm = inplace ? x : add_store(g, VELRI_STORAGE_STATE, dt, stride, dev);
+    velri_storage_id w = add_store(g, VELRI_STORAGE_WEIGHT, dt, k, dev);
+    velri_storage_id q = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_I8, stride, dev);
+    velri_storage_id scale = add_store(g, VELRI_STORAGE_STATE, dt, 1, dev);
+    velri_view_id nx = add_view_2d_strided(g, norm, dt, 1, k, stride);
+    velri_op_desc rms = {
+        .kind = VELRI_OP_RMSNORM, .num_inputs = 2, .num_outputs = 1,
+        .inputs = {add_view_2d_strided(g, x, dt, 1, k, stride), add_view_1d(g, w, dt, k, 0)},
+        .outputs = {nx}, .attr.rmsnorm = {.eps = 3.0f},
+    };
+    velri_op_desc quant = {
+        .kind = VELRI_OP_QUANTIZE_ROW, .num_inputs = 1, .num_outputs = 2, .inputs = {nx},
+        .outputs = {add_view_2d_strided(g, q, VELRI_DTYPE_I8, 1, k, stride), add_view_1d(g, scale, dt, 1, 0)},
+    };
+    CHECK_OK(velri_graph_add_op(g, &rms, dev, nullptr), "add RMS before quantization");
+    CHECK_OK(velri_graph_add_op(g, &quant, dev, nullptr), "quantize normalized row");
+    velri_plan *plan = nullptr;
+    velri_status status = velri_plan_prepare(ctx, g, nullptr, &plan);
+    if (status == VELRI_ERR_UNSUPPORTED) {
+        velri_graph_destroy(g);
+        return;
+    }
+    CHECK_OK(status, "prepare RMS quantize");
+    float gamma[k], input[stride], normalized[stride], expected[stride], actual_scale, expected_scale;
+    int8_t bytes[stride], expected_bytes[stride];
+    float *actual = inplace ? input : normalized;
+    for (size_t j = 0; j < k; ++j) gamma[j] = (float)((int)(j % 255U) - 127);
+    gamma[17] = -0.0f;
+    CHECK_OK(velri_plan_bind_weight_host(plan, w, gamma, sizeof(gamma)), "bind RMS gamma");
+    velri_slot *slot = nullptr;
+    CHECK_OK(velri_slot_create(plan, &slot), "RMS quantize slot");
+    CHECK_OK(velri_slot_bind_host(slot, x, input, sizeof(input)), "bind RMS input");
+    if (!inplace) CHECK_OK(velri_slot_bind_host(slot, norm, actual, sizeof(normalized)), "bind RMS output");
+    CHECK_OK(velri_slot_bind_host(slot, q, bytes, sizeof(bytes)), "bind quantized RMS output");
+    CHECK_OK(velri_slot_bind_host(slot, scale, &actual_scale, sizeof(actual_scale)), "bind RMS row scale");
+    for (int run = 0; run < 2; ++run) {
+        for (size_t j = 0; j < stride; ++j) input[j] = normalized[j] = expected[j] = 1234.5f;
+        for (size_t j = 0; j < k; ++j) input[j] = run == 0 ? ((j & 1U) ? -1.0f : 1.0f) : 0.0f;
+        memset(bytes, 0x5a, sizeof(bytes));
+        memcpy(expected_bytes, bytes, sizeof(bytes));
+        actual_scale = -1.0f;
+        ref_rmsnorm(dt, dt, 1, k, rms.attr.rmsnorm.eps, false, input, stride, gamma, expected, stride);
+        // The aligned Vulkan RMS adds a zero offset to gamma before multiplying the input.
+        expected[17] = copysignf(0.0f, input[17]);
+        ref_quantize_row_f32_i8(1, k, expected, stride, expected_bytes, stride, &expected_scale);
+        CHECK_OK(velri_slot_sync_state_from_host(slot, x), "upload RMS input and guards");
+        if (!inplace) CHECK_OK(velri_slot_sync_state_from_host(slot, norm), "upload normalized row guards");
+        CHECK_OK(velri_slot_sync_state_from_host(slot, q), "upload quantized row guards");
+        CHECK_OK(velri_slot_sync_state_from_host(slot, scale), "initialize row scale");
+        CHECK_OK(velri_slot_run(slot, nullptr, nullptr), "normalize and quantize");
+        CHECK_OK(velri_slot_sync_state_to_host(slot, norm), "read normalized row");
+        CHECK_OK(velri_slot_sync_state_to_host(slot, q), "read quantized row");
+        CHECK_OK(velri_slot_sync_state_to_host(slot, scale), "read scale");
+        CHECK(memcmp(actual, expected, sizeof(expected)) == 0, "normalized row and guards match reference");
+        CHECK(memcmp(bytes, expected_bytes, sizeof(bytes)) == 0 && actual_scale == expected_scale,
+              "quantized row, guard bytes and scale match reference");
+    }
+    velri_slot_destroy(slot);
+    velri_plan_destroy(plan);
+    velri_graph_destroy(g);
+}
+
+static void verify_quantized_gemv_outputs(velri_context *ctx, velri_device_id dev, size_t k) {
+    enum { m = 259, guard = 16, y_offset = 2 * guard };
+    const size_t w_stride = k + 16, q_bytes = k + 2 * guard;
+    const velri_linear_desc desc = velri_desc_w8a8_f32();
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "quantized GEMV graph");
+    velri_storage_id x = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, k, dev);
+    velri_storage_id q = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_I8, q_bytes, dev);
+    velri_storage_id result = add_store(g, VELRI_STORAGE_STATE, VELRI_DTYPE_F32, y_offset + m + guard, dev);
+    velri_storage_id w = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_I8, m * w_stride, dev);
+    velri_storage_id ws = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m, dev);
+
+    velri_tensor_view q_view, y_view;
+    CHECK_OK(velri_tensor_view_contiguous(q, VELRI_DTYPE_I8, 2, (size_t[]){1, k}, guard, &q_view),
+             "guarded quantized row");
+    CHECK_OK(velri_tensor_view_contiguous(result, VELRI_DTYPE_F32, 2, (size_t[]){1, m},
+                                          y_offset * sizeof(float), &y_view), "guarded projection");
+    velri_view_id q_row, y_row;
+    CHECK_OK(velri_graph_add_view(g, &q_view, &q_row), "add quantized row");
+    CHECK_OK(velri_graph_add_view(g, &y_view, &y_row), "add projection");
+    velri_view_id scale = add_view_1d(g, result, VELRI_DTYPE_F32, 1, guard * sizeof(float));
+    velri_op_desc quant = {
+        .kind = VELRI_OP_QUANTIZE_ROW, .num_inputs = 1, .num_outputs = 2,
+        .inputs = {add_view_2d_strided(g, x, VELRI_DTYPE_F32, 1, k, k)},
+        .outputs = {q_row, scale},
+    };
+    velri_op_desc linear = {
+        .kind = VELRI_OP_LINEAR, .num_inputs = 5, .num_outputs = 1,
+        .inputs = {q_row, add_view_2d_strided(g, w, VELRI_DTYPE_I8, m, k, w_stride),
+                   VELRI_INVALID_ID, scale, add_view_1d(g, ws, VELRI_DTYPE_F32, m, 0)},
+        .outputs = {y_row}, .attr.linear.desc = desc,
+    };
+    CHECK_OK(velri_graph_add_op(g, &quant, dev, nullptr), "add resident quantization");
+    CHECK_OK(velri_graph_add_op(g, &linear, dev, nullptr), "add adjacent W8A8 projection");
+    velri_plan *plan = nullptr;
+    velri_status status = velri_plan_prepare(ctx, g, nullptr, &plan);
+    if (status == VELRI_ERR_UNSUPPORTED) {
+        velri_graph_destroy(g);
+        return;
+    }
+    CHECK_OK(status, "prepare adjacent quantization and GEMV");
+    int8_t *weights = xcalloc(m * w_stride, sizeof(*weights));
+    uint64_t rng = 0x735411U;
+    velri_test_fill_dtype(VELRI_DTYPE_I8, weights, m * w_stride, &rng, 1.0f);
+    float scales[m];
+    for (size_t c = 0; c < m; ++c) scales[c] = (float)(1U << (c % 4U));
+    CHECK_OK(velri_plan_bind_weight_host(plan, w, weights, m * w_stride), "quantized GEMV weights");
+    CHECK_OK(velri_plan_bind_weight_host(plan, ws, scales, sizeof(scales)), "quantized GEMV weight scales");
+    velri_slot *slot = nullptr;
+    CHECK_OK(velri_slot_create(plan, &slot), "quantized GEMV slot");
+    float *input = xcalloc(k, sizeof(*input));
+    int8_t *quantized = xcalloc(q_bytes, 1), *expected_q = xcalloc(q_bytes, 1);
+    float output[y_offset + m + guard], expected[y_offset + m + guard];
+    CHECK_OK(velri_slot_bind_host(slot, x, input, k * sizeof(*input)), "bind resident row");
+    CHECK_OK(velri_slot_bind_host(slot, q, quantized, q_bytes), "bind guarded I8 output");
+    CHECK_OK(velri_slot_bind_host(slot, result, output, sizeof(output)), "bind guarded F32 outputs");
+
+    const float amplitudes[] = {0.125f, FLT_MIN, 0.0f};
+    for (size_t i = 0; i < sizeof(amplitudes) / sizeof(amplitudes[0]); ++i) {
+        for (size_t j = 0; j < k; ++j) input[j] = (float)((int)(j * 37U % 255U) - 127) * amplitudes[i];
+        memset(quantized, 0x5a, q_bytes);
+        memcpy(expected_q, quantized, q_bytes);
+        for (size_t j = 0; j < y_offset + m + guard; ++j) output[j] = -12345.0f;
+        memcpy(expected, output, sizeof(expected));
+        ref_quantize_row_f32_i8(1, k, input, k, expected_q + guard, k, expected + guard);
+        ref_linear_run(&desc, 1, m, k, expected_q + guard, k, expected + guard,
+                       weights, w_stride, scales, nullptr, expected + y_offset, m);
+
+        CHECK_OK(velri_slot_sync_state_from_host(slot, x), "upload quantization input");
+        CHECK_OK(velri_slot_sync_state_from_host(slot, q), "upload I8 guards");
+        CHECK_OK(velri_slot_sync_state_from_host(slot, result), "upload F32 guards");
+        CHECK_OK(velri_slot_run(slot, nullptr, nullptr), "quantize and project on device");
+        CHECK_OK(velri_slot_sync_state_to_host(slot, q), "read quantized bytes");
+        CHECK_OK(velri_slot_sync_state_to_host(slot, result), "read row scale and projection");
+        CHECK(memcmp(quantized, expected_q, q_bytes) == 0, "quantized bytes and guards");
+        CHECK(memcmp(output, expected, sizeof(output)) == 0, "row scale, projected values and guards");
+    }
+    velri_slot_destroy(slot);
+    velri_plan_destroy(plan);
+    velri_graph_destroy(g);
+    free(expected_q);
+    free(quantized);
+    free(input);
+    free(weights);
+}
+
 static void verify_all_ops_on_device(velri_context *ctx, velri_device_id dev, const char *tag,
                                      bool is_gpu) {
     if (is_gpu) {
         verify_dynamic_prompt_linear(ctx, dev);
+        verify_rms_quantize_outputs(ctx, dev, false);
+        verify_rms_quantize_outputs(ctx, dev, true);
+        verify_quantized_gemv_outputs(ctx, dev, 768U);
+        verify_quantized_gemv_outputs(ctx, dev, 1040U);
+        verify_linear_one(ctx, dev, tag, "dynamic W8A8 short tile", velri_desc_w8a8_f32(),
+                          65U, 96U, 384U, 16U, 32U, 3U, true, 2e-4, LINEAR_DYNAMIC_W8A8);
+        verify_linear_one(ctx, dev, tag, "dynamic W8A8 odd strides", velri_desc_w8a8_f32(),
+                          65U, 95U, 383U, 2U, 4U, 3U, true, 2e-4, LINEAR_DYNAMIC_W8A8);
         verify_linear_one(ctx, dev, tag, "mixed GEMM 64 rows", velri_desc_f32(),
                           64U, 81U, 37U, 3U, 4U, 2U, false, 3e-5, LINEAR_F16_MATMUL);
         verify_linear_one(ctx, dev, tag, "mixed GEMM 65 rows + bias", velri_desc_f32(),
@@ -2457,6 +2644,9 @@ int main(void) {
         verify_all_ops_on_device(ctx, cpu_dev, vnames[vi], false);
         verify_scalar_w8a8_scale_binding(ctx, cpu_dev);
         verify_w8a8_weight_packing(ctx, cpu_dev, vars[vi]);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "W8A8 raw GEMV signed pairs and wrapping sum",
+                          velri_desc_w8a8_f32(), 1U, 64U, 132160U, 3U, 5U, 7U, true,
+                          0.0, LINEAR_W8A8_EXTREMES);
         verify_linear_one(ctx, cpu_dev, vnames[vi], "W8A8 raw C23 panels",
                           velri_desc_w8a8_f32(), 7U, 256U, 320U, 3U, 5U, 7U, true,
                           0.0, LINEAR_W8A8_EXTREMES);

@@ -36,6 +36,18 @@ Standalone builds enable tests (`test_kernels` and `test_core_contract`) by defa
 - `VELRI_SLANG_CPU_MODE` (`AUTO`): `AUTO` (uses target-neutral `LLVM_IR -> Clang` when Clang matches `slangc`'s LLVM version, falling back to `OBJECT` for GCC or older Clang), `LLVM_IR`, or `OBJECT`.
 - `VELRI_SLANG_TARGET_TRIPLE`: optional explicit LLVM target triple used only in `OBJECT` fallback mode.
 
+### Decode projection benchmarks
+
+Build with `VELRI_BUILD_BENCHMARKS=ON` and run the applicable commands three times to compare independent runs.
+
+```sh
+build/bench_slang_cpu --decode --workers 16 --isa avx2
+build/bench_slang_cpu --decode --workers 16 --isa avx512
+build/bench_vulkan --decode
+```
+
+Omit `--isa` for automatic CPU dispatch or use `--isa base` for the portable path. Each CSV row measures one public graph projection. The 1-row and 64-row cases cycle through distinct 14336 × 4096 weight buffers. The smaller 64-row case reuses a 2048 × 2048 weight matrix. Multiply-accumulate counts as two operations. `ops_per_byte` counts one logical read of each input, weight and scale and one write of each result. The 64-row case models requests sharing weights in one dispatch. A session generating 64 consecutive tokens runs 64 dependent decode steps.
+
 ### Cross-Compilation (Any OS & CPU Architecture)
 
 With a compatible **Clang** (`LLVM_IR` mode, automatic), `slangc` emits target-neutral LLVM IR (`.ll`) and CMake's own Clang compiles it for whatever OS and CPU architecture the toolchain targets — **Linux (x86-64, AArch64, RISC-V 64 / RVV 1.0)**, **Windows (x86-64, ARM64)**, **Android (`arm64-v8a`, `x86_64`)**, and **macOS** — without hardcoding triples. `src/platform/` selects native OS threads (`pthreads` on POSIX/Android, Win32 threads on Windows) and Vulkan dynamic loading (`libvulkan.so.1`/`libvulkan.so`, `vulkan-1.dll`, or `libvulkan.1.dylib`/`libMoltenVK.dylib`). For GCC or older Clang, `AUTO` falls back to `slangc -target host-object-code` (x86-64 and AArch64):

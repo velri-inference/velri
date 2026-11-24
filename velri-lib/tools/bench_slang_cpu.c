@@ -1,3 +1,4 @@
+#include "bench_decode.h"
 #include "os.h"
 #include "pool.h"
 #include "reference.h"
@@ -213,7 +214,7 @@ static cpu_ceilings measure_cpu_ceilings(size_t nw) {
 
 /* ---- Linear Graph Benchmark Helper (via public VelriLib Graph/Slot API) ---- */
 static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_linear_desc d,
-                               size_t rows, size_t m, size_t k, size_t ring_len, size_t samples,
+                               size_t rows, size_t m, size_t k, size_t ring_len, size_t samples, size_t replays,
                                bool pack_weights) {
     size_t xb = velri_dtype_bytes(d.x_dtype);
     size_t wb = velri_dtype_bytes(d.w_dtype);
@@ -300,8 +301,9 @@ static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_li
     double times[16];
     for (size_t s = 0; s < samples; ++s) {
         double t0 = now_sec();
-        check_ok(velri_slot_run(slot, nullptr, nullptr), "run");
-        times[s] = (now_sec() - t0) / (double)ring_len;
+        for (size_t replay = 0; replay < replays; ++replay)
+            check_ok(velri_slot_run(slot, nullptr, nullptr), "run");
+        times[s] = (now_sec() - t0) / (double)(ring_len * replays);
     }
 
     velri_slot_destroy(slot);
@@ -316,19 +318,36 @@ static double bench_linear_sec(velri_context *ctx, velri_device_id dev, velri_li
 
 int main(int argc, char **argv) {
     size_t nw = 0U;
+    bool decode = false;
+    velri_cpu_variant isa = VELRI_CPU_AUTO;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) nw = (size_t)atoi(argv[++i]);
+        if (strcmp(argv[i], "--decode") == 0) {
+            decode = true;
+        } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
+            char *end;
+            long value = strtol(argv[++i], &end, 10);
+            if (end == argv[i] || *end || value < 1 || value > VELRI_POOL_MAX_WORKERS) return 2;
+            nw = (size_t)value;
+        } else if (strcmp(argv[i], "--isa") == 0 && i + 1 < argc) {
+            const char *name = argv[++i];
+            if (!strcmp(name, "base")) isa = VELRI_CPU_BASE;
+            else if (!strcmp(name, "avx2")) isa = VELRI_CPU_AVX2;
+            else if (!strcmp(name, "avx512")) isa = VELRI_CPU_AVX512;
+            else return 2;
+        } else {
+            fprintf(stderr, "usage: %s [--workers N] [--decode [--isa base|avx2|avx512]]\n", argv[0]);
+            return 2;
+        }
+    }
+    if (isa != VELRI_CPU_AUTO && (!decode || !velri_cpu_variant_supported(isa))) {
+        fprintf(stderr, "--isa requires --decode and a supported CPU variant\n");
+        return 2;
     }
     const velri_cpu_info *ci = velri_get_cpu_info();
     if (nw == 0U) nw = (size_t)(ci->hardware_threads > 16 ? ci->hardware_threads / 2 : ci->hardware_threads);
     if (nw == 0U) nw = 1U;
 
-    printf("Velri-lib Slang AOT CPU Benchmark (hw_threads=%d, workers=%zu, AVX2=%d, AVX-512=%d)\n",
-           ci->hardware_threads, nw, (int)ci->has_avx2, (int)ci->has_avx512f);
-
-    cpu_ceilings ceil = measure_cpu_ceilings(nw);
-
-    velri_context_config cfg = {.cpu_workers = nw, .cpu_variant = VELRI_CPU_AUTO, .enable_vulkan = false};
+    velri_context_config cfg = {.cpu_workers = nw, .cpu_variant = isa, .enable_vulkan = false};
     velri_context *ctx = nullptr;
     check_ok(velri_context_create(&cfg, &ctx), "ctx");
     velri_device_id dev = 0U;
@@ -348,15 +367,35 @@ int main(int argc, char **argv) {
         {"W8A8(pack)", velri_desc_w8a8_f32(), true},
     };
 
+    if (decode) {
+        decode_csv_header();
+        for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
+            for (size_t j = 0; j < sizeof(decode_shapes) / sizeof(decode_shapes[0]); ++j) {
+                size_t weights = 1U;
+                if (decode_shapes[j].stream)
+                    weights = modes[i].desc.w_dtype == VELRI_DTYPE_I8 ? 16U : 4U;
+                double sec = bench_linear_sec(ctx, dev, modes[i].desc, decode_shapes[j].rows,
+                                              decode_shapes[j].m, decode_shapes[j].k, weights, 7U,
+                                              weights == 1U ? 16U : 1U, modes[i].pack_weights);
+                decode_csv_row(modes[i].name, modes[i].desc, j, weights, sec * 1000.0);
+            }
+        }
+        velri_context_destroy(ctx);
+        return 0;
+    }
+
+    printf("Velri-lib Slang AOT CPU Benchmark (hw_threads=%d, workers=%zu, AVX2=%d, AVX-512=%d)\n",
+           ci->hardware_threads, nw, (int)ci->has_avx2, (int)ci->has_avx512f);
+
+    cpu_ceilings ceil = measure_cpu_ceilings(nw);
+
     printf("\n=== Cold-DRAM GEMV (rows=1, M=4096, K=4096, ring=8) ===\n");
     printf("%-11s | %11s | %7s\n", "Mode", "Throughput", "%DRAM");
     printf("------------+-------------+--------\n");
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
         velri_linear_desc d = modes[i].desc;
-        double sec = bench_linear_sec(ctx, dev, d, 1U, 4096U, 4096U, 8U, 5U, modes[i].pack_weights);
-        double bytes = (double)(4096U * 4096U * velri_dtype_bytes(d.w_dtype) +
-                                4096U * velri_dtype_bytes(d.x_dtype) +
-                                4096U * velri_dtype_bytes(d.y_dtype));
+        double sec = bench_linear_sec(ctx, dev, d, 1U, 4096U, 4096U, 8U, 5U, 1U, modes[i].pack_weights);
+        double bytes = (double)linear_logical_bytes(d, 1U, 4096U, 4096U);
         double gbps = bytes / sec / 1e9;
         printf("%-11s | %7.1f GB/s | %6.1f%%\n", modes[i].name, gbps,
                ceil.bw_read_gbps > 0.0 ? 100.0 * gbps / ceil.bw_read_gbps : 0.0);
@@ -368,7 +407,7 @@ int main(int argc, char **argv) {
     double ops = 2.0 * 128.0 * 2048.0 * 2048.0;
     for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
         velri_linear_desc d = modes[i].desc;
-        double sec = bench_linear_sec(ctx, dev, d, 128U, 2048U, 2048U, 1U, 5U, modes[i].pack_weights);
+        double sec = bench_linear_sec(ctx, dev, d, 128U, 2048U, 2048U, 1U, 5U, 1U, modes[i].pack_weights);
         double rate = ops / sec / 1e9;
         bool int8 = d.x_dtype == VELRI_DTYPE_I8 && d.w_dtype == VELRI_DTYPE_I8;
         if (int8) {

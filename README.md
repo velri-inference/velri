@@ -28,6 +28,8 @@ ctest --test-dir build --output-on-failure
 
 `slangc` is a build-time AOT tool only (no Slang or LLVM runtime dependency). Default CPU builds require no Vulkan SDK or network access; pass `-DVELRI_ENABLE_VULKAN=ON` to enable the built-in Vulkan 1.3 backend and `-DVELRI_BUILD_BENCHMARKS=ON` to build `bench_slang_cpu` / `bench_vulkan`. For standalone library builds and package installation, see [velri-lib/README.md](velri-lib/README.md).
 
+With benchmarks enabled, `build/bench_session cpu 16` or `build/bench_session vulkan` times 64 consecutive greedy decode steps on one synthetic FP32 Llama session, following a 128-token prompt. It prints total time, latency per token and throughput for three measured sequences after warm-up.
+
 ## Design Principles
 
 - **Composable kernels without copy-paste:** share Slang components (`IElement`, `IActivation`, `IEpilogue`, `IKVSource`) across operations and compile one source across target ISAs and GPU APIs via `slangc` AOT — no duplicate AVX2 vs. AVX-512 kernel sources and zero compiler at runtime.
