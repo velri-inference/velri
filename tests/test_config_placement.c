@@ -1,6 +1,6 @@
 #include "config/placement.h"
 #include "format/json.h"
-#include "model/arch/gpt2.h"
+#include "model/arch_registry.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -504,7 +504,9 @@ static bool run_json_gpt2(velri_context *ctx, const velri_placement_plan *pplan,
     };
     velri_b_init_checked(&b, g, &manifest, pplan->default_store_dev, pplan->default_compute_dev,
                          velri_placement_builder_cb, &ad);
-    CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2 from placement plan");
+    const velri_arch_ops *ops = velri_arch_find(VELRI_ARCH_GPT2);
+    CHECK(ops && ops->build_graph, "registered GPT-2 graph builder");
+    CHECK_OK(ops->build_graph(&b, meta), "build gpt2 from placement plan");
 
     velri_plan *plan = nullptr;
     CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare gpt2");

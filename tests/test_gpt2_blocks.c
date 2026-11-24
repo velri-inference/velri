@@ -1,5 +1,4 @@
-#include "model/arch/gpt2.h"
-#include "model/arch/llama.h"
+#include "model/arch_registry.h"
 #include "model/manifest.h"
 
 #include <math.h>
@@ -39,6 +38,12 @@
             exit(1);                                                                               \
         }                                                                                          \
     } while (0)
+
+static velri_status build_arch(velri_arch arch, velri_builder *b, const velri_model_params *params) {
+    const velri_arch_ops *ops = velri_arch_find(arch);
+    CHECK(ops && ops->build_graph, "registered architecture has a graph builder");
+    return ops->build_graph(b, params);
+}
 
 static float next_rand(uint64_t *rng, float scale) {
     uint64_t x = *rng;
@@ -441,7 +446,7 @@ static void run_gpt2_suite_ex(velri_context *ctx, velri_device_id store_dev,
     velri_builder b;
     velri_b_init(&b, g, &manifest, store_dev, compute_dev, resolve_fn, resolve_user);
 
-    CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2");
+    CHECK_OK(build_arch(VELRI_ARCH_GPT2, &b, meta), "build gpt2");
     CHECK(manifest.token_ids_in != VELRI_INVALID_ID, "manifest recorded token_ids_in");
     CHECK(manifest.logits_out != VELRI_INVALID_ID, "manifest recorded logits_out");
     CHECK(velri_manifest_find_weight(&manifest, "transformer.wte.weight") != nullptr,
@@ -809,7 +814,7 @@ static void test_builder_and_layer_contracts(velri_device_id cpu_dev,
         scope_trace tr = {0};
         velri_builder b;
         velri_b_init(&b, g, &m, cpu_dev, cpu_dev, trace_placement_cb, &tr);
-        CHECK_OK(velri_arch_gpt2_build(&b, meta), "build gpt2 scope trace");
+        CHECK_OK(build_arch(VELRI_ARCH_GPT2, &b, meta), "build gpt2 scope trace");
         CHECK(tr.saw_input_layer && tr.saw_attention && tr.saw_kv_cache && tr.saw_dense_mlp &&
                   tr.saw_lm_head,
               "all engine placement scopes visited");
@@ -1207,7 +1212,7 @@ static void run_llama_suite_ex(velri_context *ctx, velri_device_id default_dev,
     velri_manifest_init(&manifest);
     velri_builder b;
     velri_b_init(&b, g, &manifest, default_dev, default_dev, resolve_fn, resolve_user);
-    CHECK_OK(velri_arch_llama_build(&b, p), "build llama");
+    CHECK_OK(build_arch(VELRI_ARCH_LLAMA, &b, p), "build llama");
 
     CHECK(velri_manifest_find_weight(&manifest, "model.rope.cos") != nullptr &&
               velri_manifest_find_weight(&manifest, "model.rope.sin") != nullptr,

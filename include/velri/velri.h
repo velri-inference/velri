@@ -111,8 +111,13 @@ const char *velri_ctx_last_error(const velri_ctx *ctx);
 
 typedef enum {
     VELRI_ARCH_GPT2 = 0,
-    VELRI_ARCH_LLAMA = 1
+    VELRI_ARCH_LLAMA = 1,
+    VELRI_ARCH_ID_MAX = INT32_MAX /* Upper bound for architecture IDs. */
 } velri_arch;
+
+/* Look up a compiled-in architecture by its exact name. Returns VELRI_RC_ERR_NOT_FOUND
+ * for an unknown name and writes out_arch only on success. */
+velri_rc velri_arch_from_name(const char *name, velri_arch *out_arch);
 
 typedef enum {
     VELRI_TYPE_F32 = 0,

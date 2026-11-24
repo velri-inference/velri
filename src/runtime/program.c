@@ -79,7 +79,7 @@ static velri_rc program_resolve_limits(velri_program *prog, const velri_program_
     } else if (prog->cfg.context_size > 0U) {
         max_ctx = prog->cfg.context_size;
     }
-    if (max_ctx == 0U || (ops->enforces_max_pos_ctx && max_ctx > d->max_position_embeddings)) {
+    if (max_ctx == 0U || (ops->policy->enforces_max_pos_ctx && max_ctx > d->max_position_embeddings)) {
         velri_rt_ctx_set_error(prog->ctx, "program_prepare: invalid max_ctx (%u) for model '%s'",
                                max_ctx, ops->name);
         return VELRI_RC_ERR_INVALID;
@@ -283,7 +283,7 @@ static velri_rc ensure_auto_rope(velri_program *prog) {
 }
 
 static velri_rc bind_program_weights(velri_program *prog) {
-    bool has_auto_rope = prog->model->arch_ops->has_auto_rope;
+    bool has_auto_rope = prog->model->arch_ops->policy->has_auto_rope;
     if (has_auto_rope) {
         bool has_cos = (velri_rt_model_find_weight(prog->model, VELRI_WEIGHT_ROPE_COS) != nullptr);
         bool has_sin = (velri_rt_model_find_weight(prog->model, VELRI_WEIGHT_ROPE_SIN) != nullptr);

@@ -1,0 +1,14 @@
+#include "model/arch_registry.h"
+
+/* A model may initialize arch_policy in its source. C zero-initializes it otherwise. */
+static const velri_arch_policy arch_policy;
+static velri_status build_graph(velri_builder *b, const velri_model_params *params);
+
+#include "model/arch/@arch@.c"
+
+const velri_arch_ops velri_ops_@arch_id@ = {
+    .arch = @arch_id@,
+    .name = "@arch@",
+    .policy = &arch_policy,
+    .build_graph = build_graph,
+};

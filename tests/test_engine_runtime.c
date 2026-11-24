@@ -595,7 +595,6 @@ static void test_llama_auto_rope_and_cancellation(void) {
     CHECK_RC(velri_ctx_create(&copts, &ctx), "ctx create");
 
     velri_model_desc md = {
-        .arch = VELRI_ARCH_LLAMA,
         .vocab_size = 64U,
         .max_position_embeddings = 64U,
         .hidden_size = 64U,
@@ -614,6 +613,12 @@ static void test_llama_auto_rope_and_cancellation(void) {
         .qkv_bias = true, /* Qwen2-style QKV bias */
     };
     velri_model *model = nullptr;
+    CHECK_RC(velri_arch_from_name("llama", &md.arch), "find llama architecture");
+    CHECK(md.arch == VELRI_ARCH_LLAMA, "llama retains its public architecture ID");
+    CHECK(velri_arch_from_name("unknown-architecture", &md.arch) == VELRI_RC_ERR_NOT_FOUND,
+          "unknown architecture name");
+    CHECK(velri_arch_from_name(nullptr, &md.arch) == VELRI_RC_ERR_INVALID, "null architecture name");
+    CHECK(md.arch == VELRI_ARCH_LLAMA, "failed lookup leaves architecture ID intact");
     CHECK_RC(velri_model_create_synthetic(ctx, &md, &model), "llama model");
     weight_pool pool = {0};
     populate_llama_weights(model, &md, &pool); /* Intentionally omits model.rope.cos/sin -> auto! */

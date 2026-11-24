@@ -129,9 +129,9 @@ velri_rc velri_model_create_synthetic(velri_ctx *ctx, const velri_model_desc *de
         velri_rt_ctx_set_error(ctx, "model_create_synthetic: norm_eps must be finite and > 0");
         goto fail;
     }
-    if (arch_ops->validate_desc) {
+    if (arch_ops->policy->validate_desc) {
         char arch_err[192] = {0};
-        rc = arch_ops->validate_desc(&norm, arch_err, sizeof(arch_err));
+        rc = arch_ops->policy->validate_desc(&norm, arch_err, sizeof(arch_err));
         if (rc != VELRI_RC_OK) {
             velri_rt_ctx_set_error(ctx, "model_create_synthetic: %s",
                                    arch_err[0] ? arch_err : "invalid architecture parameters");

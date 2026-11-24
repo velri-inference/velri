@@ -1,4 +1,6 @@
-#include "gpt2.h"
+#include "model/arch_registry.h"
+
+static const velri_arch_policy arch_policy = {.enforces_max_pos_ctx = true};
 
 static const velri_pre_norm_layer_desc k_gpt2_layer = {
     .norm_kind = VELRI_NORM_LAYER,
@@ -26,7 +28,10 @@ static const velri_lm_head_desc k_gpt2_lm_head = {
     .tie_to_if_tied = "transformer.wte.weight",
 };
 
-velri_status velri_arch_gpt2_build(velri_builder *b, const velri_model_params *p) {
+/*
+ * token_ids -> Embedding(wte + wpe) -> N x Pre-LN(Fused-QKV Causal MHA + MLP) -> LMHead(ln_f, wte)
+ */
+static velri_status build_graph(velri_builder *b, const velri_model_params *p) {
     velri_tensor x = velri_layer_embedding(b, p, "transformer.wte.weight", "transformer.wpe.weight");
     x = velri_layers_pre_norm_repeat(b, x, p, &k_gpt2_layer, !k_gpt2_lm_head.full_seq_logits);
     (void)velri_layer_lm_head(b, x, p, &k_gpt2_lm_head);

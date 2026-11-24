@@ -7,22 +7,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/*
- * Declarative Model Architecture Registry.
- *
- * Isolates all architecture-specific rules (validation, max_ctx bounds, RoPE auto-generation,
- * and graph construction) behind a single descriptor table so `src/runtime/`
- * remains completely architecture-agnostic as new models (Qwen3.5, MoE, Gemma4, etc.) are added.
- */
+typedef struct {
+    bool has_auto_rope;
+    bool enforces_max_pos_ctx;
+    velri_rc (*validate_desc)(velri_model_desc *norm, char *err_buf, size_t err_cap);
+} velri_arch_policy;
 
 typedef struct {
     velri_arch arch;
     const char *name;
-    bool has_auto_rope;
-    bool enforces_max_pos_ctx;
-
-    velri_rc (*validate_desc)(velri_model_desc *norm, char *err_buf, size_t err_cap);
-    velri_status (*build_graph)(velri_builder *b, const velri_model_params *mp);
+    const velri_arch_policy *policy;
+    velri_status (*build_graph)(velri_builder *b, const velri_model_params *params);
 } velri_arch_ops;
 
 const velri_arch_ops *velri_arch_find(velri_arch arch);
