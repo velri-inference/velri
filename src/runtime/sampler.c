@@ -101,13 +101,6 @@ void velri_sampler_reset(velri_sampler *s) {
     s->rng_state = s->initial_seed;
 }
 
-void velri_sampler_reseed(velri_sampler *s, uint64_t seed) {
-    if (!s) {
-        return;
-    }
-    s->rng_state = seed;
-}
-
 velri_rc velri_sampler_validate_params(const velri_sampling_params *params) {
     if (!params) {
         return VELRI_RC_ERR_INVALID;

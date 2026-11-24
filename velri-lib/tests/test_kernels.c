@@ -2457,6 +2457,21 @@ int main(void) {
         verify_all_ops_on_device(ctx, cpu_dev, vnames[vi], false);
         verify_scalar_w8a8_scale_binding(ctx, cpu_dev);
         verify_w8a8_weight_packing(ctx, cpu_dev, vars[vi]);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "W8A8 raw C23 panels",
+                          velri_desc_w8a8_f32(), 7U, 256U, 320U, 3U, 5U, 7U, true,
+                          0.0, LINEAR_W8A8_EXTREMES);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 C23 panels",
+                          velri_desc_w8a8_f32(), 7U, 256U, 320U, 0U, 5U, 7U, false,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 decode from aligned panels",
+                          velri_desc_w8a8_f32(), 1U, 256U, 320U, 0U, 5U, 7U, true,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 row and depth block tails",
+                          velri_desc_w8a8_f32(), 131U, 256U, 576U, 3U, 5U, 7U, true,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 partial worker panel and wrapping sum",
+                          velri_desc_w8a8_f32(), 4U, 64U, 132160U, 0U, 3U, 1U, true,
+                          0.0, LINEAR_PACKED_W8A8_EXTREMES);
         verify_linear_one(ctx, cpu_dev, vnames[vi], "packed W8A8 guarded final tile",
                           velri_desc_w8a8_f32(), 8U, 101U, 125U, 0U, 3U, 5U, false,
                           0.0, LINEAR_PACKED_W8A8_EXTREMES);

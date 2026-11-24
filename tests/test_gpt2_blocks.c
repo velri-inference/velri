@@ -657,6 +657,68 @@ static void trace_placement_cb(const char *scope_path, int32_t layer_idx, void *
     }
 }
 
+static void test_tied_replicas(velri_context *ctx, velri_device_id cpu) {
+    velri_graph *g = nullptr;
+    CHECK_OK(velri_graph_create(&g), "tied replicas graph");
+    velri_manifest m;
+    velri_manifest_init(&m);
+    velri_builder b;
+    velri_b_init(&b, g, &m, cpu, cpu, nullptr, nullptr);
+    const size_t dims[] = {4, 4};
+    velri_tensor root = velri_b_weight(&b, "emb", VELRI_DTYPE_F32, 2, dims);
+    velri_b_weight_tied(&b, "c", "emb", VELRI_DTYPE_F32, 2, dims);
+    velri_b_weight_tied(&b, "third", "emb", VELRI_DTYPE_F32, 2, dims);
+    CHECK(root.valid && !velri_manifest_find_weight(&m, "c") && m.num_weights == 1,
+          "local names add no loader bindings");
+    velri_device_id other = cpu + 1U;
+    bool has_vk = velri_context_find_device(ctx, "vulkan", 0U, &other) == VELRI_OK;
+    b.default_store_dev = has_vk ? other : cpu + 1U;
+    velri_tensor a = velri_b_weight_tied(&b, "a", "emb", VELRI_DTYPE_F32, 2, dims);
+    velri_tensor c = velri_b_weight_tied(&b, "c", "emb", VELRI_DTYPE_F32, 2, dims);
+    CHECK(a.valid && c.valid && a.storage_id == c.storage_id && a.view_id == c.view_id &&
+              a.storage_id != root.storage_id, "aliases on one device must reuse its replica");
+    const velri_manifest_entry *alias = velri_manifest_find_weight(&m, "c");
+    CHECK(alias && strcmp(alias->name, "c") == 0 && alias->storage_id == a.storage_id &&
+              strcmp(velri_manifest_weight_source(alias), "emb") == 0,
+          "both remote names remain available to manifest consumers");
+    b.default_store_dev = cpu;
+    velri_tensor back = velri_b_weight_tied(&b, "back", "c", VELRI_DTYPE_F32, 2, dims);
+    CHECK(back.valid && back.storage_id == root.storage_id && m.num_weights == 2 &&
+              velri_graph_storage_count(g) == 2, "chain returns to the original storage");
+
+    if (has_vk) {
+        velri_plan *plan = nullptr;
+        CHECK_OK(velri_plan_prepare(ctx, g, nullptr, &plan), "prepare Vulkan weight replica");
+        alignas(64) float values[16] = {};
+        velri_memory_report memory;
+        CHECK_OK(velri_plan_memory_report(plan, &memory), "replica memory report");
+        CHECK(memory.devices[cpu].weight_bytes == sizeof(values) &&
+                  memory.devices[other].weight_bytes == sizeof(values), "one weight per device");
+        for (uint32_t i = 0; i < m.num_weights; ++i) {
+            const velri_manifest_entry *e = &m.weights[i];
+            CHECK(strcmp(e->source_name[0] ? e->source_name : e->name, "emb") == 0,
+                  "every physical weight binds the original source");
+            CHECK_OK(velri_plan_bind_weight_host(plan, e->storage_id, values, sizeof(values)),
+                     "bind canonical weight");
+        }
+        velri_plan_destroy(plan);
+    }
+
+    b.default_store_dev = a.device_id + 1U;
+    velri_tensor third = velri_b_weight_tied(&b, "third", "c", VELRI_DTYPE_F32, 2, dims);
+    const velri_manifest_entry *e = velri_manifest_find_weight(&m, "third");
+    CHECK(third.valid && e && strcmp(e->source_name, "emb") == 0 && m.num_weights == 3,
+          "a replica created through an alias binds the canonical name");
+    CHECK(velri_b_weight_shared(&b, "back", VELRI_DTYPE_F32, 2, dims).storage_id == third.storage_id,
+          "shared and tied constructors reuse the same replica");
+    velri_tensor different = velri_b_weight(&b, "different", VELRI_DTYPE_F32, 2, dims);
+    velri_tensor conflict = velri_b_weight_tied(&b, "back", "different", VELRI_DTYPE_F32, 2, dims);
+    CHECK(different.valid && !conflict.valid && velri_b_status(&b) == VELRI_ERR_INVALID,
+          "an alias cannot be redirected to another source");
+    velri_manifest_destroy(&m);
+    velri_graph_destroy(g);
+}
+
 static void test_builder_and_layer_contracts(velri_device_id cpu_dev,
                                              const velri_model_params *meta) {
     /* 1. RoPE + latent_kv combination must fail cleanly with VELRI_ERR_UNSUPPORTED. */
@@ -1337,6 +1399,10 @@ static void test_shared_manifest(void) {
     char err[192];
     CHECK(velri_model_check_shared_manifest(&owner, &peer, 2, err, sizeof(err)),
           "independent devices can interleave declarations differently");
+    strcpy(peer_entries[1].name, "prefill.alias");
+    strcpy(peer_entries[1].source_name, "key");
+    CHECK(velri_model_check_shared_manifest(&owner, &peer, 2, err, sizeof(err)),
+          "two aliases for one binding can share the same weight slab");
     strcpy(peer_entries[1].source_name, "wrong-tied-weight");
     CHECK(!velri_model_check_shared_manifest(&owner, &peer, 2, err, sizeof(err)),
           "tied weights must resolve to the same source in both plans");
@@ -1408,6 +1474,7 @@ int main(void) {
 
     velri_device_id cpu_dev = 0U;
     CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
+    test_tied_replicas(ctx, cpu_dev);
     test_builder_and_layer_contracts(cpu_dev, &meta_std);
     run_gpt2_suite_on_device(ctx, cpu_dev, cpu_dev, "cpu:0 [std-kv]", &meta_std, &w, seq, 6U,
                              ref_4, ref_6, cpu_std_logits);

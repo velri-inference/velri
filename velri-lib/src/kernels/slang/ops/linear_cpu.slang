@@ -375,7 +375,8 @@ public void linear_slice_cpu<let MR : int, let NR : int,
 // ============================================================================
 // Packed weights store signed bytes in [channel panel][depth][channel] order.
 // Each panel is 32 columns wide, including the zero-padded last panel.
-static const uint kW8A8PanelWidth = 32u;
+#include "w8a8_layout.h"
+static const uint kW8A8PanelWidth = VELRI_W8A8_SIGNED_PANEL_WIDTH;
 
 public void pack_w8a8_cpu(Ptr<int8_t, Access.Read> w, uint stride,
                           uint channels, uint depth, Ptr<int8_t> packed)

@@ -300,7 +300,7 @@ static velri_rc bind_program_weights(velri_program *prog) {
     const velri_manifest *m = &prog->decode_manifest;
     for (uint32_t i = 0U; i < m->num_weights; ++i) {
         const velri_manifest_entry *e = &m->weights[i];
-        const char *lookup = (e->source_name[0] != '\0') ? e->source_name : e->name;
+        const char *lookup = velri_manifest_weight_source(e);
         const void *ptr = nullptr;
         size_t bytes = 0U;
         bool is_auto_rope = false;

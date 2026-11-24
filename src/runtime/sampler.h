@@ -26,7 +26,6 @@ typedef struct {
 velri_rc velri_sampler_init(velri_sampler *s, uint32_t vocab_size, uint64_t seed);
 void velri_sampler_destroy(velri_sampler *s);
 void velri_sampler_reset(velri_sampler *s);
-void velri_sampler_reseed(velri_sampler *s, uint64_t seed);
 
 velri_rc velri_sampler_validate_params(const velri_sampling_params *params);
 

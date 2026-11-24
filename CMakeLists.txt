@@ -22,7 +22,7 @@ if(VELRI_LIB_SOURCE_DIR)
     set(VELRI_LIB_BUILD_TESTS ${BUILD_TESTING} CACHE BOOL "Build dependency correctness tests")
     add_subdirectory("${VELRI_LIB_SOURCE_DIR}" velri-lib)
 else()
-    find_package(VelriLib 0.5.0 EXACT CONFIG REQUIRED)
+    find_package(VelriLib 0.6.0 EXACT CONFIG REQUIRED)
 endif()
 
 # Each architecture implements build_graph in a C file named after the model.

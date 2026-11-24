@@ -27,6 +27,7 @@ set(VELRI_SLANG_COMMON_DEPS
     "${VELRI_SLANG_DIR}/common/key_iter.slang"
 )
 set(VELRI_SLANG_CPU_DEPS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cpu/w8a8_layout.h"
     ${VELRI_SLANG_COMMON_DEPS}
     "${VELRI_SLANG_DIR}/ops/norm.slang"
     "${VELRI_SLANG_DIR}/ops/rope.slang"
@@ -188,6 +189,7 @@ function(velri_add_slang_cpu_variant isa mr nr_f32 nr_f64 llvm_features clang_is
 
     set(_slang_cmd "${VELRI_SLANGC}" "${VELRI_SLANG_CPU_ENTRY}"
         -I "${VELRI_SLANG_DIR}/common" -I "${VELRI_SLANG_DIR}/ops"
+        -I "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/cpu"
         -fp-mode fast -DVELRI_ISA=${isa} -DVELRI_MR=${mr}
         -DVELRI_NR_F32=${nr_f32} -DVELRI_NR_F64=${nr_f64} ${ARGN})
 
