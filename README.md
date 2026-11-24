@@ -28,7 +28,7 @@ ctest --test-dir build --output-on-failure
 
 `slangc` is a build-time AOT tool only (no Slang or LLVM runtime dependency). Default CPU builds require no Vulkan SDK or network access; pass `-DVELRI_ENABLE_VULKAN=ON` to enable the built-in Vulkan 1.3 backend and `-DVELRI_BUILD_BENCHMARKS=ON` to build `bench_slang_cpu` / `bench_vulkan`. For standalone library builds and package installation, see [velri-lib/README.md](velri-lib/README.md).
 
-With benchmarks enabled, `build/bench_session cpu 16` or `build/bench_session vulkan` times 64 consecutive greedy decode steps on one synthetic FP32 Llama session, following a 128-token prompt. It prints total time, latency per token and throughput for three measured sequences after warm-up.
+With benchmarks enabled, `build/bench_session cpu 16` or `build/bench_session vulkan` times 64 consecutive greedy decode steps on one synthetic FP32 Llama session, following a 128-token prompt. It prints total time, latency per token and throughput for three measured sequences after warm-up. To benchmark a checkpoint, convert a plain-RoPE Llama safetensors snapshot with `python3 tools/prepare_session_weights.py SNAPSHOT weights.w8` (NumPy required), then run `build/bench_session cpu 16 --isa avx2 --weights weights.w8` or `build/bench_session vulkan 1 --weights weights.w8`. The benchmark binds the converted weights through the public engine API. See the [measurement protocol](tools/decode64-method.md) and the [9950X / RTX 5070 Ti results and reproduction commands](docs/performance/decode64/README.md).
 
 ## Design Principles
 

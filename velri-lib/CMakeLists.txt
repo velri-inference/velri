@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(VelriLib VERSION 0.6.0 LANGUAGES C)
+project(VelriLib VERSION 0.7.0 LANGUAGES C)
 include(GNUInstallDirs)
 
 set(CMAKE_C_STANDARD 23)

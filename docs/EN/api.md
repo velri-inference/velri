@@ -27,6 +27,8 @@ Use `velri_ctx_create_from_json` to configure the shared CPU pool from `backends
 
 Weights are registered by canonical name. A bind takes exclusive access to the registry. A concurrent bind or prepare may return `VELRI_RC_ERR_BUSY`. Once a program has acquired the model, its weight bindings stay immutable until all dependent programs are destroyed.
 
+With `velri_model_desc.weight_type = VELRI_TYPE_W8A8`, bind each dense projection’s canonical `.weight` as signed row-major bytes `[out, in]` and its `.weight_scale` as FP32 `[out]`. The dequantized element is `weight[o,i] * weight_scale[o]`. The graph dynamically quantizes each activation row for both prefill and decode. Biases, norms and embeddings use FP32. A tied language-model head reads the same FP32 embedding matrix. To use a quantized copy for the head, select an untied head and bind `lm_head.weight` and `lm_head.weight_scale`.
+
 ---
 
 ## 2. Buffer Ownership, Synchronicity, and Concurrency

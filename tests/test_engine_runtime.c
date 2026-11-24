@@ -56,6 +56,81 @@ static float max_abs_diff(const float *a, const float *b, uint32_t n) {
     return mx;
 }
 
+/* A zero residual branch leaves the last token's embedding at the final RMSNorm.
+ * The two output modes have independent, closed-form logits. */
+static void test_w8a8_model(bool tied) {
+    const velri_ctx_options opts = {.cpu_threads = 1U};
+    velri_ctx *ctx = nullptr;
+    velri_model *model = nullptr;
+    velri_program *prog = nullptr;
+    velri_session *session = nullptr;
+    const velri_model_desc desc = {
+        .arch = VELRI_ARCH_LLAMA, .weight_type = VELRI_TYPE_W8A8,
+        .vocab_size = 3U, .hidden_size = 4U, .intermediate_size = 4U,
+        .max_position_embeddings = 8U, .num_hidden_layers = 1U,
+        .num_attention_heads = 1U, .tie_word_embeddings = tied, .norm_eps = 1e-5f,
+    };
+    CHECK_RC(velri_ctx_create(&opts, &ctx), "W8 context");
+    CHECK_RC(velri_model_create_synthetic(ctx, &desc, &model), "W8 model");
+    const float embed[3][4] = {{1, 2, -5, 4}, {-2, 3, 7, 1}, {3, -1, 4, 5}};
+    const float ones[4] = {1, 1, 1, 1};
+    const int8_t zeros[4][4] = {{0}};
+    CHECK_RC(velri_model_bind_weight(model, "model.embed_tokens.weight", embed, sizeof(embed)), "embed");
+    const char *norms[] = {"model.layers.0.input_layernorm.weight",
+                           "model.layers.0.post_attention_layernorm.weight", "model.norm.weight"};
+    for (size_t i = 0; i < sizeof(norms) / sizeof(norms[0]); ++i)
+        CHECK_RC(velri_model_bind_weight(model, norms[i], ones, sizeof(ones)), norms[i]);
+    const char *projections[] = {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                                 "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"};
+    for (size_t i = 0; i < sizeof(projections) / sizeof(projections[0]); ++i) {
+        char name[128];
+        snprintf(name, sizeof(name), "model.layers.0.%s.weight", projections[i]);
+        CHECK_RC(velri_model_bind_weight(model, name, zeros, sizeof(zeros)), name);
+        snprintf(name, sizeof(name), "model.layers.0.%s.weight_scale", projections[i]);
+        CHECK_RC(velri_model_bind_weight(model, name, ones, sizeof(ones)), name);
+    }
+
+    const int8_t head[3][4] = {{-128, 1, 2, 3}, {7, 12, 20, 127}, {-2, 3, 4, -5}};
+    const float scale[3] = {0.25f, 0.5f, 0.125f};
+    if (!tied) {
+        CHECK_RC(velri_model_bind_weight(model, "lm_head.weight", head, sizeof(head)), "I8 head");
+        CHECK(velri_program_prepare(ctx, model, nullptr, &prog) == VELRI_RC_ERR_NOT_FOUND &&
+              !prog && strstr(velri_ctx_last_error(ctx), "lm_head.weight_scale"), "missing W8 scale");
+        CHECK_RC(velri_model_bind_weight(model, "lm_head.weight_scale", scale, sizeof(scale)), "F32 scales");
+    }
+
+    CHECK_RC(velri_program_prepare(ctx, model, nullptr, &prog), "W8 prepare");
+    CHECK_RC(velri_session_create(prog, nullptr, &session), "W8 session");
+    const int32_t tokens[] = {1, 0, 2};
+    for (uint32_t start = 0U; start < 3U;) {
+        uint32_t count = start == 0U ? 2U : 1U;
+        velri_step_result result;
+        CHECK_RC(velri_session_step(session, tokens + start, count, nullptr, nullptr, &result), "W8 step");
+        start += count;
+        CHECK(result.kv_len == start && result.last_step_allocs == 0U, "W8 decode KV and allocations");
+        const float *v = embed[tokens[start - 1U]];
+        float sum = 0.0f, maxabs = 0.0f;
+        for (size_t j = 0; j < 4; ++j) {
+            sum += v[j] * v[j];
+            maxabs = fmaxf(maxabs, fabsf(v[j]));
+        }
+        float rms = sqrtf(sum / 4.0f + desc.norm_eps);
+        for (size_t k = 0; k < 3; ++k) {
+            float dot = 0.0f;
+            for (size_t j = 0; j < 4; ++j) {
+                dot += tied ? v[j] * embed[k][j] :
+                              roundf(v[j] * 127.0f / maxabs) * (float)head[k][j];
+            }
+            float expected = tied ? dot / rms : dot * scale[k] * (maxabs / (127.0f * rms));
+            CHECK(fabsf(expected - result.logits[k]) < 1e-4f, "W8 logits after prefill/decode");
+        }
+    }
+    CHECK_RC(velri_session_destroy(session), "destroy W8 session");
+    CHECK_RC(velri_program_destroy(prog), "destroy W8 program");
+    CHECK_RC(velri_model_destroy(model), "destroy W8 model");
+    CHECK_RC(velri_ctx_destroy(ctx), "destroy W8 context");
+}
+
 /* ---- Test 1: Zero-Alloc Deterministic Sampler ---- */
 
 static void test_sampler_unit(void) {
@@ -180,7 +255,7 @@ static void test_sampler_unit(void) {
 /* ---- Test 2: Parent-Before-Child Lifecycle & Diagnostic Errors ---- */
 
 static void test_cpu_pool_configuration(void) {
-    const char fixed[] = "{\"model\":{},\"backends\":{\"cpu\":{\"threads\":2,\"affinity\":\"none\"}}}";
+    const char fixed[] = "{\"model\":{},\"backends\":{\"cpu\":{\"threads\":2,\"variant\":\"base\",\"affinity\":\"none\"}}}";
     const char automatic[] = "{\"backends\":{\"cpu\":{\"threads\":0,\"reserve-cores\":4294967295}}}";
     const char required[] = "{\"backends\":{\"cpu\":{\"affinity\":\"required\"}}}";
     char err[256];
@@ -195,6 +270,10 @@ static void test_cpu_pool_configuration(void) {
     CHECK(velri_ctx_create_from_json(nullptr, "{", 1U, &ctx, err, sizeof(err)) ==
               VELRI_RC_ERR_INVALID && !ctx && err[0],
           "return JSON diagnostic before context exists");
+    const char unknown[] = "{\"backends\":{\"cpu\":{\"variant\":\"avx999\"}}}";
+    CHECK(velri_ctx_create_from_json(nullptr, unknown, sizeof(unknown) - 1U, &ctx, err, sizeof(err)) ==
+              VELRI_RC_ERR_INVALID && !ctx && strstr(err, "variant"),
+          "reject unknown ISA before pool creation");
     CHECK_RC(velri_ctx_create_from_json(nullptr, automatic, sizeof(automatic) - 1U, &ctx,
                                         err, sizeof(err)), "auto context from backend-only object");
     velri_device_info info;
@@ -981,6 +1060,8 @@ int main(void) {
     test_cpu_pool_configuration();
     test_lifecycle_and_diagnostics();
     test_gpt2_runtime_e2e();
+    test_w8a8_model(false);
+    test_w8a8_model(true);
     test_llama_auto_rope_and_cancellation();
     test_dual_plan_prefill_compute_and_vulkan();
     printf("=== All Engine Runtime Tests PASSED ===\n");

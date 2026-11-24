@@ -86,14 +86,14 @@ add_subdirectory(path/to/velri-lib velri-lib-build)
 target_link_libraries(my_application PRIVATE VelriLib::velri)
 ```
 
-Or from an installed package (`VelriLib 0.6.0 EXACT`):
+Or from an installed package (`VelriLib 0.7.0 EXACT`):
 
 ```sh
 cmake --install build --prefix /path/to/velri-lib-install
 ```
 
 ```cmake
-find_package(VelriLib 0.6.0 EXACT CONFIG REQUIRED)
+find_package(VelriLib 0.7.0 EXACT CONFIG REQUIRED)
 target_link_libraries(my_application PRIVATE VelriLib::velri)
 ```
 

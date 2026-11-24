@@ -43,6 +43,8 @@ static const vk_pipe_spec k_pipes[PIPE_COUNT] = {
     [PIPE_GEMV_F32]              = {spv_vk_gemv_f32, spv_vk_gemv_f32_bytes, VK_CAP_NONE},
     [PIPE_GEMV_F16]              = {spv_vk_gemv_f16, spv_vk_gemv_f16_bytes, VK_CAP_F16_I8},
     [PIPE_GEMV_BF16]             = {spv_vk_gemv_bf16, spv_vk_gemv_bf16_bytes, VK_CAP_INT16},
+    [PIPE_GATED_W8A8] = {spv_vk_gated_w8a8, spv_vk_gated_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
+    [PIPE_QKV_ROPE_W8A8] = {spv_vk_qkv_rope_w8a8, spv_vk_qkv_rope_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
     [PIPE_QUANT_GEMV_W8A8] = {spv_vk_quant_gemv_w8a8, spv_vk_quant_gemv_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
     [PIPE_GEMV_W8A8]             = {spv_vk_gemv_w8a8, spv_vk_gemv_w8a8_bytes, VK_CAP_F16_I8 | VK_CAP_INT_DOT},
     [PIPE_GEMM_SHORT_F32]        = {spv_vk_gemm_short_f32, spv_vk_gemm_short_f32_bytes, VK_CAP_F32_GEMM},
@@ -547,6 +549,10 @@ static void prepare_optional_pipes_locked(velri_backend_device *dev, const velri
     }
     if (dev->subgroup_size != 32U) {
         return;
+    }
+    if (plan->pipe_id == PIPE_GEMV_W8A8 || plan->alt_pipe_id == PIPE_GEMV_W8A8) {
+        (void)velri_vk_get_pipe_locked(dev, PIPE_GATED_W8A8);
+        (void)velri_vk_get_pipe_locked(dev, PIPE_QKV_ROPE_W8A8);
     }
     switch (plan->pipe_id) {
     case PIPE_QUANTIZE_ROW_F32_I8: {

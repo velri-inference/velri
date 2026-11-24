@@ -122,7 +122,11 @@ velri_rc velri_arch_from_name(const char *name, velri_arch *out_arch);
 typedef enum {
     VELRI_TYPE_F32 = 0,
     VELRI_TYPE_F16 = 1,
-    VELRI_TYPE_BF16 = 2
+    VELRI_TYPE_BF16 = 2,
+    /* Bind linear .weight as row-major int8_t [out,in] and .weight_scale as float [out].
+     * Each output channel represents weight[i,j] * weight_scale[i]. Activations are
+     * quantized per token. Embeddings, norms, biases and a tied output head use F32. */
+    VELRI_TYPE_W8A8 = 3
 } velri_type;
 
 typedef enum {

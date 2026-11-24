@@ -59,7 +59,7 @@ cmake --build build-lib
 ctest --test-dir build-lib --output-on-failure
 ```
 
-Для проверки чистоты границы потребителя движок также можно собрать против установленного пакета `VelriLib 0.6.0 EXACT`:
+Для проверки чистоты границы потребителя движок также можно собрать против установленного пакета `VelriLib 0.7.0 EXACT`:
 
 ```sh
 cmake --install build/velri-lib --prefix /tmp/velri-lib-install

@@ -968,6 +968,7 @@ static velri_status parse_cpu_backend(velri_json_reader *r, velri_cpu_backend_cf
         CPU_SEEN_THREADS = 1U << 0,
         CPU_SEEN_RESERVE = 1U << 1,
         CPU_SEEN_AFFINITY = 1U << 2,
+        CPU_SEEN_VARIANT = 1U << 3,
     };
     velri_json_iter it;
     velri_status st = velri_json_begin_object(r, &it);
@@ -994,6 +995,18 @@ static velri_status parse_cpu_backend(velri_json_reader *r, velri_cpu_backend_cf
             st = read_u32_range(r, &out->reserve_cores, 0U, UINT32_MAX,
                                 "backends.cpu.reserve-cores", err_msg, err_cap);
             out->has_reserve_cores = true;
+        } else if (velri_json_str_eq(key, "variant")) {
+            static const velri_cfg_enum_entry variants[] = {
+                {"auto", VELRI_CPU_AUTO}, {"base", VELRI_CPU_BASE},
+                {"avx2", VELRI_CPU_AVX2}, {"avx512", VELRI_CPU_AVX512},
+            };
+            if (!check_dup(&seen, CPU_SEEN_VARIANT, "backends.cpu", "variant", err_msg, err_cap)) {
+                return VELRI_ERR_INVALID;
+            }
+            int variant = VELRI_CPU_AUTO;
+            st = read_enum_str(r, variants, ARRAY_COUNT(variants), &variant,
+                               "backends.cpu.variant", err_msg, err_cap);
+            if (st == VELRI_OK) out->variant = (velri_cpu_variant)variant;
         } else if (velri_json_str_eq(key, "affinity")) {
             if (!check_dup(&seen, CPU_SEEN_AFFINITY, "backends.cpu", "affinity", err_msg, err_cap)) {
                 return VELRI_ERR_INVALID;

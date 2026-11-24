@@ -131,6 +131,7 @@ Backend-specific options sit at the top level under `backends.<name>`, do not in
 ```
 
 - Apply `backends.cpu` when creating the context with `velri_ctx_create_from_json`. A fixed positive `threads` sets the pool size directly. The automatic mode (`threads: 0` or omitted) subtracts `reserve-cores` (default 1) from the accessible physical core count and clamps the result to 1–256 workers. Linux uses the calling thread’s affinity mask and SMT topology. Windows supports a single process affinity group. If the topology is unavailable, the engine uses one worker.
+- `backends.cpu.variant` selects the CPU implementation when opening the context. Accepted values are `auto` (default), `base`, `avx2` and `avx512`. An explicit variant must be supported by the host CPU and the build.
 - The current pool runs unpinned. `affinity: "auto"` uses this fallback, `"none"` requests it explicitly, and `"required"` returns an unsupported-configuration error. Program inspection reports the effective worker count and pinning policy alongside the JSON settings.
 - Full dense and MoE target-schema examples: [examples/example-dense.json](../../examples/example-dense.json) and [examples/example-moe.json](../../examples/example-moe.json).
 

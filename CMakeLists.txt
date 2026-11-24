@@ -22,7 +22,7 @@ if(VELRI_LIB_SOURCE_DIR)
     set(VELRI_LIB_BUILD_TESTS ${BUILD_TESTING} CACHE BOOL "Build dependency correctness tests")
     add_subdirectory("${VELRI_LIB_SOURCE_DIR}" velri-lib)
 else()
-    find_package(VelriLib 0.6.0 EXACT CONFIG REQUIRED)
+    find_package(VelriLib 0.7.0 EXACT CONFIG REQUIRED)
 endif()
 
 # Each architecture implements build_graph in a C file named after the model.
@@ -104,6 +104,23 @@ if(VELRI_BUILD_BENCHMARKS AND VELRI_LIB_SOURCE_DIR)
     add_executable(bench_session tools/bench_session.c)
     target_include_directories(bench_session PRIVATE tests "${VELRI_LIB_SOURCE_DIR}/src/platform")
     target_link_libraries(bench_session PRIVATE velri_engine VelriLib::velri)
+endif()
+
+# GNU ld --wrap keeps diagnostic clocks and Vulkan query commands out of the timed binary.
+if(TARGET bench_session AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(profile_session tools/bench_session.c tools/profile/session_trace.c)
+    target_include_directories(profile_session PRIVATE tests src "${VELRI_LIB_SOURCE_DIR}/src/platform")
+    target_link_libraries(profile_session PRIVATE velri_engine VelriLib::velri)
+    target_link_options(profile_session PRIVATE "LINKER:--wrap=velri_session_step"
+        "LINKER:--wrap=velri_cpu_backend_vtable" "LINKER:--wrap=velri_sampler_sample")
+    if(VELRI_ENABLE_VULKAN)
+        target_sources(profile_session PRIVATE tools/profile/session_trace_vk.c)
+        target_compile_definitions(profile_session PRIVATE TRACE_VULKAN=1)
+        target_include_directories(profile_session PRIVATE "${VELRI_LIB_SOURCE_DIR}/src/backend/vulkan"
+            "${VELRI_LIB_SOURCE_DIR}/src/core" "${VELRI_LIB_SOURCE_DIR}/src/ops" "${VELRI_VULKAN_INCLUDE_DIR}")
+        target_link_options(profile_session PRIVATE "LINKER:--wrap=velri_vk_fuse_decode"
+            "LINKER:--wrap=velri_vk_record_readback")
+    endif()
 endif()
 
 # Integration & End-to-End Model Tests

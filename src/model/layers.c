@@ -24,7 +24,7 @@ velri_tensor velri_layer_embedding(velri_builder *b, const velri_model_params *p
         .max_pos = p->max_position_embeddings,
         .dim = p->hidden_size,
         .max_seq_len = p->max_seq_len,
-        .dtype = p->dtype,
+        .dtype = p->dtype == VELRI_DTYPE_I8 ? VELRI_DTYPE_F32 : p->dtype,
     };
     return velri_block_embedding(b, &spec);
 }
@@ -131,7 +131,7 @@ velri_tensor velri_layer_lm_head(velri_builder *b, velri_tensor x, const velri_m
         .tie_to = p->tie_word_embeddings ? desc->tie_to_if_tied : nullptr,
         .vocab_size = p->vocab_size,
         .dim = p->hidden_size,
-        .dtype = p->dtype,
+        .dtype = p->tie_word_embeddings && p->dtype == VELRI_DTYPE_I8 ? VELRI_DTYPE_F32 : p->dtype,
         .full_seq_logits = desc->full_seq_logits,
         .has_bias = desc->has_bias,
     };

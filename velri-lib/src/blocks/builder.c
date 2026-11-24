@@ -775,16 +775,46 @@ velri_tensor velri_b_embedding(velri_builder *b, velri_tensor table, velri_tenso
 
 velri_tensor velri_b_linear_into(velri_builder *b, velri_tensor x, velri_tensor w,
                                  velri_tensor bias_or_none, velri_tensor out) {
+    velri_projection_input input = {.values = x};
+    return velri_blocks_linear_into(b, input, w, bias_or_none, VELRI_TENSOR_NONE, out);
+}
+
+velri_projection_input velri_blocks_projection_input(velri_builder *b, velri_tensor x,
+                                                     velri_dtype w_dtype) {
+    if (w_dtype != VELRI_DTYPE_I8) return (velri_projection_input){.values = x};
+    if (!x.valid || x.rank != 2U || x.dtype != VELRI_DTYPE_F32) {
+        velri_b_set_error(b, VELRI_ERR_INVALID);
+        return (velri_projection_input){0};
+    }
+
+    velri_tensor q = velri_b_scratch(b, VELRI_DTYPE_I8, 2U, x.dims);
+    velri_tensor scale = velri_b_scratch(b, VELRI_DTYPE_F32, 1U, x.dims);
+    if (!q.valid || !scale.valid) return (velri_projection_input){0};
+    q.is_seq_dynamic = x.is_seq_dynamic;
+    velri_op_desc op = init_op_desc(VELRI_OP_QUANTIZE_ROW, 1U, 2U);
+    op.dynamic_seq = x.is_seq_dynamic;
+    op.inputs[0] = x.view_id;
+    op.outputs[0] = q.view_id;
+    op.outputs[1] = scale.view_id;
+    if (!emit_op(b, &op)) return (velri_projection_input){0};
+    return (velri_projection_input){.values = q, .scale = scale};
+}
+
+velri_tensor velri_blocks_linear_into(velri_builder *b, velri_projection_input input, velri_tensor w,
+                                      velri_tensor bias_or_none, velri_tensor weight_scale,
+                                      velri_tensor out) {
     if (!b || b->err != VELRI_OK) {
         return VELRI_TENSOR_NONE;
     }
+    velri_tensor x = input.values;
     if (!x.valid || !w.valid || !out.valid || x.rank != 2U || w.rank != 2U || out.rank != 2U ||
         x.dims[1] != w.dims[1] || out.dims[0] != x.dims[0] || out.dims[1] != w.dims[0]) {
         velri_b_set_error(b, VELRI_ERR_INVALID);
         return VELRI_TENSOR_NONE;
     }
 
-    velri_op_desc op = init_op_desc(VELRI_OP_LINEAR, bias_or_none.valid ? 3U : 2U, 1U);
+    uint32_t num_inputs = weight_scale.valid ? 5U : (bias_or_none.valid ? 3U : 2U);
+    velri_op_desc op = init_op_desc(VELRI_OP_LINEAR, num_inputs, 1U);
     op.dynamic_seq = x.is_seq_dynamic;
     op.inputs[0] = x.view_id;
     op.inputs[1] = w.view_id;
@@ -792,13 +822,17 @@ velri_tensor velri_b_linear_into(velri_builder *b, velri_tensor x, velri_tensor 
         op.inputs[2] = bias_or_none.view_id;
     }
     op.outputs[0] = out.view_id;
+    if (weight_scale.valid) {
+        op.inputs[3] = input.scale.view_id;
+        op.inputs[4] = weight_scale.view_id;
+    }
     op.attr.linear.allow_f16_matmul = b->allow_f16_matmul;
     op.attr.linear.desc = (velri_linear_desc){
         .x_dtype = x.dtype,
         .w_dtype = w.dtype,
         .y_dtype = out.dtype,
-        .has_x_scale = false,
-        .has_w_scale = false,
+        .has_x_scale = input.scale.valid,
+        .has_w_scale = weight_scale.valid,
     };
 
     out.is_seq_dynamic = x.is_seq_dynamic;

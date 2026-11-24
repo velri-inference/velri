@@ -326,13 +326,126 @@ static bool rms_quantize(const velri_backend_device *dev, const velri_submit_ite
     return true;
 }
 
+static bool quantized_projection(const velri_backend_device *dev, const vk_encoded_dispatch *e,
+                                 vk_linear_args *linear) {
+    if (!single_stage(dev, e, PIPE_GEMV_W8A8)) return false;
+    memcpy(linear, e->stages[0].pc, sizeof(*linear));
+    return linear->rows == 1U && linear->k == linear->w_stride && !(linear->k & 15U) &&
+           !((linear->x | linear->w) & 15U) &&
+           linear->flags == (VELRI_EP_FLAG_X_SCALE | VELRI_EP_FLAG_W_SCALE);
+}
+
+/* Both graph patterns start with independent projections of the same INT8 row.
+ * All writes must be disjoint from concurrent reads, including per-channel scales. */
+static uint32_t fuse_w8_projections(const velri_backend_device *dev, const velri_submit_item *items,
+                                    const vk_encoded_dispatch *e, uint32_t count,
+                                    vk_encoded_dispatch *out) {
+    vk_linear_args a, b;
+    if (!items[1].no_barrier_before || !quantized_projection(dev, e, &a) ||
+        !quantized_projection(dev, e + 1, &b) || a.x != b.x || a.x_scale != b.x_scale || a.k != b.k)
+        return 0U;
+    device_span reads[10] = {input_span(items, 0), input_span(items, 3), input_span(items, 1),
+                             input_span(items, 4), input_span(items + 1, 1), input_span(items + 1, 4)};
+    device_span writes[3] = {output_span(items, 0), output_span(items + 1, 0)};
+    if (single_stage(dev, e + 2, PIPE_GATED_SILU_F32)) {
+        vk_gated_mlp_args act;
+        memcpy(&act, e[2].stages[0].pc, sizeof(act));
+        VkPipeline pipe = dev->pipes[PIPE_GATED_W8A8];
+        if (!pipe || a.m != b.m || a.m != act.count || a.y != act.gate || b.y != act.up ||
+            a.y != act.y || !independent(reads, 6, writes, 2)) return 0U;
+        uint32_t gx = velri_div_ceil_u32(a.m, VK_GEMV_WG_SIZE / dev->subgroup_size);
+        if (gx > dev->max_wg_count[0]) return 0U;
+        const vk_gated_w8_args args = {
+            .x = a.x, .gate_w = a.w, .up_w = b.w, .x_scale = a.x_scale, .gate_scale = a.w_scale,
+            .up_scale = b.w_scale, .up = b.y, .y = a.y, .m = a.m, .k16 = a.k / 16U,
+            .clamp_limit = act.clamp_limit,
+        };
+        *out = e[0];
+        set_dispatch_stage(&out->stages[0], pipe, &args, sizeof(args), gx, 1U, 1U);
+        return 3U;
+    }
+    if (count < 5U) return 0U;
+    vk_linear_args c;
+    VkPipeline pipe = dev->pipes[PIPE_QKV_ROPE_W8A8];
+    if (!pipe || !items[2].no_barrier_before || !quantized_projection(dev, e + 2, &c) ||
+        c.x != a.x || c.x_scale != a.x_scale || c.k != a.k || c.m != b.m)
+        return 0U;
+    vk_rope_args qr, kr;
+    if (a.k / 16U > UINT16_MAX || !half_rope(dev, e + 3, &a, &qr) ||
+        !half_rope(dev, e + 4, &b, &kr) || qr.head_dim != kr.head_dim || qr.head_dim / 2U > UINT16_MAX ||
+        qr.cos_tbl != kr.cos_tbl || qr.sin_tbl != kr.sin_tbl || qr.pos_offset != kr.pos_offset ||
+        qr.step_params != kr.step_params) return 0U;
+    reads[6] = input_span(items + 2, 1);
+    reads[7] = input_span(items + 2, 4);
+    reads[8] = input_span(items + 3, 1);
+    reads[9] = input_span(items + 3, 2);
+    writes[2] = output_span(items + 2, 0);
+    uint64_t rows = (uint64_t)a.m + b.m + c.m;
+    if (rows / 2U > UINT32_MAX || !independent(reads, 10, writes, 3)) return 0U;
+    uint32_t gx = velri_div_ceil_u32((uint32_t)(rows / 2U), VK_GEMV_WG_SIZE / dev->subgroup_size);
+    if (gx > dev->max_wg_count[0]) return 0U;
+    const vk_qkv_rope_w8_args args = {
+        .x = a.x, .qw = a.w, .kw = b.w, .vw = c.w, .x_scale = a.x_scale, .q_scale = a.w_scale,
+        .k_scale = b.w_scale, .v_scale = c.w_scale, .q = a.y, .k = b.y, .v = c.y,
+        .q_rows = a.m, .kv_rows = b.m, .cos_tbl = qr.cos_tbl, .sin_tbl = qr.sin_tbl, .step = qr.step_params,
+        .dims = ((qr.head_dim / 2U) << 16U) | (a.k / 16U), .pos = qr.pos_offset,
+    };
+    *out = e[0];
+    set_dispatch_stage(&out->stages[0], pipe, &args, sizeof(args), gx, 1U, 1U);
+    return 5U;
+}
+
+/* Merge a projection followed by an in-place residual addition. All original
+ * outputs, including a fused quantizer's row and scale, remain observable. */
+static bool add_projection_residual(const velri_backend_device *dev, const velri_submit_item *items,
+                                    const vk_encoded_dispatch *e, uint32_t n, vk_encoded_dispatch *out) {
+    if (!single_stage(dev, e + n, PIPE_VEC_AXPBY_F32))
+        return false;
+    vk_vec_axpby_args add;
+    memcpy(&add, e[n].stages[0].pc, sizeof(add));
+    vk_linear_args linear;
+    memcpy(&linear, e[n - 1U].stages[0].pc, sizeof(linear));
+    if (linear.rows != 1U || linear.bias || add.a != add.y || add.b != linear.y || !add.has_b ||
+        add.count != linear.m || add.alpha != 1.0f || add.beta != 1.0f)
+        return false;
+    device_span residual = output_span(items + n, 0);
+    for (uint32_t op = 0; op < n; ++op) {
+        const velri_submit_item *item = items + op;
+        for (uint32_t i = 0; i < item->op->num_inputs; ++i) {
+            if (item->op->input_present[i] && overlap(residual, input_span(item, i)))
+                return false;
+        }
+        for (uint32_t i = 0; i < item->op->num_outputs; ++i) {
+            if (overlap(residual, output_span(item, i)))
+                return false;
+        }
+    }
+    if (n == 2U) {
+        vk_quant_gemv_args args;
+        memcpy(&args, out->stages[0].pc, sizeof(args));
+        args.residual = add.y;
+        memcpy(out->stages[0].pc, &args, sizeof(args));
+    } else {
+        linear.residual = add.y;
+        *out = *e;
+        memcpy(out->stages[0].pc, &linear, sizeof(linear));
+    }
+    return true;
+}
+
 uint32_t velri_vk_fuse_decode(velri_backend_device *dev, const velri_submit_item *items,
                               const vk_encoded_dispatch *e, uint32_t count,
                               vk_encoded_dispatch *out) {
     if (dev->subgroup_size != 32U || count < 2U)
         return 0U;
-    if (single_stage(dev, e, PIPE_QUANTIZE_ROW_F32_I8))
-        return quantized_gemv(dev, items, e, out) ? 2U : 0U;
+    if (single_stage(dev, e, PIPE_QUANTIZE_ROW_F32_I8)) {
+        if (!quantized_gemv(dev, items, e, out)) return 0U;
+        return count >= 3U && add_projection_residual(dev, items, e, 2U, out) ? 3U : 2U;
+    }
+    if (single_stage(dev, e, PIPE_GEMV_W8A8)) {
+        if (add_projection_residual(dev, items, e, 1U, out)) return 2U;
+        return count >= 3U ? fuse_w8_projections(dev, items, e, count, out) : 0U;
+    }
     decode_norm previous;
     const decode_norm *norm = nullptr;
     if (read_norm(dev, items, e, &previous)) {

@@ -12,6 +12,9 @@ static bool map_type_to_vl(velri_type t, velri_dtype *out) {
     case VELRI_TYPE_F16:
         *out = VELRI_DTYPE_F16;
         return true;
+    case VELRI_TYPE_W8A8:
+        *out = VELRI_DTYPE_I8;
+        return true;
     case VELRI_TYPE_BF16:
         *out = VELRI_DTYPE_BF16;
         return true;

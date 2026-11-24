@@ -70,9 +70,9 @@ static void raw_gemv(const int8_t *x, const int8_t *w, size_t stride, size_t dep
                      size_t c0, size_t c1) {
     uint32_t correction = gemv_correction(x, depth);
     size_t c = c0;
-    // A long streaming slice benefits from reading one weight row to completion.
-    // Smaller slices reuse the activation across channels in the private cache.
-    if (depth < 4096 || (c1 - c0) * depth <= 2U * 1024U * 1024U) {
+    // On large projections each worker streams whole weight rows. Small slices
+    // reuse the same activation loads across several channels.
+    if (depth < 1024 || (c1 - c0) * depth <= 128U * 1024U) {
         for (; c1 - c >= GEMV_CHANNELS; c += GEMV_CHANNELS) {
             gemv_channels(x, w + c * stride, stride, depth, wscale + c, bias ? bias + c : nullptr,
                           y + c, xscale, correction, GEMV_CHANNELS);

@@ -506,6 +506,8 @@ if(VELRI_ENABLE_VULKAN)
         "${_vk}/gemv.slang|vk_gemv_bf16"
         "${_vk}/gemv.slang|vk_gemv_w8a8"
         "${_vk}/elementwise.slang|vk_quant_gemv_w8a8"
+        "${_vk}/w8_projections.slang|vk_gated_w8a8"
+        "${_vk}/w8_projections.slang|vk_qkv_rope_w8a8"
         "${_vk}/gemm_f32.slang|vk_gemm_f32"
         "${_vk}/gemm_short.slang|vk_gemm_short_f32"
         "${_vk}/gemv.slang|vk_gemv_rows_f32"

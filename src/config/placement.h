@@ -62,6 +62,7 @@ typedef struct {
     uint32_t threads;       /* 0 => auto */
     uint32_t reserve_cores; /* default 1 */
     velri_cpu_affinity_mode affinity;
+    velri_cpu_variant variant; /* auto by default */
     bool has_threads;
     bool has_reserve_cores;
 } velri_cpu_backend_cfg;

@@ -313,14 +313,16 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
     Ptr<int8_t> qr = a.x_i8 + uint64_t(row) * uint64_t(a.xi8_stride);
 
     bool aligned = ((a.k & 3u) == 0u) && is_ptr_aligned16(xr) && is_ptr_aligned4(qr);
-    if (aligned && a.k <= kRowRegCacheMaxDim) {
+    // Cache one row through the max reduction so the output needs no second input pass.
+    static const uint chunks = 8u;
+    if (aligned && a.k <= chunks * 4u * kRowWgSize) {
         uint n4 = a.k >> 2u;
         Ptr<float4, Access.Read> xr4 = Ptr<float4, Access.Read>(xr);
         Ptr<uint> qr4 = Ptr<uint>(qr);
 
-        float4 reg[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+        float4 reg[chunks];
         float local_max = 0.0f;
-        [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+        [ForceUnroll] for (uint s = 0u; s < chunks; ++s) {
             uint idx = s * kRowWgSize + tid;
             if (idx < n4) {
                 float4 v = load_a16(xr4 + idx);
@@ -334,12 +336,12 @@ void vk_quantize_row_f32_i8(uniform QuantizeRowArgs a, uint3 gtid : SV_GroupThre
         compute_sym_i8_scale(amax, scale, inv_scale);
         if (tid == 0u) a.scale_out[row] = scale;
         if (inv_scale == 0.0f) {
-            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            [ForceUnroll] for (uint s = 0u; s < chunks; ++s) {
                 uint idx = s * kRowWgSize + tid;
                 if (idx < n4) qr4[idx] = 0u;
             }
         } else {
-            [ForceUnroll] for (uint s = 0u; s < 4u; ++s) {
+            [ForceUnroll] for (uint s = 0u; s < chunks; ++s) {
                 uint idx = s * kRowWgSize + tid;
                 if (idx < n4) qr4[idx] = pack_i8x4_scaled(reg[s] * inv_scale);
             }
@@ -369,6 +371,7 @@ struct QuantGemvArgs {
     Ptr<uint4, Access.Read> weights;
     Ptr<float, Access.Read> weight_scale;
     Ptr<float> y;
+    Ptr<float> residual;
     uint channels;
     uint k4;
     uint stride16;
@@ -415,7 +418,11 @@ void vk_quant_gemv_w8a8(uniform QuantGemvArgs a, uint3 group : SV_GroupID, uint3
         sum = dot4add_i8packed(quant_words[4u*i + 3u], w.w, sum);
     }
     sum = WaveActiveSum(sum);
-    if (WaveGetLaneIndex() == 0u) a.y[col] = float(sum) * (a.weight_scale[col] * scale);
+    if (WaveGetLaneIndex() == 0u) {
+        precise float y = float(sum) * (a.weight_scale[col] * scale);
+        a.y[col] = y;
+        if (a.residual != nullptr) a.residual[col] = a.residual[col] + y;
+    }
 }
 
 struct RmsQuantArgs {

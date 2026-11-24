@@ -165,6 +165,15 @@ velri_rc velri_rt_check_cpu_policy(const velri_cpu_backend_cfg *request,
         }
         return VELRI_RC_ERR_INVALID;
     }
+    if (!velri_cpu_variant_supported(request->variant)) {
+        if (err_msg && err_cap) snprintf(err_msg, err_cap, "backends.cpu.variant unavailable on this host or build");
+        return VELRI_RC_ERR_UNSUPPORTED;
+    }
+    if (existing && request->variant != VELRI_CPU_AUTO &&
+        request->variant != velri_cpu_resolve_variant(existing->variant)) {
+        if (err_msg && err_cap) snprintf(err_msg, err_cap, "backends.cpu.variant conflicts with context setting");
+        return VELRI_RC_ERR_INVALID;
+    }
     return VELRI_RC_OK;
 }
 
@@ -185,7 +194,7 @@ static velri_rc create_context(const velri_ctx_options *opts, velri_cpu_backend_
 
     velri_context_config vcfg = {
         .cpu_workers = cpu.threads,
-        .cpu_variant = VELRI_CPU_AUTO,
+        .cpu_variant = cpu.variant,
         .enable_vulkan = ctx->vulkan_requested,
         .use_physical_cores = true,
         .cpu_reserve_cores = cpu.reserve_cores,
@@ -218,7 +227,7 @@ velri_rc velri_ctx_create_from_json(const velri_ctx_options *opts, const char *j
     if (st != VELRI_OK) {
         return velri_rt_rc_from_vl(st);
     }
-    velri_cpu_backend_cfg fixed = {.threads = opts ? opts->cpu_threads : 0U};
+    velri_cpu_backend_cfg fixed = {.threads = opts ? opts->cpu_threads : 0U, .variant = cpu.variant};
     velri_rc rc = velri_rt_check_cpu_policy(&cpu, fixed.threads ? &fixed : nullptr,
                                             err_msg, err_cap);
     if (rc != VELRI_RC_OK) {
