@@ -582,6 +582,147 @@ void linear_mc_panel_f64<let MR : int, let NR : int, let ZERO_INIT : bool>(
 // ============================================================================
 // 4. Unified Floating-Point Linear (F32, F16->F32, BF16->F32, F32xBF16)
 // ============================================================================
+// Large-batch 5-loop BLIS helpers (MR == 6, nrows > kMC): pack NC = kNcTiles * NR
+// columns of B once per (MB, KC) block and pack non-native A (F16/BF16) once per
+// MC rows across all NC strips, avoiding redundant DRAM repacking and conversion.
+void pack_a_panel_f32<T : IElement>(
+    Ptr<T.Storage, Access.Read> src, uint stride, uint row0, uint mc,
+    uint k0, uint kc, Ptr<float> dst)
+{
+    uint64_t s64 = uint64_t(stride);
+    uint64_t k64 = uint64_t(k0);
+    for (uint r = 0u; r < mc; ++r) {
+        Ptr<T.Storage, Access.Read> sr = src + uint64_t(row0 + r) * s64 + k64;
+        Ptr<float> dr = dst + r * kApStrideF32;
+        for (uint p = 0u; p < kc; ++p) dr[p] = T::toF32(sr[p]);
+    }
+    for (uint r = mc; r < mc + 3u; ++r) {
+        Ptr<float> dr = dst + r * kApStrideF32;
+        for (uint p = 0u; p < kc; ++p) dr[p] = 0.0f;
+    }
+}
+
+[ForceInline] void blis_step_f32<let TILE_MR : int, let NR : int,
+                                 TX : IElement, TY : IElement, Ep : IEpilogue,
+                                 let PACK_A : bool>(
+    Ptr<TX.Storage, Access.Read> x, uint x_stride,
+    Ptr<float> ap_wr, Ptr<float, Access.Read> ap_rd, Ptr<float> bp, Ptr<float> ct_ptr,
+    Ptr<TY.Storage> y, uint y_stride,
+    uint row0, uint rm, uint mr, uint cb, uint nr, uint k0, uint kc,
+    bool first, bool last, EpilogueParams ep)
+{
+    if (mr == uint(TILE_MR) && nr == uint(NR)) {
+        Ptr<float> ytile = Ptr<float>(y) + uint64_t(row0) * uint64_t(y_stride) + uint64_t(cb);
+        Ptr<float, Access.Read> aptr = PACK_A
+            ? (ap_rd + rm * kApStrideF32)
+            : (Ptr<float, Access.Read>(x) + uint64_t(row0) * uint64_t(x_stride) + uint64_t(k0));
+        uint lda = PACK_A ? kApStrideF32 : x_stride;
+        if (first) gemm_mk_f32<TILE_MR, NR, true>(aptr, lda, bp, ytile, y_stride, ytile, y_stride, kc);
+        else gemm_mk_f32<TILE_MR, NR, false>(aptr, lda, bp, ytile, y_stride, ytile, y_stride, kc);
+        if (last && !Ep::isIdentity(ep)) {
+            for (uint r = 0u; r < uint(TILE_MR); ++r) {
+                Ptr<float> yr = ytile + uint64_t(r) * uint64_t(y_stride);
+                for (uint j = 0u; j < uint(NR); ++j) yr[j] = Ep::apply(yr[j], row0 + r, cb + j, ep);
+            }
+        }
+        return;
+    }
+    if (!first) {
+        for (uint r = 0u; r < mr; ++r) {
+            Ptr<float> yr = Ptr<float>(y) + uint64_t(row0 + r) * uint64_t(y_stride) + uint64_t(cb);
+            for (uint j = 0u; j < nr; ++j) ct_ptr[r * uint(NR) + j] = yr[j];
+            for (uint j = nr; j < uint(NR); ++j) ct_ptr[r * uint(NR) + j] = 0.0f;
+        }
+    }
+    Ptr<float, Access.Read> aptr = ap_rd + rm * kApStrideF32;
+    if (!PACK_A) {
+        pack_a_f32<TX, TILE_MR>(x, x_stride, row0, mr, k0, kc, ap_wr);
+        aptr = ap_rd;
+    }
+    if (first) gemm_mk_f32<TILE_MR, NR, true>(aptr, kApStrideF32, bp, ct_ptr, uint(NR), ct_ptr, uint(NR), kc);
+    else gemm_mk_f32<TILE_MR, NR, false>(aptr, kApStrideF32, bp, ct_ptr, uint(NR), ct_ptr, uint(NR), kc);
+    for (uint r = 0u; r < mr; ++r) {
+        Ptr<float> yr = Ptr<float>(y) + uint64_t(row0 + r) * uint64_t(y_stride) + uint64_t(cb);
+        if (last && !Ep::isIdentity(ep)) {
+            for (uint j = 0u; j < nr; ++j) yr[j] = Ep::apply(ct_ptr[r * uint(NR) + j], row0 + r, cb + j, ep);
+        } else {
+            for (uint j = 0u; j < nr; ++j) yr[j] = ct_ptr[r * uint(NR) + j];
+        }
+    }
+}
+
+void blis_f32_large<let MR : int, let NR : int,
+                    TX : IElement, TW : IElement, TY : IElement, Ep : IEpilogue>(
+    Ptr<TX.Storage, Access.Read> x, uint x_stride,
+    Ptr<TW.Storage, Access.Read> w, uint w_stride,
+    Ptr<TY.Storage> y, uint y_stride,
+    uint r0, uint r1, uint c0, uint c1, uint k,
+    EpilogueParams ep, bool aligned_w)
+{
+    static const int kNcTiles = 2;
+    static const uint kNC = uint(kNcTiles * NR);
+    static const uint kMcBlis = 192u;
+    static const uint kMbBlis = 512u;
+    static const bool kPackA = !TX.kIsNativeF32;
+    float4 bp_all[kNcTiles * VELRI_KC * (NR / 4)];
+    float ap_all[(kPackA ? (192 + 3) : 4) * (VELRI_KC + VELRI_AP_PAD_F32)];
+    float c_tail[MR * NR];
+    bp_all[0] = float4(0.0f); ap_all[0] = 0.0f; c_tail[0] = 0.0f;
+    Ptr<float> bp_base = Ptr<float>(&bp_all[0]);
+    Ptr<float> ap_wr = &ap_all[0];
+    Ptr<float, Access.Read> ap_rd = Ptr<float, Access.Read>(&ap_all[0]);
+    Ptr<float> ct_ptr = &c_tail[0];
+
+    for (uint jc = c0; jc < c1;) {
+        uint nc = min(kNC, c1 - jc);
+        uint n_tiles = (nc + uint(NR) - 1u) / uint(NR);
+        for (uint rb = r0; rb < r1;) {
+            uint mb = min(kMbBlis, r1 - rb);
+            for (uint k0 = 0u; k0 < k;) {
+                uint kc = min(kKC, k - k0);
+                bool first = (k0 == 0u);
+                bool last = (k0 + kc == k);
+                for (uint t = 0u; t < n_tiles; ++t) {
+                    uint cb = jc + t * uint(NR);
+                    uint nr = min(uint(NR), c1 - cb);
+                    pack_b_f32<TW, NR>(w, w_stride, cb, nr, k0, kc,
+                                       &bp_all[t * kKC * (uint(NR) >> 2u)], aligned_w);
+                }
+                for (uint ic = 0u; ic < mb;) {
+                    uint mc = min(kMcBlis, mb - ic);
+                    uint row_base = rb + ic;
+                    if (kPackA) pack_a_panel_f32<TX>(x, x_stride, row_base, mc, k0, kc, ap_wr);
+                    uint m6 = mc_split_m6(mc);
+                    for (uint t = 0u; t < n_tiles; ++t) {
+                        uint cb = jc + t * uint(NR);
+                        uint nr = min(uint(NR), c1 - cb);
+                        Ptr<float> bp = bp_base + t * kKC * uint(NR);
+                        uint rm = 0u;
+                        if (nr == uint(NR)) {
+                            for (; rm < m6; rm += 6u) {
+                                blis_step_f32<6, NR, TX, TY, Ep, kPackA>(
+                                    x, x_stride, ap_wr, ap_rd, bp, ct_ptr, y, y_stride,
+                                    row_base + rm, rm, 6u, cb, nr, k0, kc, first, last, ep);
+                            }
+                        }
+                        for (; rm < mc;) {
+                            uint mr = min(4u, mc - rm);
+                            blis_step_f32<4, NR, TX, TY, Ep, kPackA>(
+                                x, x_stride, ap_wr, ap_rd, bp, ct_ptr, y, y_stride,
+                                row_base + rm, rm, mr, cb, nr, k0, kc, first, last, ep);
+                            rm += mr;
+                        }
+                    }
+                    ic += mc;
+                }
+                k0 += kc;
+            }
+            rb += mb;
+        }
+        jc += nc;
+    }
+}
+
 public void linear_slice_cpu<let MR : int, let NR : int,
                              TX : IElement, TW : IElement, TY : IElement, Ep : IEpilogue>(
     Ptr<TX.Storage, Access.Read> x, uint x_stride,
@@ -613,6 +754,11 @@ public void linear_slice_cpu<let MR : int, let NR : int,
                 gemv_1row<TX, TW, TY, Ep>(xr, w + uint64_t(c) * uint64_t(w_stride), yr, r, c, k, ep);
             }
         }
+        return;
+    }
+    if (MR == 6 && TY.kIsNativeF32 && nrows > kMC) {
+        blis_f32_large<MR, NR, TX, TW, TY, Ep>(
+            x, x_stride, w, w_stride, y, y_stride, r0, r1, c0, c1, k, ep, aligned_w);
         return;
     }
 
@@ -832,6 +978,114 @@ public void linear_w8a8_f32_slice_cpu<let MR : int, let NR : int, let PACKED : b
 // ============================================================================
 // 6. Native FP64 Linear (Streaming GEMV + Scatter-Free L1-Packed BLIS GEMM)
 // ============================================================================
+[ForceInline] void blis_step_f64<let TILE_MR : int, let NR : int>(
+    Ptr<double, Access.Read> x, uint x_stride,
+    Ptr<double> ap_wr, Ptr<double, Access.Read> ap_rd, Ptr<double> bp, Ptr<double> ct_ptr,
+    Ptr<double> y, uint y_stride, Ptr<double, Access.Read> bias, uint has_bias,
+    uint row0, uint mr, uint cb, uint nr, uint k0, uint kc, bool first, bool last)
+{
+    if (mr == uint(TILE_MR) && nr == uint(NR)) {
+        Ptr<double> ytile = y + uint64_t(row0) * uint64_t(y_stride) + uint64_t(cb);
+        Ptr<double, Access.Read> aptr = x + uint64_t(row0) * uint64_t(x_stride) + uint64_t(k0);
+        if (first) gemm_mk_f64<TILE_MR, NR, true>(aptr, x_stride, bp, ytile, y_stride, ytile, y_stride, kc);
+        else gemm_mk_f64<TILE_MR, NR, false>(aptr, x_stride, bp, ytile, y_stride, ytile, y_stride, kc);
+        if (last && has_bias != 0u) {
+            for (uint r = 0u; r < uint(TILE_MR); ++r) {
+                Ptr<double> yr = ytile + uint64_t(r) * uint64_t(y_stride);
+                for (uint j = 0u; j < uint(NR); ++j) yr[j] += bias[cb + j];
+            }
+        }
+        return;
+    }
+    if (!first) {
+        for (uint r = 0u; r < mr; ++r) {
+            Ptr<double> yr = y + uint64_t(row0 + r) * uint64_t(y_stride) + uint64_t(cb);
+            for (uint j = 0u; j < nr; ++j) ct_ptr[r * uint(NR) + j] = yr[j];
+            for (uint j = nr; j < uint(NR); ++j) ct_ptr[r * uint(NR) + j] = 0.0;
+        }
+    }
+    pack_a_f64<TILE_MR>(x, x_stride, row0, mr, k0, kc, ap_wr);
+    if (first) gemm_mk_f64<TILE_MR, NR, true>(ap_rd, kApStrideF64, bp, ct_ptr, uint(NR), ct_ptr, uint(NR), kc);
+    else gemm_mk_f64<TILE_MR, NR, false>(ap_rd, kApStrideF64, bp, ct_ptr, uint(NR), ct_ptr, uint(NR), kc);
+    for (uint r = 0u; r < mr; ++r) {
+        Ptr<double> yr = y + uint64_t(row0 + r) * uint64_t(y_stride) + uint64_t(cb);
+        if (last && has_bias != 0u) {
+            for (uint j = 0u; j < nr; ++j) yr[j] = ct_ptr[r * uint(NR) + j] + bias[cb + j];
+        } else {
+            for (uint j = 0u; j < nr; ++j) yr[j] = ct_ptr[r * uint(NR) + j];
+        }
+    }
+}
+
+void blis_f64_large<let MR : int, let NR : int>(
+    Ptr<double, Access.Read> x, uint x_stride,
+    Ptr<double, Access.Read> w, uint w_stride,
+    Ptr<double, Access.Read> bias, uint has_bias,
+    Ptr<double> y, uint y_stride,
+    uint r0, uint r1, uint c0, uint c1, uint k, bool aligned_w)
+{
+    static const int kNcTiles = 4;
+    static const uint kNC = uint(kNcTiles * NR);
+    static const uint kMcBlis = 144u;
+    static const uint kMbBlis = 768u;
+    double4 bp_all[kNcTiles * VELRI_KC * (NR / 4)];
+    double ap_tail[4 * (VELRI_KC + VELRI_AP_PAD_F64)];
+    double c_tail[MR * NR];
+    bp_all[0] = double4(0.0); ap_tail[0] = 0.0; c_tail[0] = 0.0;
+    Ptr<double> bp_base = Ptr<double>(&bp_all[0]);
+    Ptr<double> ap_wr = &ap_tail[0];
+    Ptr<double, Access.Read> ap_rd = Ptr<double, Access.Read>(&ap_tail[0]);
+    Ptr<double> ct_ptr = &c_tail[0];
+
+    for (uint jc = c0; jc < c1;) {
+        uint nc = min(kNC, c1 - jc);
+        uint n_tiles = (nc + uint(NR) - 1u) / uint(NR);
+        for (uint rb = r0; rb < r1;) {
+            uint mb = min(kMbBlis, r1 - rb);
+            for (uint k0 = 0u; k0 < k;) {
+                uint kc = min(kKC, k - k0);
+                bool first = (k0 == 0u);
+                bool last = (k0 + kc == k);
+                for (uint t = 0u; t < n_tiles; ++t) {
+                    uint cb = jc + t * uint(NR);
+                    uint nr = min(uint(NR), c1 - cb);
+                    pack_b_f64<NR>(w, w_stride, cb, nr, k0, kc,
+                                   &bp_all[t * kKC * (uint(NR) >> 2u)], aligned_w);
+                }
+                for (uint ic = 0u; ic < mb;) {
+                    uint mc = min(kMcBlis, mb - ic);
+                    uint row_base = rb + ic;
+                    uint m6 = mc_split_m6(mc);
+                    for (uint t = 0u; t < n_tiles; ++t) {
+                        uint cb = jc + t * uint(NR);
+                        uint nr = min(uint(NR), c1 - cb);
+                        Ptr<double> bp = bp_base + t * kKC * uint(NR);
+                        uint rm = 0u;
+                        if (nr == uint(NR)) {
+                            for (; rm < m6; rm += 6u) {
+                                blis_step_f64<6, NR>(
+                                    x, x_stride, ap_wr, ap_rd, bp, ct_ptr, y, y_stride,
+                                    bias, has_bias, row_base + rm, 6u, cb, nr, k0, kc, first, last);
+                            }
+                        }
+                        for (; rm < mc;) {
+                            uint mr = min(4u, mc - rm);
+                            blis_step_f64<4, NR>(
+                                x, x_stride, ap_wr, ap_rd, bp, ct_ptr, y, y_stride,
+                                bias, has_bias, row_base + rm, mr, cb, nr, k0, kc, first, last);
+                            rm += mr;
+                        }
+                    }
+                    ic += mc;
+                }
+                k0 += kc;
+            }
+            rb += mb;
+        }
+        jc += nc;
+    }
+}
+
 public void linear_f64_slice_cpu<let MR : int, let NR : int>(
     Ptr<double, Access.Read> x, uint x_stride,
     Ptr<double, Access.Read> w, uint w_stride,
@@ -882,6 +1136,11 @@ public void linear_f64_slice_cpu<let MR : int, let NR : int>(
                 yr[c] = s + (has_bias != 0u ? bias[c] : 0.0);
             }
         }
+        return;
+    }
+    if (MR == 6 && nrows > kMC) {
+        blis_f64_large<MR, NR>(
+            x, x_stride, w, w_stride, bias, has_bias, y, y_stride, r0, r1, c0, c1, k, aligned_w);
         return;
     }
 

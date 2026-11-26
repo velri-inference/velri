@@ -487,11 +487,12 @@ int main(int argc, char **argv) {
                int8 ? "TOPS  " : "TFLOPS");
     }
 
-    const size_t gemm_shapes[2][3] = {
+    const size_t gemm_shapes[3][3] = {
         {128U, 2048U, 2048U},
         {256U, 4096U, 4096U},
+        {1024U, 4096U, 4096U},
     };
-    for (size_t si = 0; si < 2U; ++si) {
+    for (size_t si = 0; si < 3U; ++si) {
         size_t mr = gemm_shapes[si][0], mm = gemm_shapes[si][1], mk = gemm_shapes[si][2];
         printf("\n=== GEMM (rows=%zu, M=%zu, K=%zu) ===\n", mr, mm, mk);
         printf("%-11s | %14s | %7s | %s\n", "Mode", "Throughput", "%Peak", "Reference");

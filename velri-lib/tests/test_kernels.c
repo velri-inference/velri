@@ -2888,6 +2888,20 @@ int main(void) {
         verify_linear_one(ctx, cpu_dev, vnames[vi], "BF16->F32 MC-1 tail (rows=263, k=200)",
                           velri_desc_bf16(VELRI_DTYPE_F32), 263U, 128U, 200U, 0U, 0U, 0U, true,
                           2e-2, LINEAR_RANDOM);
+        /* Regression for large-batch 5-loop BLIS path (rows > VELRI_MC) with odd tails & strides. */
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "F32 large-batch BLIS odd tails",
+                          velri_desc_f32(), 527U, 131U, 200U, 3U, 5U, 7U, true, 2e-3, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "F64 large-batch BLIS odd tails",
+                          velri_desc_f64(), 773U, 131U, 200U, 3U, 5U, 7U, true, 1e-11, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "F16->F32 large-batch BLIS odd tails",
+                          velri_desc_f16(VELRI_DTYPE_F32), 527U, 131U, 200U, 3U, 5U, 7U, true,
+                          2e-2, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "BF16->F32 large-batch BLIS odd tails",
+                          velri_desc_bf16(VELRI_DTYPE_F32), 527U, 131U, 200U, 3U, 5U, 7U, true,
+                          2e-2, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "F32xBF16 large-batch BLIS odd tails",
+                          velri_desc_f32x_bf16w(), 527U, 131U, 200U, 3U, 5U, 7U, false,
+                          2e-2, LINEAR_RANDOM);
         verify_linear_one(ctx, cpu_dev, vnames[vi], "W8A8 raw GEMV wrapping sum",
                           velri_desc_w8a8_f32(), 1U, 64U, 132160U, 3U, 5U, 7U, true,
                           0.0, LINEAR_W8A8_EXTREMES);
