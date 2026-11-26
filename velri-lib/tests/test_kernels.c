@@ -324,6 +324,106 @@ static void verify_scalar_w8a8_scale_binding(velri_context *ctx, velri_device_id
     velri_graph_destroy(g);
 }
 
+/* Shift output one row ahead of input in a single host buffer (`y[r]` aliases `x[r-1]`).
+ * Row-by-row direct traversal consumes `x[r-1]` before writing `y[r]`, whereas column-blocked
+ * or panel GEMM corrupts `x[0..rows-2]` during the first column block. */
+static void verify_w8a8_overlap_direct_order(velri_cpu_variant variant) {
+    velri_context_config cfg = {
+        .cpu_workers = 1U,
+        .cpu_variant = variant,
+        .enable_vulkan = false,
+    };
+    velri_context *ctx = nullptr;
+    CHECK_OK(velri_context_create(&cfg, &ctx), "overlap ctx");
+    velri_device_id dev = 0U;
+    CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &dev), "overlap cpu");
+
+    const struct {
+        size_t rows, m, k, ys;
+    } cases[] = {
+        {3U, 64U, 256U, 64U},
+        {5U, 64U, 256U, 64U},
+        {3U, 192U, 1024U, 256U},
+        {5U, 192U, 1024U, 256U},
+    };
+    for (size_t ci = 0U; ci < sizeof(cases) / sizeof(cases[0]); ++ci) {
+        const size_t rows = cases[ci].rows;
+        const size_t m = cases[ci].m;
+        const size_t k = cases[ci].k;
+        const size_t ys = cases[ci].ys;
+        const size_t row_bytes = ys * sizeof(float);
+        CHECK(row_bytes == k, "overlap fixture requires y row stride == x row bytes");
+
+        velri_graph *g = nullptr;
+        CHECK_OK(velri_graph_create(&g), "overlap g");
+        velri_storage_id sx = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_I8, rows * k, dev);
+        velri_storage_id sw = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_I8, m * k, dev);
+        velri_storage_id sb = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m, dev);
+        velri_storage_id sxs = add_store(g, VELRI_STORAGE_INPUT, VELRI_DTYPE_F32, rows, dev);
+        velri_storage_id sws = add_store(g, VELRI_STORAGE_WEIGHT, VELRI_DTYPE_F32, m, dev);
+        velri_storage_id sy = add_store(g, VELRI_STORAGE_OUTPUT, VELRI_DTYPE_F32, rows * ys, dev);
+        velri_op_desc op = {
+            .kind = VELRI_OP_LINEAR, .num_inputs = 5U, .num_outputs = 1U,
+            .inputs = {add_view_2d_strided(g, sx, VELRI_DTYPE_I8, rows, k, k),
+                       add_view_2d_strided(g, sw, VELRI_DTYPE_I8, m, k, k),
+                       add_view_1d(g, sb, VELRI_DTYPE_F32, m, 0U),
+                       add_view_1d(g, sxs, VELRI_DTYPE_F32, rows, 0U),
+                       add_view_1d(g, sws, VELRI_DTYPE_F32, m, 0U)},
+            .outputs = {add_view_2d_strided(g, sy, VELRI_DTYPE_F32, rows, m, ys)},
+            .attr.linear.desc = velri_desc_w8a8_f32(),
+        };
+        CHECK_OK(velri_graph_add_op(g, &op, dev, nullptr), "overlap op");
+
+        int8_t *x_orig = (int8_t *)xcalloc(rows * k, sizeof(int8_t));
+        int8_t *w = (int8_t *)xcalloc(m * k, sizeof(int8_t));
+        float *bias = (float *)xcalloc(m, sizeof(float));
+        float *x_scale = (float *)xcalloc(rows, sizeof(float));
+        float *w_scale = (float *)xcalloc(m, sizeof(float));
+        float *y_ref = (float *)xcalloc(rows * ys, sizeof(float));
+        uint8_t *shared = (uint8_t *)xcalloc((rows + 1U) * row_bytes, 1U);
+
+        uint64_t rng = 0x0AE80001ULL ^ (uint64_t)ci;
+        velri_test_fill_dtype(VELRI_DTYPE_I8, x_orig, rows * k, &rng, 1.0f);
+        velri_test_fill_dtype(VELRI_DTYPE_I8, w, m * k, &rng, 1.0f);
+        for (size_t c = 0U; c < m; ++c) {
+            w_scale[c] = 1.0f / (float)(1U << (c % 4U));
+            bias[c] = (float)((int)c - 3) * 0.25f;
+        }
+        for (size_t r = 0U; r < rows; ++r) {
+            x_scale[r] = 1.0f / (float)(1U << (r % 3U));
+        }
+        velri_linear_desc desc = velri_desc_w8a8_f32();
+        ref_linear_run(&desc, rows, m, k, x_orig, k, x_scale, w, k, w_scale, bias, y_ref, ys);
+
+        for (unsigned packed = 0U; packed < 2U; ++packed) {
+            velri_plan *plan = nullptr;
+            uint32_t flags = packed ? VELRI_PLAN_PACK_CPU_WEIGHTS : 0U;
+            CHECK_OK(velri_plan_prepare_ex(ctx, g, nullptr, flags, &plan), "overlap plan");
+            CHECK_OK(velri_plan_bind_weight_host(plan, sw, w, m * k), "overlap w");
+            CHECK_OK(velri_plan_bind_weight_host(plan, sb, bias, m * sizeof(float)), "overlap b");
+            CHECK_OK(velri_plan_bind_weight_host(plan, sws, w_scale, m * sizeof(float)), "overlap ws");
+
+            velri_slot *slot = nullptr;
+            CHECK_OK(velri_slot_create(plan, &slot), "overlap slot");
+            memset(shared, 0, (rows + 1U) * row_bytes);
+            memcpy(shared + row_bytes, x_orig, rows * k);
+            CHECK_OK(velri_slot_bind_host(slot, sx, shared + row_bytes, rows * k), "overlap bx");
+            CHECK_OK(velri_slot_bind_host(slot, sy, shared, rows * row_bytes), "overlap by");
+            CHECK_OK(velri_slot_bind_host(slot, sxs, x_scale, rows * sizeof(float)), "overlap bxs");
+            CHECK_OK(velri_slot_run(slot, nullptr, nullptr), "overlap run");
+
+            double err = velri_test_max_abs_diff_2d(VELRI_DTYPE_F32, y_ref, shared, rows, m, ys);
+            CHECK(err == 0.0, "W8A8 overlapping x/y must preserve row-by-row direct order");
+
+            velri_slot_destroy(slot);
+            velri_plan_destroy(plan);
+        }
+        free(shared); free(y_ref); free(w_scale); free(x_scale); free(bias); free(w); free(x_orig);
+        velri_graph_destroy(g);
+    }
+    velri_context_destroy(ctx);
+}
+
 static void verify_w8a8_weight_packing(velri_context *ctx, velri_device_id dev,
                                       velri_cpu_variant variant) {
     enum { rows = 29, m = 127, k = 2049, xs = k, ws = k + 4, ys = m + 6 };
@@ -2776,8 +2876,19 @@ int main(void) {
         CHECK_OK(velri_context_find_device(ctx, "cpu", 0U, &cpu_dev), "find cpu");
         verify_all_ops_on_device(ctx, cpu_dev, vnames[vi], false);
         verify_scalar_w8a8_scale_binding(ctx, cpu_dev);
+        verify_w8a8_overlap_direct_order(vars[vi]);
         verify_w8a8_weight_packing(ctx, cpu_dev, vars[vi]);
-        verify_linear_one(ctx, cpu_dev, vnames[vi], "W8A8 raw GEMV signed pairs and wrapping sum",
+        /* Regression for MR==6 4-row tail at mc == VELRI_MC - 1 (263) with multi-K accumulation. */
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "F32 MC-1 tail (rows=263, k=200)",
+                          velri_desc_f32(), 263U, 128U, 200U, 0U, 0U, 0U, false, 1e-3, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "F32 MC-1 tail + bias (rows=263, k=200)",
+                          velri_desc_f32(), 263U, 128U, 200U, 0U, 0U, 0U, true, 1e-3, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "F64 MC-1 tail (rows=263, k=200)",
+                          velri_desc_f64(), 263U, 64U, 200U, 0U, 0U, 0U, false, 1e-11, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "BF16->F32 MC-1 tail (rows=263, k=200)",
+                          velri_desc_bf16(VELRI_DTYPE_F32), 263U, 128U, 200U, 0U, 0U, 0U, true,
+                          2e-2, LINEAR_RANDOM);
+        verify_linear_one(ctx, cpu_dev, vnames[vi], "W8A8 raw GEMV wrapping sum",
                           velri_desc_w8a8_f32(), 1U, 64U, 132160U, 3U, 5U, 7U, true,
                           0.0, LINEAR_W8A8_EXTREMES);
         verify_linear_one(ctx, cpu_dev, vnames[vi], "W8A8 raw C23 panels",

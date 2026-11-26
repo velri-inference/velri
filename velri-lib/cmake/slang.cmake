@@ -286,7 +286,7 @@ function(velri_add_slang_cpu_dot)
 extern uint32_t velri_probe_dot(const uint8_t *, const int8_t *, uint32_t);
 int main(void) { return (int)velri_probe_dot(0, 0, 0); }
 ]=])
-    set(_flags -O3 -fPIC ${_avx512_cc_flags} -mavx512vnni -mprefer-vector-width=512)
+    set(_flags -O3 -fPIC ${_avx512_cc_flags} -mavx512vnni)
     set(_source "${VELRI_SLANG_DIR}/ops/w8a8_dot.slang")
     set(_base "${VELRI_SLANG_GEN_DIR}/slang_cpu_dot")
     set(_deps "${_source}" "${VELRI_SLANG_DIR}/common/epilogue.slang" "${VELRI_SLANGC}")
@@ -361,10 +361,10 @@ set(VELRI_HAS_SLANG_CPU_DOT 0)
 if(VELRI_X86_VARIANTS)
     if(VELRI_MSVC_FRONTEND)
         set(_avx2_cc_flags /arch:AVX2)
-        set(_avx512_cc_flags /arch:AVX512)
+        set(_avx512_cc_flags /arch:AVX512 /clang:-mprefer-vector-width=512)
     else()
         set(_avx2_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mfma -mf16c)
-        set(_avx512_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -mf16c)
+        set(_avx512_cc_flags ${VELRI_BASE_FLAGS} -mavx2 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -mf16c -mprefer-vector-width=512)
     endif()
     velri_add_slang_cpu_variant(avx2 3 32 16
         "+avx2,+fma,+f16c"

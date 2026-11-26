@@ -2,7 +2,6 @@
 // Subtract 128 * sum(x) once per output, with wrapping 32-bit accumulation.
 import epilogue;
 
-static const uint kDirectOrder = 8u;
 static const uint kRowBlock = 128u;
 static const uint kRawKC = 4096u;
 static const uint kRawTileStride = 4224u;
@@ -245,7 +244,7 @@ void dot_slice<let PACKED : bool>(
     EpilogueParams ep, uint flags)
 {
     if (r0 >= r1 || c0 >= c1) return;
-    bool direct_order = (flags & kDirectOrder) != 0u;
+    bool direct_order = (flags & kLinearFlagDirectOrder) != 0u;
     uint width = c1 - c0;
     uint total_rows = r1 - r0;
     bool direct = direct_order || total_rows < uint(kTileRows) || width < 4u || ys < width || k == 0u;
@@ -254,17 +253,20 @@ void dot_slice<let PACKED : bool>(
     uint8_t scale128 = uint8_t(128u + (flags >> 24u));
 
     if (direct) {
+        bool stream_rows = w8a8_should_stream_rows(direct_order, width, k);
         for (uint r = r0; r < r1; ++r) {
             Ptr<int8_t, Access.Read> xr = x + uint64_t(r) * xs;
             Ptr<float> yr = y + uint64_t(r) * ys;
             uint corr = 0u;
             row_corrections(xr, xs, 1u, k, &corr, scale128);
             uint c = c0;
-            for (; c1 - c >= uint(kTileCols); c += uint(kTileCols))
-                dot_tile_direct1<kTileCols, PACKED>(xr, w + uint64_t(c) * ws, ws, yr, r, c, corr, k, ep);
-            if (c1 - c >= 4u) {
-                dot_tile_direct1<4, PACKED>(xr, w + uint64_t(c) * ws, ws, yr, r, c, corr, k, ep);
-                c += 4u;
+            if (!stream_rows) {
+                for (; c1 - c >= uint(kTileCols); c += uint(kTileCols))
+                    dot_tile_direct1<kTileCols, PACKED>(xr, w + uint64_t(c) * ws, ws, yr, r, c, corr, k, ep);
+                if (c1 - c >= 4u) {
+                    dot_tile_direct1<4, PACKED>(xr, w + uint64_t(c) * ws, ws, yr, r, c, corr, k, ep);
+                    c += 4u;
+                }
             }
             for (; c < c1; ++c)
                 dot_tile_direct1<1, PACKED>(xr, w + uint64_t(c) * ws, ws, yr, r, c, corr, k, ep);

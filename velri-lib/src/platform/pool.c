@@ -28,6 +28,7 @@ typedef struct {
 
 struct velri_pool {
     size_t num_workers;
+    velri_os_pin_plan *pin_plan;
     atomic_bool stopping;
     size_t last_nw;
     uint64_t host_gen;
@@ -80,6 +81,7 @@ static void worker_loop(void *arg) {
     const size_t mask_idx = wid >> 6;
     const uint64_t mask_bit = UINT64_C(1) << (wid & 63U);
 
+    velri_os_pin_worker(pool->pin_plan, wid);
     atomic_store_explicit(&slot->done_gen, UINT64_C(1), memory_order_release);
 
     uint64_t g = UINT64_C(1);
@@ -153,6 +155,7 @@ static void free_pool_slots(velri_pool *pool, size_t count) {
         velri_os_cond_destroy(pool->slots[j].cv);
         velri_os_mutex_destroy(pool->slots[j].mtx);
     }
+    velri_os_pin_release(pool->pin_plan);
     velri_os_aligned_free(pool->slots);
     velri_os_aligned_free(pool);
 }
@@ -185,6 +188,7 @@ velri_status velri_pool_create(size_t num_workers, velri_pool **out_pool) {
     }
     memset(pool->slots, 0, num_workers * sizeof(velri_worker_slot));
 
+    pool->pin_plan = (num_workers > 1U) ? velri_os_pin_acquire(num_workers) : nullptr;
     for (size_t i = 0U; i < num_workers; ++i) {
         pool->slots[i].worker_id = i;
         pool->slots[i].pool = pool;
@@ -242,6 +246,9 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
         return;
     }
 
+    velri_os_affinity_guard pin_guard;
+    velri_os_caller_guard_enter(pool->pin_plan, &pin_guard);
+
     size_t nw = active_workers < pool->num_workers ? active_workers : pool->num_workers;
     pool->last_nw = nw;
     pool->fn = fn;
@@ -278,4 +285,6 @@ void velri_pool_parallel(velri_pool *pool, size_t active_workers, velri_parallel
             velri_os_cpu_relax();
         }
     }
+
+    velri_os_caller_guard_leave(&pin_guard);
 }

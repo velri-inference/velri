@@ -30,8 +30,6 @@ import batched_linear;
 
 // ---- Linear (GEMV + L1-Packed BLIS Outer-Product GEMM) ----
 
-static const uint kStreamDenseWeights = 1u << 4u;
-
 [DllExport] export __extern_cpp void VSYM(linear_f32)(
     Ptr<float, Access.Read> x, uint xs, Ptr<float, Access.Read> w, uint ws,
     Ptr<float, Access.Read> bias, uint flags, Ptr<float> y, uint ys,
@@ -39,7 +37,7 @@ static const uint kStreamDenseWeights = 1u << 4u;
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemF32, ElemF32, ElemF32, EpBias>(
         x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags),
-        (flags & kStreamDenseWeights) != 0u);
+        (flags & kLinearFlagStreamWeights) != 0u, (flags & kLinearFlagAlignedWeights) != 0u);
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_f16_f32)(
@@ -48,7 +46,8 @@ static const uint kStreamDenseWeights = 1u << 4u;
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemF16, ElemF16, ElemF32, EpBias>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags),
+        (flags & kLinearFlagStreamWeights) != 0u, (flags & kLinearFlagAlignedWeights) != 0u);
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_bf16_f32)(
@@ -57,7 +56,8 @@ static const uint kStreamDenseWeights = 1u << 4u;
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemBF16, ElemBF16, ElemF32, EpBias>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags),
+        (flags & kLinearFlagStreamWeights) != 0u, (flags & kLinearFlagAlignedWeights) != 0u);
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_f32x_bf16w)(
@@ -66,15 +66,18 @@ static const uint kStreamDenseWeights = 1u << 4u;
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_slice_cpu<VELRI_MR, VELRI_NR_F32, ElemF32, ElemBF16, ElemF32, EpBias>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, bias, bias, flags),
+        (flags & kLinearFlagStreamWeights) != 0u, (flags & kLinearFlagAlignedWeights) != 0u);
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_f64)(
     Ptr<double, Access.Read> x, uint xs, Ptr<double, Access.Read> w, uint ws,
-    Ptr<double, Access.Read> bias, uint has_bias, Ptr<double> y, uint ys,
+    Ptr<double, Access.Read> bias, uint flags, Ptr<double> y, uint ys,
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
-    linear_f64_slice_cpu<VELRI_MR, VELRI_NR_F64>(x, xs, w, ws, bias, has_bias, y, ys, r0, r1, c0, c1, k);
+    linear_f64_slice_cpu<VELRI_MR, VELRI_NR_F64>(
+        x, xs, w, ws, bias, flags, y, ys, r0, r1, c0, c1, k,
+        (flags & kLinearFlagStreamWeights) != 0u, (flags & kLinearFlagAlignedWeights) != 0u);
 }
 
 [DllExport] export __extern_cpp void VSYM(linear_w8a8_f32)(
@@ -84,7 +87,9 @@ static const uint kStreamDenseWeights = 1u << 4u;
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_w8a8_f32_slice_cpu<VELRI_MR, VELRI_NR_F32, false>(
-        x, xs, w, ws, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, x_scale, w_scale, flags));
+        x, xs, w, ws, y, ys, r0, r1, c0, c1, k,
+        make_epilogue_params(bias, x_scale, w_scale, flags),
+        (flags & kLinearFlagDirectOrder) != 0u);
 }
 
 [DllExport] export __extern_cpp void VSYM(pack_w8a8)(
@@ -100,7 +105,9 @@ static const uint kStreamDenseWeights = 1u << 4u;
     uint r0, uint r1, uint c0, uint c1, uint k)
 {
     linear_w8a8_f32_slice_cpu<VELRI_MR, VELRI_NR_F32, true>(
-        x, xs, packed_w, k, y, ys, r0, r1, c0, c1, k, make_epilogue_params(bias, x_scale, w_scale, flags));
+        x, xs, packed_w, k, y, ys, r0, r1, c0, c1, k,
+        make_epilogue_params(bias, x_scale, w_scale, flags),
+        (flags & kLinearFlagDirectOrder) != 0u);
 }
 
 // ---- Normalization ----
