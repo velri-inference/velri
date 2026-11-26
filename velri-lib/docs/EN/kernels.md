@@ -117,7 +117,7 @@ Pass `VELRI_PLAN_PACK_CPU_WEIGHTS` to `velri_plan_prepare_ex` to pack eligible C
 ### Acceptance rules for new Slang kernels
 Every new or optimized Slang kernel is accepted only after it:
 - passes numerical verification against the independent C23 reference (`tests/cpu/typed/reference.c`), ASan/UBSan, and ISA dispatch checks (`Nehalem`/`Haswell` under QEMU; `spirv-val` for GPU shaders);
-- reports measured throughput against physical device ceilings under [performance.md](../../../docs/EN/performance.md).
+- reports measured throughput against physical device ceilings under [performance.md](https://github.com/velri-inference/velri/blob/main/docs/EN/performance.md).
 
 ---
 

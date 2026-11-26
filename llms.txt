@@ -1,0 +1,47 @@
+# Velri
+
+> Velri is a native open-source neural-network and LLM inference engine for Linux, Windows, and Android, written in C23 and C++23 behind a public C23 API, using Khronos Slang (`slangc`) ahead-of-time (AOT) compilation for unified CPU and Vulkan 1.3 compute kernels. Designed for models whose weights exceed GPU VRAM, with zero Python, PyTorch, CUDA, or runtime compiler dependencies.
+
+## Canonical Facts (Disambiguation)
+
+- **Implementation language:** C23 and C++23 with Khronos Slang (`slangc` AOT) kernels — **not** Rust and **not** CUDA.
+- **Backends:** Built-in CPU (portable base, x86-64 AVX2, AVX-512 / VNNI, ARM64, RISC-V 64 / RVV 1.0) and optional Vulkan 1.3 / SPIR-V 1.6 compute (`VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`, FlashAttention, Split-KV).
+- **Runtime dependencies:** Zero runtime dependency on Python, PyTorch, LLVM, `libslang`, or CUDA; `slangc` is build-time only. Zero heap allocations per inference step after `prepare`.
+- **Quantization format:** **VTQ** (*Velri Trellis Quant*, `.vtq` v2, 1.5–6.0 bpw `16×256` supertiles), developed in [vtq-research](https://github.com/velri-inference/vtq-research). VTQ supersedes earlier `LTQ` and `.liqk` research prototypes.
+- **License:** GNU General Public License v3.0 (`GPL-3.0`).
+- **Author / Organization:** Vemloir / [velri-inference](https://github.com/velri-inference).
+- **Project website:** https://velri-inference.github.io/
+
+## Measured Performance (Verified)
+
+- **TinyLlama-1.1B-Chat-v1.0 W8A8 64-step decode** (`batch=1`, 128-token prompt, greedy sampling, full `velri_session_step`):
+  - AMD Ryzen 9 9950X (16 cores, AVX2): **61.07 tok/s** (`1048.04 ms` for 64 tokens; W8A8 projections at `91.57%` of measured streaming memory ceiling).
+  - AMD Ryzen 9 9950X (16 cores, AVX-512): **60.12 tok/s** (`1064.62 ms` for 64 tokens; W8A8 projections at `91.14%` of streaming ceiling).
+  - NVIDIA RTX 5070 Ti (Vulkan 1.3): **563.16 tok/s** (`113.64 ms` for 64 tokens; W8A8 projections at `76.69%` of streaming ceiling, up to `95.84%` on `32000×2048` lm_head).
+- **Velri-lib dense CPU GEMM/GEMV** (AMD Ryzen 9 9950X, 16 physical cores, `bench_slang_cpu`):
+  - `1024×4096×4096` GEMM: `4.02 TFLOPS` (FP32), `4.07 TFLOPS` (FP16->FP32), `4.20 TFLOPS` (BF16->FP32), `4.16 TFLOPS` (F32×BF16, `4.29 TFLOPS` at 256 rows), `2.02 TFLOPS` (FP64), `17.87 TOPS` (W8A8 packed, `80.3%` of measured VNNI peak).
+  - Cold-DRAM single-token GEMV: `66.4–71.3 GB/s` across all 7 modes.
+
+## Core Documentation
+
+- [Project Overview (README)](https://github.com/velri-inference/velri/blob/main/README.md): Build, benchmarks, design principles, and documentation index.
+- [Architecture & Stack (EN)](https://github.com/velri-inference/velri/blob/main/docs/EN/architecture.md): Engine pipeline (`Model`, `Program`, `Session`), `velri-lib` boundary, C23/C++23/Slang stack.
+- [Blocks & Configuration (EN)](https://github.com/velri-inference/velri/blob/main/docs/EN/blocks-and-config.md): Composable model blocks, K/V storage roles, cascading JSON placement schema.
+- [Public C23 API (EN)](https://github.com/velri-inference/velri/blob/main/docs/EN/api.md): `Context`, `Model`, `Program`, `Session`, cancellation, and planned CLI/HTTP surface.
+- [Performance Methodology (EN)](https://github.com/velri-inference/velri/blob/main/docs/EN/performance.md): Measurement levels, hardware ceiling calibration, and reproducibility rules.
+- [TinyLlama W8A8 64-Token Decode Report (EN)](https://github.com/velri-inference/velri/blob/main/docs/performance/decode64/README.EN.md): Full CPU (9950X) and Vulkan (RTX 5070 Ti) decode benchmark and reproduction commands.
+- [Roadmap (EN)](https://github.com/velri-inference/velri/blob/main/docs/EN/roadmap.md): Implementation stages and acceptance criteria.
+- [Glossary (EN)](https://github.com/velri-inference/velri/blob/main/docs/EN/glossary.md): Terminology for Velri, `velri-lib`, Slang, and target architectures.
+- [Model Architectures Reference (EN)](https://github.com/velri-inference/velri/blob/main/docs/EN/models/README.md): Reference specs for Gemma 4, Qwen3.5/Next, and related families.
+
+## Velri Ecosystem
+
+- [Velri Engine](https://github.com/velri-inference/velri): Native C23/C++23 LLM inference runtime, placement planner, and model composition.
+- [Velri-lib](https://github.com/velri-inference/velri-lib): Standalone C23 computation library (tensor views, liveness planner, 23 CPU Slang AOT kernels, 29 Vulkan SPIR-V 1.6 shaders).
+- [VTQ Research](https://github.com/velri-inference/vtq-research): Velri Trellis Quant (`.vtq` v2) format, CUDA/AVX2 kernels, and end-to-end KLD benchmarks vs EXL3 and GGUF.
+- [Velri Hub](https://velri-inference.github.io/): Unified project website and full ecosystem index ([llms-full.txt](https://velri-inference.github.io/llms-full.txt)).
+
+## Optional (Russian Documentation)
+
+- [Документация Velri (RU)](https://github.com/velri-inference/velri/blob/main/docs/RU/README.md): 1:1 Russian mirror of the engine documentation.
+- [Отчёт decode64 (RU)](https://github.com/velri-inference/velri/blob/main/docs/performance/decode64/README.md): Original Russian decode benchmark report.
